@@ -1,0 +1,104 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must stay in sync with requires-python in pyproject.toml (">=3.10").
+        # 3.9 was dropped rather than left declared-but-untested: recent scanpy
+        # releases no longer support it, so a 3.9 job would have pinned an old
+        # scanpy and tested a configuration nobody runs.
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Import check
+        # Catches a missing runtime dependency that the test suite might mask by
+        # importing something else first.
+        run: python -c "import scfair; print(scfair.__version__)"
+
+      - name: Leiden backend check
+        # Every balanced method needs sc.tl.leiden(flavor="igraph"). This failed
+        # once because igraph was not a declared dependency.
+        run: python -c "import igraph; print('igraph', igraph.__version__)"
+
+      - name: Tests
+        run: pytest -q --cov=scfair --cov-report=term-missing
+
+  min-versions:
+    # Installs the exact floors declared in pyproject.toml and runs the suite
+    # against them. Without this the floors are assertions, not facts — and two of
+    # them were wrong before this job existed: `scanpy>=1.9` could not run
+    # sc.tl.leiden(flavor="igraph") at all (1.10+ only), and `scikit-misc` was
+    # missing entirely while being required by the default flavor="seurat_v3".
+    # If this job fails, raise the floor in pyproject.toml — do not delete the job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install declared floors
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "anndata==0.10.*" "numpy==1.24.*" "pandas==2.0.*" \
+            "scanpy==1.10.*" "scipy==1.10.*" "igraph==0.10.*" \
+            "scikit-misc==0.3.*"
+          pip install --no-deps -e .
+          pip install "pytest>=7.0" "pytest-cov>=4.0"
+      - name: Show resolved versions
+        run: pip list | grep -Ei "anndata|scanpy|numpy|pandas|scipy|igraph|scikit-misc"
+      - name: seurat_v3 must really be available at the floor
+        # scFair falls back to flavor="seurat" if seurat_v3 raises, so a missing
+        # skmisc would look like a pass. Assert the real path is reachable.
+        run: python -c "from skmisc.loess import loess; print('skmisc loess OK')"
+      - name: Leiden flavor must exist at the floor
+        run: |
+          python -c "
+          import inspect, scanpy as sc
+          assert 'flavor' in inspect.signature(sc.tl.leiden).parameters, \
+              'sc.tl.leiden lacks flavor= at the declared scanpy floor'
+          print('leiden flavor OK')"
+      - name: Tests
+        run: pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install "ruff>=0.4.0"
+      - run: ruff check src tests examples
+      # `ruff format --check` is deliberately NOT gated yet: the existing source
+      # predates the formatter and enforcing it would mean a repo-wide reformat.
+      # To adopt it, run `ruff format src tests` once, review that diff on its
+      # own, then add the check here.
