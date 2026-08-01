@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scfair"
+dynamic = ["version"]
+description = "Fair highly variable gene selection for single-cell RNA-seq"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Zhao Li (李钊)", email = "leelieber@gmail.com"},
+]
+keywords = [
+    "single-cell",
+    "RNA-seq",
+    "HVG",
+    "highly-variable-genes",
+    "fairness",
+    "bioinformatics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    # Floors are the versions CI actually installs and tests (see the
+    # `min-versions` job); do not loosen them without re-running that job.
+    "anndata>=0.10",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    # scanpy>=1.10, not 1.9: the intermediate clustering calls
+    # sc.tl.leiden(flavor="igraph"), and `flavor` did not exist before 1.10.
+    # That call has no fallback, so on 1.9 every balanced method raises TypeError.
+    # `flavor="seurat_v3_paper"` is also 1.10+.
+    "scanpy>=1.10",
+    "scipy>=1.10",
+    # Required, not optional: every balanced method runs an intermediate Leiden
+    # via sc.tl.leiden(flavor="igraph"). flavor="igraph" does not need leidenalg.
+    "igraph>=0.10",
+    # Also required, not optional: the DEFAULT flavor="seurat_v3" is implemented in
+    # scanpy as `from skmisc.loess import loess`. Without it scanpy raises, scFair
+    # catches it and silently continues on flavor="seurat" instead — a different
+    # method from the one every documented benchmark used.
+    "scikit-misc>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/leelieber2025/scFair"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "scfair._version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# Benchmark scripts deliberately insert the examples/ directory on sys.path
+# before importing sibling modules, so their imports cannot all sit at the top.
+"examples/*.py" = ["E402"]
