@@ -66,10 +66,43 @@ ignored on the default `"append"` path.
 |-------|----------|
 | int (default **2000**) | Fixed base size; classical community choice |
 | `"auto"` | Label-free structure tools pick `k` from the data, then apply the same base + append step |
+| `"structure"` | Same estimator as `"auto"`, used directly without the extra re-selection pass |
 
-Fixed `k` is better for reproducible protocols. `"auto"` is better for
-exploration and will record why it chose a value under
-`adata.uns["scfair"]["hvg"]["auto_n"]`.
+Fixed `k` is better for reproducible protocols. `"auto"` / `"structure"` are
+better for a first look at a new dataset when you do not want to guess `k`
+by hand.
+
+### What `"auto"` / `"structure"` actually do
+
+Both read the **density** of cells in a low-dimensional embedding (after
+`sc.pp.neighbors`), rather than looking at gene variance directly. The idea:
+a dataset with several well-separated cell populations shows up as several
+dense cores with valleys between them; a dataset dominated by one or two
+large populations shows shallow or few valleys. More, deeper valleys are
+read as evidence of more distinct populations worth keeping separate
+markers for, and the estimator picks a larger gene list; fewer or shallower
+valleys give a shorter list. The result is clipped to `n_top_min` /
+`n_top_max` (default 500–5000).
+
+`"auto"` additionally re-selects genes within the global top `2×k` using
+the same specificity-aware step as `balance_method="hybrid"`, which is why
+it costs noticeably more than a fixed `k` — expect a call to run for tens
+of seconds instead of a couple, since it repeats the PCA → neighbours step
+internally. `"structure"` only asks "how many genes", then hands `k`
+straight to your chosen `balance_method`, so it is cheaper.
+
+After a call, `adata.uns["scfair"]["hvg"]["auto_n"]` records what happened:
+
+| Field | Meaning |
+|-------|---------|
+| `strategy` | Which estimator ran (`"structure"` unless you changed `auto_n_method`) |
+| `n_top_selected` | The `k` it picked |
+| `structure` | The density features it measured (population count, valley depth, stability) |
+| `rule_branch` | An internal tag naming which rule fired — useful when reporting an issue, not meant to be interpreted on its own |
+
+**Known limitation:** on small datasets the estimator can hit `n_top_max`
+and select almost every gene (see {doc}`../faq`). Prefer a fixed `n_top_genes`
+whenever you need to re-run the same protocol later, e.g. for a paper.
 
 ## Product modes
 

@@ -4,8 +4,10 @@
 import scfair as scf
 ```
 
-Public surface: top-level names in `scfair.__all__` and the `scf.pp` submodule.
-Other internal modules are not part of the stable API. Narrative usage:
+Public surface: the four names below, plus `scfair.__version__`. Everything
+else in `scfair.pp` (resolution/mode helpers, the structure-based `k`
+estimator, raw-count snapshotting, ...) is an internal implementation detail
+used by `highly_variable_genes` and is not documented here. Narrative usage:
 {doc}`../user_guide/index`.
 
 ## Preprocessing (`scfair.pp`)
@@ -21,9 +23,6 @@ Other internal modules are not part of the stable API. Narrative usage:
    HVGOptions
    diagnose_from_labels
    estimate_n_populations
-   resolve_hvg_mode
-   recommend_cluster_resolution
-   resolve_cluster_resolution
 ```
 
 ## Package

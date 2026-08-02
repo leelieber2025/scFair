@@ -24,7 +24,8 @@ base top-`k`.
 |------|------|
 | Install and run a first analysis | {doc}`installation` → {doc}`quickstart` |
 | Understand the default and the options | {doc}`user_guide/index` |
-| Gold-label clustering errors vs standard HVG (PBMC 10k) | {doc}`tutorials/index` |
+| A full real workflow on real (unlabeled) data | {doc}`tutorials/pbmc3k_first_analysis` |
+| Gold-label clustering errors vs standard HVG (PBMC 10k) | {doc}`tutorials/pbmc10k_hvg_compare` |
 | Function signatures | {doc}`api/index` |
 | Common issues | {doc}`faq` |
 
@@ -32,7 +33,7 @@ base top-`k`.
 
 1. Install: `pip install scfair`
 2. Follow {doc}`quickstart`
-3. Work through the {doc}`tutorials/pbmc10k_hvg_compare` notebook
+3. Work through the {doc}`tutorials/pbmc3k_first_analysis` notebook
 4. Use {doc}`faq` when a call looks off
 
 ### Default call
