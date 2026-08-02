@@ -62,4 +62,4 @@ import scfair as scf
 print(scf.__version__)
 ```
 
-Pin the version in analysis code and manuscripts, for example `scfair==0.5.0`.
+Pin the version in analysis code and manuscripts, for example `scfair==0.6.0`.

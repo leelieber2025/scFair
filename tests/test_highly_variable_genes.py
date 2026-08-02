@@ -158,6 +158,12 @@ def test_neighbor_contrast_warns_at_low_resolution(adata_for_hvg, caplog):
     assert any("neighbor_contrast" in r.message for r in caplog.records)
 
 
+def _is_large_k_tip(msg: str) -> bool:
+    """Match product tip for k>=3000 (wording is short / user-facing)."""
+    m = str(msg)
+    return "n_top_genes=3000" in m and "large" in m
+
+
 def test_large_k_warns(adata_for_hvg, caplog):
     """k>=3000 is advisory-only: warn, never refuse."""
     ad = adata_for_hvg.copy()
@@ -165,7 +171,7 @@ def test_large_k_warns(adata_for_hvg, caplog):
         scf.pp.highly_variable_genes(
             ad, n_top_genes=3000, balance_method="hybrid", min_cluster_size=20
         )
-    assert any(">= 3000" in r.message for r in caplog.records)
+    assert any(_is_large_k_tip(r.message) for r in caplog.records)
     # advisory, not a refusal: it still selects every gene it can
     assert int(ad.var["highly_variable"].sum()) == ad.n_vars
 
@@ -186,7 +192,7 @@ def test_large_k_warns_before_the_expensive_step(adata_for_hvg, caplog):
             progress=False,
         )
     msgs = [r.message for r in caplog.records]
-    k_warn = next(i for i, m in enumerate(msgs) if ">= 3000" in m)
+    k_warn = next(i for i, m in enumerate(msgs) if _is_large_k_tip(m))
     clustering = next(i for i, m in enumerate(msgs) if "intermediate clustering" in m)
     assert k_warn < clustering
 
@@ -196,7 +202,7 @@ def test_large_k_says_nothing_on_the_scanpy_path(adata_for_hvg, caplog):
     ad = adata_for_hvg.copy()
     with caplog.at_level("WARNING", logger="scfair.pp._diagnosis"):
         scf.pp.highly_variable_genes(ad, n_top_genes=3000, balance_method="none")
-    assert not any(">= 3000" in r.message for r in caplog.records)
+    assert not any(_is_large_k_tip(r.message) for r in caplog.records)
 
 
 def test_each_config_finding_is_reported_once(adata_for_hvg, caplog):
@@ -207,7 +213,7 @@ def test_each_config_finding_is_reported_once(adata_for_hvg, caplog):
         scf.pp.highly_variable_genes(
             ad, n_top_genes=3000, balance_method="hybrid", min_cluster_size=20
         )
-    assert len([r for r in caplog.records if ">= 3000" in r.message]) == 1
+    assert len([r for r in caplog.records if _is_large_k_tip(r.message)]) == 1
     # ...and it is still recorded in the machine-readable diagnosis
     assert "k_ge_3000" in ad.uns[UNS_KEY]["hvg"]["diagnosis"]["flags"]
 
@@ -218,7 +224,7 @@ def test_moderate_k_does_not_warn(adata_for_hvg, caplog):
         scf.pp.highly_variable_genes(
             ad, n_top_genes=2000, balance_method="none", min_cluster_size=20
         )
-    assert not any(">= 3000" in r.message for r in caplog.records)
+    assert not any(_is_large_k_tip(r.message) for r in caplog.records)
 
 
 def test_hvg_default_resolution_is_auto(adata_for_hvg):
@@ -481,10 +487,15 @@ def test_progress_structure_auto_announces_single_hybrid(adata_for_hvg, capsys):
         progress=True,
     )
     err = capsys.readouterr().err
-    assert "structure" in err.lower()
-    assert "one hybrid" in err.lower() or "no double" in err.lower()
+    err_l = err.lower()
+    # Product progress is short: auto k choice + single hybrid clustering.
+    assert "auto" in err_l
+    assert "hybrid" in err_l or "intermediate clustering" in err_l
     # physical intermediate clustering once (hybrid@k), not twice
     assert err.count("intermediate clustering (the slow step)") == 1
+    # tips stay sparse (hard cap in diagnosis)
+    tip_lines = [ln for ln in err.splitlines() if "tip:" in ln.lower()]
+    assert len(tip_lines) <= 2
 
 
 def test_progress_ensemble_auto_mentions_shared_graph(adata_for_hvg, capsys):

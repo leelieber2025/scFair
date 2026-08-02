@@ -470,9 +470,27 @@ SHORT_BLOCK_N_OBS = 10_000
 SHORT_BLOCK_ND_MAX = 10  # inclusive: nd ≤ this counts as "few" on large n
 SHORT_FLOOR_K = 2000
 
-# Soft one-rung buffer on classical structure picks (always on; cheap).
-# Does **not** replace anti-SHORT: untrusted density still floors short_* to
-# short_floor_k after this lift (500→1000 then →2000 when blocked).
+# --- short_hard second-feature split (GOLD-15 worst-case study) ---
+# Soft buffer (500→1000) used to run unconditionally, which (1) wrecked true
+# multi-core SHORT peaks (SLN: ARI@500 ≫ ARI@1000) and (2) left false SHORT
+# (Zheng: few density cores, ARI rises with k) stuck at 1000 because residual
+# anti-SHORT only fired when post-buffer k was still ≤500.
+#
+# False SHORT (label-free): large n + low density conf + very few density cores
+#   → floor to SHORT_FLOOR_K even after soft buffer.
+# Inclusive. Calibrated on Zheng 20k (nd can land 6–7 across seeds/subsamples);
+# nd=6 alone left a one-bin window with short_hard (nd≥6) and missed nd=7.
+FALSE_SHORT_ND_MAX = 8
+# True SHORT (needs n_types when available): many density cores + multi-type
+#   → skip soft buffer so short_hard keeps k=500 (protects SLN; not 2-way
+#   boards like TM brain with n_types=2, nd=12 which prefer 1000).
+TRUE_SHORT_ND_MIN = 10
+TRUE_SHORT_N_TYPES_MIN = 5
+
+# Soft one-rung buffer on classical structure picks (cheap hedge).
+# Skipped for true multi-core SHORT when n_types is known (see above).
+# False-SHORT floor applies after the buffer when geometry says density
+# under-count (see _emit / _apply_short_floor_if_needed).
 # Intermediate / LONG continuous k values are left unchanged.
 K_BUFFER_LADDER: dict[int, int] = {
     500: 1000,
@@ -520,11 +538,20 @@ def explain_structure_rule(
     short_block_nd_max: int = SHORT_BLOCK_ND_MAX,
     short_floor_k: int = SHORT_FLOOR_K,
     hvg_mode: str | None = None,
+    n_types: int | None = None,
 ) -> dict[str, Any]:
     """Explain structure auto_n: same inputs as the selector, plus branch labels.
 
     ``hvg_mode="fine"`` floors SHORT soft-buffer results to ≥2000 so fine
     multi-type boards do not ship a 1000-gene compact list.
+
+    ``n_types`` (optional, from labels) enables the **true SHORT** path: multi-core
+    ``short_hard`` geometry with enough types skips the soft 500→1000 buffer.
+    Without labels, buffer stays on for high-nd SHORT (protects 2-way boards).
+
+    **False SHORT** (label-free): ``short_hard`` + large ``n_obs`` + low density
+    confidence + ``n_density_pops ≤ FALSE_SHORT_ND_MAX`` (default 8) floors to
+    ``short_floor_k`` even after soft buffer (Zheng-like density under-count).
 
     Returns
     -------
@@ -551,13 +578,21 @@ def explain_structure_rule(
     floor_k = int(short_floor_k)
     mode_l = str(hvg_mode or "").lower().strip()
     fine_mode = mode_l == "fine"
+    n_types_i = int(n_types) if n_types is not None else None
 
-    def _short_block_reasons() -> list[str]:
+    def _short_block_reasons(*, for_high_nd_short: bool = False) -> list[str]:
+        """Reasons to residual-floor a raw SHORT (k≤500) to ``short_floor_k``.
+
+        When ``for_high_nd_short`` (true multi-core SHORT, nd ≥ TRUE_SHORT_ND_MIN),
+        conf/sens alone must not override — only large_n_few_density_pops (which
+        requires low nd) can fire, so high-nd true SHORT stays at 500.
+        """
         reasons: list[str] = []
-        if conf == "low":
-            reasons.append("density_confidence_low")
-        if sens is not None and sens >= 3:
-            reasons.append("density_depth_sensitivity_high")
+        if not for_high_nd_short:
+            if conf == "low":
+                reasons.append("density_confidence_low")
+            if sens is not None and sens >= 3:
+                reasons.append("density_depth_sensitivity_high")
         if (
             n_cells is not None
             and n_cells >= int(short_block_n_obs)
@@ -568,6 +603,26 @@ def explain_structure_rule(
             # multi-type FACS structure (Zheng edge) while SHORT still fires.
             reasons.append("large_n_few_density_pops")
         return reasons
+
+    def _is_false_short_geometry() -> bool:
+        """Zheng-like: large n, low conf, very few density cores."""
+        return bool(
+            conf == "low"
+            and n_cells is not None
+            and n_cells >= int(short_block_n_obs)
+            and np.isfinite(nd)
+            and nd <= float(FALSE_SHORT_ND_MAX)
+        )
+
+    def _is_true_short_no_buffer(base_branch: str) -> bool:
+        """Multi-core short_hard + multi-type labels → keep raw 500 (no soft buffer)."""
+        return bool(
+            base_branch.startswith("short_hard")
+            and n_types_i is not None
+            and n_types_i >= int(TRUE_SHORT_N_TYPES_MIN)
+            and np.isfinite(nd)
+            and nd >= float(TRUE_SHORT_ND_MIN)
+        )
 
     def _out(k: int, branch: str, **extra: Any) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -580,6 +635,7 @@ def explain_structure_rule(
             "n_leiden": int(nl) if np.isfinite(nl) else None,
             "ratio": float(ratio) if np.isfinite(ratio) else None,
             "n_obs": n_cells,
+            "n_types": n_types_i,
             "v7_band_eligible": False,
             "v7_band_miss": None,
             "density_confidence": conf,
@@ -588,29 +644,36 @@ def explain_structure_rule(
             "short_block_reason": None,
             "short_k_raw": None,
             "k_buffer_raw": None,
+            "no_buffer": False,
         }
         d.update(extra)
         return d
 
     def _emit(k: int, branch: str, **extra: Any) -> dict[str, Any]:
-        """Clip k → soft rung buffer; residual anti-SHORT only if still ≤500.
+        """Clip k → soft rung buffer; false-SHORT / residual anti-SHORT floors.
 
-        Soft ladder (500→1000, 1000→1500, 1500→2000) is the **primary** hedge.
-        The old hard anti-SHORT floor to 2000 used to fire on every ``short_*``
-        branch under low density confidence and **swallowed** the soft lift
-        (500→1000 then immediately →2000). That left users seeing
-        ``floored n_top=2000`` with raw k=500 and no visible soft buffer.
+        Soft ladder (500→1000, 1000→1500, 1500→2000) is the default hedge, but:
 
-        Anti-SHORT now only applies when the post-buffer k is **still** ≤500
-        (ladder miss / buffer off) and density is untrusted.
+        * **True SHORT** (``short_hard`` + high ``nd`` + ``n_types≥5``): skip
+          buffer so multi-core SHORT keeps k=500 (SLN-like).
+        * **False SHORT** (``short_hard`` + large n + low conf + ``nd≤8``):
+          floor to 2000 even after soft buffer (Zheng-like density under-count).
+        * Residual anti-SHORT for other k≤500 cases only when density is
+          untrusted and geometry is not high-nd multi-core SHORT.
         """
         base_branch = str(branch)
         k_rule = _clip_k(int(k), k_min, k_max, n_genes)
-        k_buf, buf_raw = apply_structure_k_buffer(k_rule)
-        k_clip = _clip_k(int(k_buf), k_min, k_max, n_genes)
-        branch_out = base_branch
-        if buf_raw is not None and k_clip != buf_raw:
-            branch_out = f"{base_branch}+k_buffer:{buf_raw}→{k_clip}"
+        skip_buffer = _is_true_short_no_buffer(base_branch)
+        if skip_buffer:
+            k_clip = int(k_rule)
+            buf_raw = None
+            branch_out = f"{base_branch}+no_buffer:nd{int(nd)}_ntypes{int(n_types_i)}"
+        else:
+            k_buf, buf_raw = apply_structure_k_buffer(k_rule)
+            k_clip = _clip_k(int(k_buf), k_min, k_max, n_genes)
+            branch_out = base_branch
+            if buf_raw is not None and k_clip != buf_raw:
+                branch_out = f"{base_branch}+k_buffer:{buf_raw}→{k_clip}"
         # Fine product mode: do not ship SHORT soft lists (500→1000). Floor to
         # classical 2000 so multi-type atlases keep length (seurat-like).
         if (
@@ -621,10 +684,27 @@ def explain_structure_rule(
             k_pre = int(k_clip)
             k_clip = _clip_k(2000, k_min, k_max, n_genes)
             branch_out = f"{branch_out}+fine_mode_floor:{k_pre}→{k_clip}"
-        # Residual hard-SHORT after soft buffer only (soft lift already moved
-        # classical short/mid rungs to ≥1000).
+        # False SHORT: short_hard + under-counted density on a large atlas.
+        # Must run *after* soft buffer (which would leave k=1000 and formerly
+        # skipped residual anti-SHORT that only checked k≤500).
+        if base_branch.startswith("short_hard") and _is_false_short_geometry() and k_clip < floor_k:
+            k_floor = _clip_k(floor_k, k_min, k_max, n_genes)
+            why = "false_short_nd_low"
+            return _out(
+                k_floor,
+                f"{branch_out}+antishort:{why}",
+                short_blocked=True,
+                short_block_reason=why,
+                short_k_raw=int(k_rule),
+                k_buffer_raw=buf_raw,
+                no_buffer=bool(skip_buffer),
+                **extra,
+            )
+        # Residual hard-SHORT after soft buffer (ladder miss / buffer off).
+        # High-nd multi-core SHORT: conf/sens alone must not floor to 2000.
         if k_clip <= 500:
-            reasons = _short_block_reasons()
+            high_nd = bool(np.isfinite(nd) and nd >= float(TRUE_SHORT_ND_MIN))
+            reasons = _short_block_reasons(for_high_nd_short=high_nd)
             if reasons and k_clip < floor_k:
                 k_floor = _clip_k(floor_k, k_min, k_max, n_genes)
                 why = "+".join(reasons)
@@ -635,12 +715,14 @@ def explain_structure_rule(
                     short_block_reason=why,
                     short_k_raw=int(k_rule),
                     k_buffer_raw=buf_raw,
+                    no_buffer=bool(skip_buffer),
                     **extra,
                 )
         return _out(
             k_clip,
             branch_out,
             k_buffer_raw=buf_raw,
+            no_buffer=bool(skip_buffer),
             **extra,
         )
 
@@ -760,6 +842,7 @@ def select_n_top_from_structure(
     short_block_nd_max: int = SHORT_BLOCK_ND_MAX,
     short_floor_k: int = SHORT_FLOOR_K,
     hvg_mode: str | None = None,
+    n_types: int | None = None,
 ) -> int:
     """Structure-aware ``n_top`` (density valleys + pop count).
 
@@ -779,18 +862,21 @@ def select_n_top_from_structure(
     per-population budget instead of falling through to the short-k rules
     below.
 
-    **Soft k buffer (primary):** classical discrete picks are lifted one rung
-    (500→1000, 1000→1500, 1500→2000) before use. This is the product hedge
-    against under-selection; LONG / continuous k unchanged.
+    **Soft k buffer:** classical discrete picks are lifted one rung
+    (500→1000, 1000→1500, 1500→2000) before use, except **true multi-core
+    SHORT** when ``n_types≥5`` and ``n_density_pops≥10`` (keeps 500).
 
-    **Anti-SHORT floor (residual only):** if k is **still** ≤500 after the soft
-    buffer (ladder miss) **and** density is untrusted (low confidence / high
-    depth sensitivity / large n + few density cores), floor to
-    ``short_floor_k`` (default 2000). Soft buffer is **not** overridden to
-    2000 just because the pre-buffer rule was ``short_*``.
+    **False-SHORT floor:** ``short_hard`` + large n + low density confidence +
+    ``n_density_pops≤6`` floors to ``short_floor_k`` (default 2000) even after
+    soft buffer (Zheng-like density under-count).
+
+    **Residual anti-SHORT:** if k is still ≤500 after the above and density is
+    untrusted *without* high-nd multi-core geometry, floor to
+    ``short_floor_k``.
 
     Pass ``n_obs`` and ``n_leiden`` for v5+; without them behaviour
-    approximates v4.
+    approximates v4. Pass ``n_types`` (from labels) to enable true-SHORT
+    no-buffer.
 
     For a machine-readable branch label, use :func:`explain_structure_rule`.
     """
@@ -821,6 +907,7 @@ def select_n_top_from_structure(
             short_block_nd_max=short_block_nd_max,
             short_floor_k=short_floor_k,
             hvg_mode=hvg_mode,
+            n_types=n_types,
         )["n_top"]
     )
 
@@ -1217,27 +1304,52 @@ def _apply_short_floor_if_needed(
     short_block_nd_max: int = SHORT_BLOCK_ND_MAX,
     short_floor_k: int = SHORT_FLOOR_K,
 ) -> tuple[int, str, str | None]:
-    """Post-combine SHORT floor only (same conditions as :func:`explain_structure_rule`).
+    """Post-combine SHORT / false-SHORT floor (matches :func:`explain_structure_rule`).
 
     Soft k-buffer is **not** re-applied here: ``explain_structure_rule`` /
     per-seed and aggregated rules already lifted 500→1000 / 1000→1500 /
     1500→2000. Re-buffering after combine double-lifted mid rungs (e.g.
     soft_1000 → 1500 in the rule, then 1500 → 2000 again here).
 
+    **False SHORT:** if combine left k in (500, short_floor) under large-n +
+    low conf + ``nd ≤ FALSE_SHORT_ND_MAX``, floor to ``short_floor_k`` (covers
+    unanimous soft-buffered short_hard that skipped per-seed false-SHORT in
+    older paths).
+
+    **Residual ≤500:** untrusted density floors, except high-nd multi-core
+    SHORT (``nd ≥ TRUE_SHORT_ND_MIN``) where conf/sens alone must not override.
+
     Returns ``(k, k_source, post_block_tag_or_None)``.
     """
     k_cur = int(k)
+    conf = str(density_confidence).lower() if density_confidence else None
+    n_cells = int(n_obs) if n_obs is not None else None
+    nd = float(n_density_pops)
+    floor_k = int(short_floor_k)
+
+    # False SHORT after soft buffer (k often 1000): density under-count on large n.
+    if (
+        k_cur < floor_k
+        and conf == "low"
+        and n_cells is not None
+        and n_cells >= int(short_block_n_obs)
+        and np.isfinite(nd)
+        and nd <= float(FALSE_SHORT_ND_MAX)
+    ):
+        k_new = _clip_k(floor_k, k_min, k_max, n_genes)
+        why = "false_short_nd_low"
+        return int(k_new), f"anti_short_floor:{why}", f"antishort:{why}"
+
     # Residual hard-SHORT only (≤500). Buffered soft_1000/mid already ≥1000.
     if k_cur > 500:
         return k_cur, k_source, None
     reasons: list[str] = []
-    conf = str(density_confidence).lower() if density_confidence else None
-    if conf == "low":
-        reasons.append("density_confidence_low")
-    if density_depth_sensitivity is not None and int(density_depth_sensitivity) >= 3:
-        reasons.append("density_depth_sensitivity_high")
-    n_cells = int(n_obs) if n_obs is not None else None
-    nd = float(n_density_pops)
+    high_nd = bool(np.isfinite(nd) and nd >= float(TRUE_SHORT_ND_MIN))
+    if not high_nd:
+        if conf == "low":
+            reasons.append("density_confidence_low")
+        if density_depth_sensitivity is not None and int(density_depth_sensitivity) >= 3:
+            reasons.append("density_depth_sensitivity_high")
     if (
         n_cells is not None
         and n_cells >= int(short_block_n_obs)
@@ -1247,7 +1359,7 @@ def _apply_short_floor_if_needed(
         reasons.append("large_n_few_density_pops")
     if not reasons:
         return k_cur, k_source, None
-    k_new = _clip_k(int(short_floor_k), k_min, k_max, n_genes)
+    k_new = _clip_k(floor_k, k_min, k_max, n_genes)
     why = "+".join(reasons)
     return int(k_new), f"anti_short_floor:{why}", f"anti_short:{why}"
 
@@ -1264,6 +1376,8 @@ def estimate_n_top_structure(
     n_seeds: int = 1,
     progress: bool = False,
     hvg_mode: str | None = None,
+    n_types: int | None = None,
+    label_key: str | None = None,
     **feature_kwargs: Any,
 ) -> tuple[int, dict[str, Any]]:
     """End-to-end structure-aware ``n_top``: features → rule v7 (default).
@@ -1289,6 +1403,8 @@ def estimate_n_top_structure(
     :func:`_combine_structure_k`.
 
     ``hvg_mode="fine"`` floors SHORT soft lists to ≥2000 after the rule.
+    ``n_types`` / ``label_key`` enable true-SHORT no-buffer (multi-core SHORT
+    keeps k=500 when types ≥5).
 
     Returns
     -------
@@ -1301,9 +1417,20 @@ def estimate_n_top_structure(
     n_hvg = int(feature_kwargs.pop("n_hvg", 2000))
     min_cluster_size = int(feature_kwargs.pop("min_cluster_size", 30))
     stability_n_boot = int(feature_kwargs.pop("stability_n_boot", STRUCTURE_STABILITY_N_BOOT))
-    # allow hvg_mode via kwargs for older call sites
+    # allow hvg_mode / n_types via kwargs for older call sites
     if hvg_mode is None and "hvg_mode" in feature_kwargs:
         hvg_mode = feature_kwargs.pop("hvg_mode")
+    if n_types is None and "n_types" in feature_kwargs:
+        n_types = feature_kwargs.pop("n_types")
+    if label_key is None and "label_key" in feature_kwargs:
+        label_key = feature_kwargs.pop("label_key")
+    if n_types is None and label_key and adata is not None:
+        try:
+            if label_key in getattr(adata, "obs", {}):
+                labs = np.asarray(adata.obs[label_key].astype(str))
+                n_types = int(len(np.unique(labs)))
+        except Exception:
+            n_types = None
     if feature_kwargs:
         logger.debug("estimate_n_top_structure ignoring kwargs %s", feature_kwargs)
 
@@ -1314,9 +1441,7 @@ def estimate_n_top_structure(
     if n_seeds > 1:
         _progress(
             progress,
-            "structure auto_n: extracting features from %d seed(s) -- each "
-            "rebuilds its own PCA + neighbour graph, so this can take a few "
-            "minutes on larger datasets. Please wait...",
+            "auto n_top: estimating list size (%d runs; may take a few minutes)...",
             n_seeds,
         )
     per_seed_feats: list[dict[str, Any]] = []
@@ -1335,10 +1460,9 @@ def estimate_n_top_structure(
         if n_seeds > 1:
             _progress(
                 progress,
-                "structure auto_n: seed %d/%d done (%d%%)...",
+                "auto n_top: %d/%d done...",
                 i + 1,
                 n_seeds,
-                round((i + 1) / n_seeds * 100),
             )
         k_i = select_n_top_from_structure(
             valley_median=feat_i.get("valley_median", float("nan")),
@@ -1355,6 +1479,7 @@ def estimate_n_top_structure(
             density_confidence=feat_i.get("density_confidence"),
             density_depth_sensitivity=feat_i.get("density_depth_sensitivity"),
             hvg_mode=hvg_mode,
+            n_types=n_types,
         )
         per_seed_feats.append(feat_i)
         per_seed_k.append(int(k_i))
@@ -1368,6 +1493,8 @@ def estimate_n_top_structure(
             mode="auto",
             n_obs=feat.get("n_obs"),
             n_density_pops=feat.get("n_density_pops"),
+            n_types=n_types,
+            label_key=label_key,
         )["mode"]
     k_vote = _vote_structure_k(per_seed_k)
     rule_kw = dict(
@@ -1385,6 +1512,7 @@ def estimate_n_top_structure(
         density_confidence=feat.get("density_confidence"),
         density_depth_sensitivity=feat.get("density_depth_sensitivity"),
         hvg_mode=hvg_mode,
+        n_types=n_types,
     )
     rule_explain = explain_structure_rule(**rule_kw)
     k_from_agg = int(rule_explain["n_top"])
@@ -1452,12 +1580,14 @@ def estimate_n_top_structure(
             "n_leiden": rule_explain.get("n_leiden"),
             "valley_median": rule_explain.get("valley_median"),
             "n_obs": rule_explain.get("n_obs"),
+            "n_types": rule_explain.get("n_types"),
             "density_confidence": rule_explain.get("density_confidence"),
             "density_depth_sensitivity": rule_explain.get("density_depth_sensitivity"),
             "short_blocked": rule_explain.get("short_blocked"),
             "short_block_reason": rule_explain.get("short_block_reason"),
             "short_k_raw": rule_explain.get("short_k_raw"),
             "k_buffer_raw": rule_explain.get("k_buffer_raw"),
+            "no_buffer": rule_explain.get("no_buffer"),
         },
         "shared_embedding": False,
         "stability_n_boot": int(stability_n_boot),

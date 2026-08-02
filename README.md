@@ -57,7 +57,7 @@ scf.pp.highly_variable_genes(adata, balance_method="none")
 
 ## Status
 
-**0.5.0 (Beta).** Import as `import scfair as scf` and use names in
+**0.6.0 (Beta).** Import as `import scfair as scf` and use names in
 `scfair.__all__` and `scf.pp`. See the
 [API reference](https://scfair.readthedocs.io/en/latest/api/index.html).
 

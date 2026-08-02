@@ -24,10 +24,13 @@ global-exclude docs/AUTO_N_*
 global-exclude docs/CELLBRF_*
 global-exclude docs/DATA_SOURCES.md
 
-graft examples
-# Never ship large or regenerable example outputs / data
+# Public tree: pointer to RTD only. Research / benchmark scripts stay in the
+# developer checkout and are not shipped on PyPI or GitHub release zips.
+include examples/README.md
 prune examples/data
 prune examples/results
+global-exclude examples/*.py
+global-exclude examples/*.sh
 global-exclude examples/**/__pycache__/*
 
 graft .github/workflows

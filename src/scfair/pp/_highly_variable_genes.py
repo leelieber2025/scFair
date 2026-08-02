@@ -956,9 +956,7 @@ def highly_variable_genes(
         elif structure_hybrid_fast:
             _progress(
                 show,
-                "n_top_genes='auto' (structure): estimate k from structure features, "
-                "then %s at that k.",
-                "append secondary HVG" if method == "append" else "one hybrid pass",
+                "n_top_genes='auto': choosing list size from the data...",
             )
 
         # --- Pass 1: global HVG (seeds clustering features for balanced modes) ---
@@ -1074,6 +1072,14 @@ def highly_variable_genes(
             from ._auto_n import PRODUCT_STRUCTURE_N_SEEDS, estimate_n_top_structure
 
             try:
+                # Optional type count for true-SHORT no-buffer (multi-core SHORT
+                # keeps k=500 when labels say ≥5 types). Label-free path skips it.
+                n_types_struct: int | None = None
+                if label_key and label_key in getattr(adata, "obs", {}):
+                    try:
+                        n_types_struct = int(pd.Series(adata.obs[label_key]).astype(str).nunique())
+                    except Exception:
+                        n_types_struct = None
                 n_final, structure_detail = estimate_n_top_structure(
                     adata,
                     counts_layer=counts_layer,
@@ -1088,6 +1094,8 @@ def highly_variable_genes(
                     # the single longest-running, most opaque step in the auto path).
                     progress=show,
                     hvg_mode=hvg_mode if hvg_mode != "balanced" else "auto",
+                    n_types=n_types_struct,
+                    label_key=label_key,
                 )
                 # Re-resolve mode with structure features (may promote to fine/compact).
                 mode_info = resolve_hvg_mode(
@@ -1150,7 +1158,7 @@ def highly_variable_genes(
                     append_budget = _cap
                     _progress(
                         show,
-                        "structure auto_n → base k=%d; append +%d secondary HVG...",
+                        "auto: base list k=%d, then +%d more genes...",
                         n_final,
                         append_budget,
                     )
@@ -1180,7 +1188,7 @@ def highly_variable_genes(
                 else:
                     _progress(
                         show,
-                        "structure auto_n → k=%d; running hybrid once at that k...",
+                        "auto: k=%d; running hybrid selection...",
                         n_final,
                     )
                     selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
@@ -1753,7 +1761,7 @@ def highly_variable_genes(
             )
             _progress(
                 show,
-                "done: %d genes (global HVG base %d + %d secondary append; no clustering).",
+                "done: %d genes (%d base + %d append).",
                 len(selected),
                 n_base,
                 n_extra,

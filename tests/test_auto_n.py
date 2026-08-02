@@ -100,50 +100,135 @@ def test_structure_auto_n_pancreas_like_short():
     assert k == 1000
 
 
-def test_structure_soft_buffer_beats_anti_short_on_short_rules():
-    """SHORT rule + untrusted density: soft buffer 500→1000, NOT hard 2000.
+def test_structure_false_short_floors_after_buffer():
+    """Zheng-like short_hard + large n + low conf + nd≤8 → floor 2000.
 
-    Previously anti-SHORT fired on every short_* branch and swallowed the
-    soft ladder (raw 500 → buffer 1000 → anti_short 2000). Product soft lift
-    must remain visible: 500→1000.
+    Soft buffer alone would leave k=1000 and formerly skipped residual
+    anti-SHORT (which only checked k≤500). False-SHORT must fire after buffer.
+    Covers both the original nd=6 calibration and retest nd=7 Zheng-20k.
     """
     from scfair.pp._auto_n import explain_structure_rule
 
-    # Same geometry as short_hard_vm0.80_nd6, large atlas + low conf
-    d = explain_structure_rule(
+    for nd in (6, 7, 8):
+        d = explain_structure_rule(
+            valley_median=0.83,
+            frac_shallow=0.1,
+            n_density_pops=nd,
+            mean_stability=0.7,
+            min_stability=0.1,
+            n_obs=20_000,
+            n_leiden=8,
+            density_confidence="low",
+        )
+        assert d["short_blocked"] is True, nd
+        assert d["n_top"] == 2000, nd
+        assert d["short_block_reason"] == "false_short_nd_low", nd
+        assert "antishort:false_short_nd_low" in d["rule_branch"], nd
+        assert "k_buffer:500→1000" in d["rule_branch"], nd
+
+    k = select_n_top_from_structure(
         valley_median=0.83,
         frac_shallow=0.1,
-        n_density_pops=6,
+        n_density_pops=7,  # GOLD-15 retest Zheng landed here
         mean_stability=0.7,
         min_stability=0.1,
         n_obs=20_000,
         n_leiden=8,
+        density_confidence="low",
+    )
+    assert k == 2000
+
+
+def test_structure_soft_buffer_when_not_false_short():
+    """short_hard with nd just above false-SHORT max still soft-buffers 500→1000."""
+    from scfair.pp._auto_n import explain_structure_rule
+
+    d = explain_structure_rule(
+        valley_median=0.83,
+        frac_shallow=0.1,
+        n_density_pops=9,  # FALSE_SHORT_ND_MAX=8 → not false SHORT
+        mean_stability=0.7,
+        min_stability=0.1,
+        n_obs=20_000,
+        n_leiden=10,
         density_confidence="low",
     )
     assert d["short_blocked"] is False
     assert d["n_top"] == 1000
     assert d["k_buffer_raw"] == 500
     assert "k_buffer:500→1000" in d["rule_branch"]
-    assert "anti_short" not in d["rule_branch"]
+    assert "antishort:false_short" not in d["rule_branch"]
 
-    k = select_n_top_from_structure(
-        valley_median=0.83,
+
+def test_structure_true_short_skips_buffer_with_n_types():
+    """Multi-core short_hard + n_types≥5: keep k=500 (no soft buffer)."""
+    from scfair.pp._auto_n import explain_structure_rule
+
+    # SLN-like: high nd, multi-type labels
+    d = explain_structure_rule(
+        valley_median=0.92,
         frac_shallow=0.1,
-        n_density_pops=6,
+        n_density_pops=12,
         mean_stability=0.7,
         min_stability=0.1,
-        n_obs=20_000,
-        n_leiden=8,
+        n_obs=15_000,
+        n_leiden=14,
+        density_confidence="low",
+        n_types=9,
+    )
+    assert d["n_top"] == 500
+    assert d["no_buffer"] is True
+    assert "no_buffer:nd12_ntypes9" in d["rule_branch"]
+    assert d["k_buffer_raw"] is None
+    # Without n_types: soft buffer remains (protect 2-way boards)
+    d2 = explain_structure_rule(
+        valley_median=0.92,
+        frac_shallow=0.1,
+        n_density_pops=12,
+        mean_stability=0.7,
+        min_stability=0.1,
+        n_obs=15_000,
+        n_leiden=14,
         density_confidence="low",
     )
-    assert k == 1000
+    assert d2["n_top"] == 1000
+    assert "k_buffer:500→1000" in d2["rule_branch"]
+    # n_types=2 (TM brain-like): still buffer
+    d3 = explain_structure_rule(
+        valley_median=0.79,
+        frac_shallow=0.1,
+        n_density_pops=12,
+        mean_stability=0.7,
+        min_stability=0.1,
+        n_obs=10_000,
+        n_leiden=14,
+        density_confidence="low",
+        n_types=2,
+    )
+    assert d3["n_top"] == 1000
+    assert "k_buffer" in d3["rule_branch"]
 
 
-def test_structure_anti_short_residual_only_when_still_le_500():
-    """Anti-SHORT hard floor only if post-buffer k is still ≤500."""
+def test_structure_anti_short_residual_and_false_short_post_combine():
+    """Post-combine floor: false_short on buffered 1000; residual on raw 500."""
     from scfair.pp._auto_n import _apply_short_floor_if_needed
 
-    # Residual raw 500 under untrusted density → floor 2000
+    # Buffered false-SHORT (k=1000, nd=7 Zheng-like, large n, low conf) → 2000
+    k1, src1, tag1 = _apply_short_floor_if_needed(
+        k=1000,
+        k_source="unanimous_seed_vote",
+        n_obs=20_000,
+        n_density_pops=7,
+        density_confidence="low",
+        density_depth_sensitivity=3,
+        k_min=500,
+        k_max=5000,
+        n_genes=20_000,
+    )
+    assert k1 == 2000
+    assert tag1 is not None and "false_short" in tag1
+
+    # Raw 500 under false-SHORT geometry → same 2000 floor (via false_short path)
     k2, src2, tag2 = _apply_short_floor_if_needed(
         k=500,
         k_source="unanimous_seed_vote",
@@ -156,7 +241,37 @@ def test_structure_anti_short_residual_only_when_still_le_500():
         n_genes=20_000,
     )
     assert k2 == 2000
-    assert tag2 is not None and "anti_short" in tag2
+    assert tag2 is not None and "false_short" in tag2
+
+    # nd=9 is above FALSE_SHORT_ND_MAX=8 → no post-combine floor
+    k2b, _, tag2b = _apply_short_floor_if_needed(
+        k=1000,
+        k_source="unanimous_seed_vote",
+        n_obs=20_000,
+        n_density_pops=9,
+        density_confidence="low",
+        density_depth_sensitivity=3,
+        k_min=500,
+        k_max=5000,
+        n_genes=20_000,
+    )
+    assert k2b == 1000
+    assert tag2b is None
+
+    # High-nd raw 500: conf alone must not floor (true multi-core SHORT)
+    k3, src3, tag3 = _apply_short_floor_if_needed(
+        k=500,
+        k_source="unanimous_seed_vote",
+        n_obs=15_000,
+        n_density_pops=12,
+        density_confidence="low",
+        density_depth_sensitivity=4,
+        k_min=500,
+        k_max=5000,
+        n_genes=20_000,
+    )
+    assert k3 == 500
+    assert tag3 is None
 
 
 def test_structure_auto_n_adt_like_mid():
@@ -802,7 +917,7 @@ def test_post_combine_does_not_double_buffer():
     assert src == "aggregated_features"
     assert tag is None
 
-    # Residual raw SHORT still floors under untrusted density
+    # Raw SHORT under false-SHORT geometry floors to 2000
     k2, src2, tag2 = _apply_short_floor_if_needed(
         k=500,
         k_source="unanimous_seed_vote",
@@ -815,7 +930,7 @@ def test_post_combine_does_not_double_buffer():
         n_genes=20_000,
     )
     assert k2 == 2000
-    assert tag2 is not None and "anti_short" in tag2
+    assert tag2 is not None and "false_short" in tag2
 
 
 def test_explain_structure_rule_seurat_v7_band_floor():

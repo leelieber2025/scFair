@@ -103,7 +103,7 @@ def test_diagnose_from_labels_describes_imbalance_without_forecasting():
     assert d["recommendation"] == "keep_current"
     assert d["benefit_evidence"] == "not_predictable"
     assert d["known_no_gain_regime"] is False
-    assert any("does not predict" in t.lower() for t in d["tips"])
+    assert any("does not say" in t.lower() or "does not predict" in t.lower() for t in d["tips"])
 
 
 def test_diagnose_from_labels_balanced_is_also_not_a_forecast():
@@ -185,12 +185,13 @@ def test_strong_imbalance_is_described_not_graded():
     assert d["benefit_evidence"] == "not_predictable"
     assert d["recommendation"] == "keep_current"
     assert d["known_no_gain_regime"] is False
-    # the imbalance is still reported, with its numbers
-    assert any("imbalance: strong" in t for t in d["tips"])
+    # strong imbalance still gets a short user-facing tip
+    assert any("imbalance" in t.lower() or "largest" in t.lower() for t in d["tips"])
     # ... and no tip promises a gain
     joined = " ".join(d["tips"]).lower()
     assert "largest gains" not in joined
     assert "most useful" not in joined
+    assert "seurat_v4" not in joined
 
 
 def test_rare_tail_advice_is_conditional_not_a_recommendation():
@@ -316,7 +317,7 @@ def test_no_gain_regime_does_not_get_the_tuning_advice(adata_for_hvg):
     assert not any("Sweep it" in t for t in tips)
 
 
-def test_structure_auto_tips_short_k_mentions_fixed_2000():
+def test_structure_auto_tips_short_k_user_friendly():
     from scfair.pp._diagnosis import _structure_auto_tips
 
     tips, flags = _structure_auto_tips(
@@ -330,16 +331,19 @@ def test_structure_auto_tips_short_k_mentions_fixed_2000():
                 "n_leiden": 19,
                 "ratio": 1.36,
                 "valley_median": 0.71,
-                "v7_band_miss": ["vm_ok", "ratio_ok"],
             },
         },
     )
     assert "structure_short_k" in flags
-    assert "structure_v7_band_miss" in flags
-    blob = " ".join(tips).lower()
-    assert "n_top=500" in blob or "n_top=500" in " ".join(tips)
-    assert "n_top_genes=2000" in " ".join(tips)
-    assert "v7" in blob
+    assert len(tips) == 1
+    blob = tips[0].lower()
+    assert "500" in blob
+    assert "n_top_genes=2000" in tips[0]
+    # no internal jargon dumps
+    assert "nd=" not in blob
+    assert "valley" not in blob
+    assert "v7" not in blob
+    assert "branch" not in blob
 
 
 def test_structure_auto_tips_v7_band_floor():
@@ -361,8 +365,32 @@ def test_structure_auto_tips_v7_band_floor():
     )
     assert "structure_v7_band_floor" in flags
     assert "downstream_fine_resolution" in flags
-    assert any("fine-atlas" in t.lower() or "v7" in t.lower() for t in tips)
-    assert any("1.5" in t for t in tips)
+    assert len(tips) == 1
+    assert "1.5" in tips[0]
+    assert "2000" in tips[0]
+    assert not any("seurat_v4" in t.lower() for t in tips)
+    assert not any("nd=" in t for t in tips)
+    assert not any("append_budget" in t for t in tips)
+
+
+def test_structure_auto_tips_soft_buffer_short():
+    """Soft-buffer is normal product behaviour — flag only, no user tip."""
+    from scfair.pp._diagnosis import _structure_auto_tips
+
+    tips, flags = _structure_auto_tips(
+        k=1000,
+        structure_meta={
+            "rule_branch": "short_hard_vm0.70_nd12+k_buffer:500→1000",
+            "k_buffer_raw": 500,
+            "rule_explain": {
+                "rule_branch": "short_hard_vm0.70_nd12+k_buffer:500→1000",
+                "k_buffer_raw": 500,
+            },
+        },
+    )
+    assert "structure_k_buffer" in flags
+    # No tip about 500→1000 / soft-buffer — confuses users; done line shows k.
+    assert tips == []
 
 
 def test_resolve_hvg_mode_auto():
@@ -431,8 +459,9 @@ def test_diagnose_from_labels_fine_downstream():
 
 
 def test_diagnose_hvg_run_structure_meta_short():
+    # append: no intermediate clustering required to surface the short-k tip
     diag = diagnose_hvg_run(
-        balance_method="hybrid",
+        balance_method="append",
         n_top_genes_used=500,
         n_top_is_auto=True,
         auto_n_strategy="structure",
@@ -452,6 +481,7 @@ def test_diagnose_hvg_run_structure_meta_short():
     )
     assert "structure_short_k" in diag["flags"]
     assert any("2000" in t for t in diag["tips"])
+    assert len(diag["tips"]) <= 2
 
 
 def test_diagnosis_coarse_partition_and_fallback_not_keep_current():
@@ -482,4 +512,6 @@ def test_diagnosis_coarse_partition_and_fallback_not_keep_current():
     assert diag["recommendation"] == "raise_resolution"
     assert diag["benefit_evidence"] == "structure_unreliable"
     assert diag["imbalance_source"] == "intermediate_clusters_unreliable"
-    assert any("collapsed" in t or "fallback" in t.lower() or "only 2" in t for t in diag["tips"])
+    blob = " ".join(diag["tips"]).lower()
+    assert "too coarse" in blob or "fallback" in blob or "only 2" in blob
+    assert len(diag["tips"]) <= 2

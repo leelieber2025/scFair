@@ -7,6 +7,40 @@ Versions follow [Semantic Versioning](https://semver.org/). While the package
 is in the `0.x` series, defaults may still change in a minor release when new
 evidence warrants it.
 
+## [Unreleased]
+
+## [0.6.0] - 2026-08-02
+
+Structure auto-`k` v1.1, clearer product diagnostics, and a full GOLD-15
+product retest (append + auto vs HVG@2000).
+
+### Fixed
+
+- Structure auto_n **false SHORT** (Zheng-like): `short_hard` + large `n_obs` +
+  low density confidence + `n_density_pops ≤ 8` floors to 2000 **after** the
+  soft buffer (was stuck at 1000 because residual anti-SHORT only checked
+  `k ≤ 500`). Threshold was `nd ≤ 6` in an earlier draft; GOLD Zheng-20k
+  retest measured `nd=7`, so the cap is now 8.
+- Structure auto_n **true SHORT** (SLN-like): with labels (`n_types ≥ 5`) and
+  multi-core geometry (`n_density_pops ≥ 10`), skip the 500→1000 soft buffer so
+  k stays 500. Two-type boards (`n_types < 5`) still buffer (TM brain safety).
+- Product `n_top_genes="auto"` passes `label_key` / `n_types` into structure
+  estimation when available (`options=HVGOptions(label_key=...)`). Branch tags:
+  `+no_buffer:nd…_ntypes…`, `+antishort:false_short_nd_low`.
+
+### Changed
+
+- Progress / diagnosis tips are short and user-facing (no internal feature dumps
+  such as `nd=` / `branch=` / research dataset names on stderr). Soft-buffer
+  outcomes stay silent; at most two tips per call.
+- Product `append_budget` default remains the absolute **200** (calibrated near
+  base≈2000); not scaled with base. Override with `HVGOptions(append_budget=…)`.
+
+### Documentation
+
+- GOLD-15 product retest tables (pred n / used n / best n + ΔARI) and development
+  log §5.49 archive of the v1.1 decision record.
+
 ## [0.5.0] - 2026-08-02
 
 First public release prepared for PyPI and Read the Docs.
