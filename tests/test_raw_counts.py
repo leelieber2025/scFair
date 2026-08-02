@@ -114,6 +114,39 @@ def test_auto_mode_recovers_from_raw(adata_counts):
     assert _is_integer_counts_like(ad.layers["counts"])
 
 
+def test_is_integer_counts_like_uses_atol_only():
+    """rtol relative to magnitude would accept 100000.5; use atol only."""
+    # Half-count at large magnitude must NOT be integer-like.
+    big = np.array([[100000.5, 2.0], [3.0, 4.0]], dtype=float)
+    assert not _is_integer_counts_like(big)
+    # True integer floats still pass.
+    ok = np.array([[100000.0, 2.0], [3.0, 4.0]], dtype=float)
+    assert _is_integer_counts_like(ok)
+    # Small fractional noise within atol=1e-6 still ok.
+    noisy = np.array([[1.0 + 1e-7, 2.0]], dtype=float)
+    assert _is_integer_counts_like(noisy)
+
+
+def test_is_integer_counts_like_catches_trailing_fractional_sparse():
+    """Isolated non-integer at the end of a large sparse .data must not pass.
+
+    Strided sampling with max_check≪nnz could miss a single tail value; full
+    check up to 1e7 nnz closes that hole.
+    """
+    n = 200_000
+    data = np.ones(n, dtype=np.float64)
+    data[-1] = 0.5  # single fractional at the end
+    indptr = np.arange(0, n + 1, dtype=np.int32)
+    #  n cells × 1 gene sparse CSR with n nonzeros
+    indices = np.zeros(n, dtype=np.int32)
+    X = sp.csr_matrix((data, indices, indptr), shape=(n, 1))
+    assert not _is_integer_counts_like(X)
+    # Pure integers still pass at this size.
+    data2 = np.ones(n, dtype=np.float64)
+    X2 = sp.csr_matrix((data2, indices, indptr), shape=(n, 1))
+    assert _is_integer_counts_like(X2)
+
+
 def test_sparse_roundtrip(adata_counts_sparse):
     ad = adata_counts_sparse.copy()
     _store_raw_counts(ad)
@@ -143,10 +176,19 @@ def test_ondisk_sidecar(adata_counts, tmp_path):
 
 def test_prepare_counts_layer(adata_counts):
     ad = adata_counts.copy()
+    # Default: counts layer only, no uns raw_snapshot (avoids 3× h5ad bloat).
     name = _prepare_counts_layer(ad)
     assert name == "counts"
     assert "counts" in ad.layers
+    assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
+
+
+def test_prepare_counts_layer_store_raw(adata_counts):
+    ad = adata_counts.copy()
+    name = _prepare_counts_layer(ad, store_raw=True)
+    assert name == "counts"
     assert "raw_snapshot" in ad.uns[UNS_KEY]
+    assert ad.uns[UNS_KEY]["raw_snapshot"]["backend"] == "inline"
 
 
 def test_resolve_aligned_after_subset(adata_counts):
@@ -156,6 +198,23 @@ def test_resolve_aligned_after_subset(adata_counts):
     mat = resolve_aligned_raw_counts(sub, layer="counts", require_integer=True)
     assert mat is not None
     assert mat.shape == (sub.n_obs, sub.n_vars)
+
+
+def test_resolve_aligned_from_raw_after_gene_subset(adata_counts):
+    """adata.raw with more genes than current object is the normal scanpy case."""
+    ad = adata_counts.copy()
+    X_full = np.asarray(ad.X, dtype=float).copy()
+    ad.raw = ad.copy()
+    # Subset genes; drop counts layer and snapshot so only .raw remains.
+    sub = ad[:, :5].copy()
+    sub.layers.pop("counts", None)
+    if UNS_KEY in sub.uns:
+        sub.uns[UNS_KEY].pop("raw_snapshot", None)
+        sub.uns[UNS_KEY].pop("raw_gene_list", None)
+    mat = resolve_aligned_raw_counts(sub, layer="counts", require_integer=True)
+    assert mat is not None
+    assert mat.shape == (sub.n_obs, 5)
+    assert np.allclose(np.asarray(mat, dtype=float), X_full[:, :5])
 
 
 def test_public_api_does_not_export_store_restore():
@@ -187,11 +246,11 @@ def test_explicit_layer_refreshes_a_stale_snapshot():
     adata.layers["a"] = X.copy()
     adata.layers["b"] = (X * 3).astype(np.float32)
 
-    used = _prepare_counts_layer(adata, layer="a")
+    used = _prepare_counts_layer(adata, layer="a", store_raw=True)
     assert used == "a"
     snap_a = np.asarray(adata.uns[UNS_KEY]["raw_snapshot"]["X"])
 
-    used = _prepare_counts_layer(adata, layer="b")
+    used = _prepare_counts_layer(adata, layer="b", store_raw=True)
     assert used == "b", "an explicitly requested layer must be the one used"
     snap_b = np.asarray(adata.uns[UNS_KEY]["raw_snapshot"]["X"])
 
@@ -215,3 +274,116 @@ def test_explicit_layer_wins_over_an_existing_counts_layer():
     adata.layers["counts"] = np.zeros_like(X)  # decoy
 
     assert _prepare_counts_layer(adata, layer="raw") == "raw"
+    # Must not overwrite or replace the existing decoy counts layer.
+    assert np.array_equal(adata.layers["counts"], np.zeros_like(X))
+
+
+def test_matrix_fingerprint_uses_column_sums():
+    """Same global sum but different column distribution must not collide."""
+    from scfair.pp._raw_counts import _matrix_fingerprint
+
+    a = np.array([[1, 0, 0], [1, 0, 0], [0, 0, 0]], dtype=float)
+    b = np.array([[0, 0, 1], [0, 0, 1], [0, 0, 0]], dtype=float)
+    assert a.sum() == b.sum()
+    assert a.shape == b.shape
+    assert int(np.count_nonzero(a)) == int(np.count_nonzero(b))
+    assert _matrix_fingerprint(a) != _matrix_fingerprint(b)
+    assert _matrix_fingerprint(a) == _matrix_fingerprint(a.copy())
+
+
+def test_explicit_layer_does_not_materialize_into_counts():
+    """layer='alt' must not permanently hijack later default (layer=None) calls."""
+    import anndata as ad
+    import numpy as np
+
+    from scfair.pp._raw_counts import _prepare_counts_layer
+
+    rng = np.random.default_rng(2)
+    X = rng.poisson(1.0, size=(40, 15)).astype(np.float32)
+    alt = rng.poisson(5.0, size=(40, 15)).astype(np.float32)
+    adata = ad.AnnData(X=X)
+    adata.obs_names = [f"c{i}" for i in range(40)]
+    adata.var_names = [f"g{i}" for i in range(15)]
+    adata.layers["alt"] = alt
+
+    assert _prepare_counts_layer(adata, layer="alt") == "alt"
+    assert "counts" not in adata.layers
+
+    used = _prepare_counts_layer(adata)  # default
+    assert used == "counts"
+    # Default path materialises from .X, not from the prior layer='alt' call.
+    assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(X))
+
+
+def test_stale_counts_uses_internal_layer_preserves_user_counts():
+    """Fingerprint mismatch: use .X via _scfair_counts; never clobber user layer."""
+    import anndata as ad
+    import numpy as np
+    import pytest
+
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER, _prepare_counts_layer
+
+    rng = np.random.default_rng(3)
+    X1 = rng.poisson(1.0, size=(40, 15)).astype(np.float32)
+    X2 = rng.poisson(8.0, size=(40, 15)).astype(np.float32)
+    counts_b = rng.poisson(3.0, size=(40, 15)).astype(np.float32)
+    adata = ad.AnnData(X=X1)
+    adata.obs_names = [f"c{i}" for i in range(40)]
+    adata.var_names = [f"g{i}" for i in range(15)]
+
+    assert _prepare_counts_layer(adata) == "counts"
+    # User replaces .X and also keeps a distinct intentional counts matrix.
+    adata.X = X2
+    adata.layers["counts"] = counts_b.copy()
+    with pytest.warns(UserWarning, match="left unchanged|internal layer"):
+        used = _prepare_counts_layer(adata)
+    assert used == INTERNAL_COUNTS_LAYER
+    # User layer must be byte-identical to what they put there.
+    assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(counts_b))
+    assert np.array_equal(np.asarray(adata.layers[INTERNAL_COUNTS_LAYER]), np.asarray(X2))
+
+
+def test_intentional_dual_integer_counts_not_destroyed():
+    """Both .X and layers['counts'] integer but different — preserve the layer."""
+    import anndata as ad
+    import numpy as np
+    import pytest
+
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER, _prepare_counts_layer
+
+    rng = np.random.default_rng(5)
+    counts_a = rng.poisson(1.0, size=(30, 12)).astype(np.float32)
+    counts_b = rng.poisson(7.0, size=(30, 12)).astype(np.float32)
+    adata = ad.AnnData(X=counts_a.copy())
+    adata.obs_names = [f"c{i}" for i in range(30)]
+    adata.var_names = [f"g{i}" for i in range(12)]
+    adata.layers["counts"] = counts_b.copy()
+
+    with pytest.warns(UserWarning, match="left unchanged"):
+        used = _prepare_counts_layer(adata)
+    assert used == INTERNAL_COUNTS_LAYER
+    assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(counts_b))
+    # Escape hatch still works.
+    assert _prepare_counts_layer(adata, layer="counts") == "counts"
+    assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(counts_b))
+
+
+def test_log_normalized_X_keeps_counts_layer():
+    """Usual scanpy pattern: raw in counts, log1p in .X — do not overwrite counts."""
+    import anndata as ad
+    import numpy as np
+    import scanpy as sc
+
+    from scfair.pp._raw_counts import _prepare_counts_layer
+
+    rng = np.random.default_rng(4)
+    X = rng.poisson(2.0, size=(40, 15)).astype(np.float32)
+    adata = ad.AnnData(X=X.copy())
+    adata.obs_names = [f"c{i}" for i in range(40)]
+    adata.var_names = [f"g{i}" for i in range(15)]
+    adata.layers["counts"] = X.copy()
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    assert _prepare_counts_layer(adata) == "counts"
+    assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(X))

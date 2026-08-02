@@ -57,6 +57,7 @@ sizes, so the bandwidth is expressed as a fraction of ``n_obs``:
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,13 +87,24 @@ class GranularityEstimate:
     n_populations
         The count, or ``None`` when the estimate could not run at all.
     reason
-        ``ok`` | ``too_few_cells`` | ``no_embedding``.
+        ``ok`` | ``too_few_cells`` | ``no_embedding``. ``ok`` only means the
+        estimator produced a count — not that the count is reliable. Check
+        ``confidence`` / ``depth_sensitivity``.
     labels
         Cell -> population; ``None`` when there is no count.
     bandwidth
         The kNN bandwidth actually used, in cells.
     depth
         The merge threshold actually used.
+    confidence
+        ``high`` | ``moderate`` | ``low`` | ``none``. Depth-perturbation
+        stability of the count; ``none`` when no estimate ran.
+    depth_sensitivity
+        ``n_populations`` at a looser depth minus the count at a stricter
+        depth. Large values mean the count moves when the merge threshold
+        moves — treat ``n_populations`` as uncertain.
+    n_populations_loose, n_populations_strict
+        Counts at depth×0.5 and min(0.95, depth×1.5) for the margin.
     """
 
     n_populations: int | None
@@ -100,6 +112,10 @@ class GranularityEstimate:
     labels: np.ndarray | None = None
     bandwidth: int | None = None
     depth: float = DEFAULT_DEPTH
+    confidence: str = "none"
+    depth_sensitivity: int | None = None
+    n_populations_loose: int | None = None
+    n_populations_strict: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Diagnostics-shaped view, for ``uns``. Omits the per-cell labels."""
@@ -108,6 +124,10 @@ class GranularityEstimate:
             "reason": self.reason,
             "bandwidth": self.bandwidth,
             "depth": float(self.depth),
+            "confidence": self.confidence,
+            "depth_sensitivity": self.depth_sensitivity,
+            "n_populations_loose": self.n_populations_loose,
+            "n_populations_strict": self.n_populations_strict,
         }
         if self.labels is not None:
             # Sizes of the density-field populations -- not of the Leiden
@@ -115,13 +135,23 @@ class GranularityEstimate:
             # `n_top_genes` should scale with population size is an open,
             # measurable question (see _auto_n.select_n_top_from_populations).
             _, counts = np.unique(self.labels, return_counts=True)
-            out["population_sizes"] = sorted((int(c) for c in counts), reverse=True)
+            sizes = sorted((int(c) for c in counts), reverse=True)
+            out["population_sizes"] = sizes
+            if len(sizes) >= 2 and sizes[-1] > 0:
+                out["size_max_min_ratio"] = float(sizes[0] / sizes[-1])
+            elif len(sizes) == 1:
+                out["size_max_min_ratio"] = 1.0
         return out
 
 
 # ---------------------------------------------------------------------------
 # density and peak merging
 # ---------------------------------------------------------------------------
+# Floor on k-th neighbour distance. ``np.finfo(float).tiny ** 3`` underflows
+# to 0 → rho=inf → rho/rho.max() = NaN on duplicate / near-duplicate points.
+_KNN_DIST_FLOOR = 1e-12
+
+
 def knn_density(X: np.ndarray, k: int) -> np.ndarray:
     """Adaptive kNN density on an embedding, normalised to max 1.
 
@@ -130,15 +160,31 @@ def knn_density(X: np.ndarray, k: int) -> np.ndarray:
     and ``k`` is in units of cells rather than a fraction of the layout's
     extent. That independence from the layout's extent is the whole point —
     see the module docstring on why the voxel formulation failed.
+
+    Duplicate coordinates (common in integer embeddings / collapsed UMAP) are
+    handled by flooring ``r_k`` so density stays finite; callers should treat a
+    near-flat field as low confidence.
     """
     from sklearn.neighbors import NearestNeighbors
 
     k = int(min(k, X.shape[0] - 1))
     nn = NearestNeighbors(n_neighbors=k + 1).fit(X)
     dist, _ = nn.kneighbors(X)
-    r = np.maximum(dist[:, k], np.finfo(float).tiny)
-    rho = 1.0 / r ** X.shape[1]
-    return rho / rho.max()
+    r = np.maximum(dist[:, k].astype(float, copy=False), _KNN_DIST_FLOOR)
+    dim = max(int(X.shape[1]), 1)
+    # Avoid overflow to inf for very small r and high d before the floor bites.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        rho = 1.0 / np.power(r, float(dim))
+    rho = np.asarray(rho, dtype=float)
+    finite = np.isfinite(rho) & (rho > 0)
+    if not np.any(finite):
+        # Fully degenerate (should be rare after the distance floor).
+        return np.ones(X.shape[0], dtype=float)
+    rho = np.where(finite, rho, 0.0)
+    m = float(rho.max())
+    if m <= 0.0 or not np.isfinite(m):
+        return np.ones(X.shape[0], dtype=float)
+    return rho / m
 
 
 def knn_graph(X: np.ndarray, k: int) -> np.ndarray:
@@ -234,13 +280,50 @@ def population_count_from_embedding(
 
     nbrs = knn_graph(X, k_graph)
     rho = knn_density(X, k)
+    # Near-flat density (duplicates / collapsed embedding): merge_peaks with
+    # NaNs used to never merge and inflate n_pop while still reporting high
+    # confidence. Force low confidence when the field has no usable contrast.
+    rho_finite = bool(np.all(np.isfinite(rho)))
+    rho_span = float(np.nanmax(rho) - np.nanmin(rho)) if rho.size else 0.0
+    density_degenerate = (not rho_finite) or rho_span < 1e-12
+    if not rho_finite:
+        rho = np.nan_to_num(np.asarray(rho, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        m = float(rho.max()) if rho.size else 0.0
+        rho = (rho / m) if m > 0 else np.ones(X.shape[0], dtype=float)
+
     labels = merge_peaks(rho, nbrs, depth)
+    n_pop = int(pd.unique(labels).size)
+
+    # Depth-perturbation margin: the same field at looser / stricter merges.
+    # reason="ok" alone is not a reliability claim — if the count swings with
+    # depth, the density field is not resolving stable valleys.
+    depth_lo = max(0.05, float(depth) * 0.5)
+    depth_hi = min(0.95, float(depth) * 1.5)
+    n_loose = int(pd.unique(merge_peaks(rho, nbrs, depth_lo)).size)
+    n_strict = int(pd.unique(merge_peaks(rho, nbrs, depth_hi)).size)
+    sensitivity = int(n_loose - n_strict)
+    if density_degenerate:
+        confidence = "low"
+    elif sensitivity <= 0 and n_pop >= 2:
+        confidence = "high"
+    elif sensitivity <= 2:
+        confidence = "moderate"
+    else:
+        confidence = "low"
+    # Single blob is always low-confidence as a multi-type claim.
+    if n_pop < 2:
+        confidence = "low"
+
     return GranularityEstimate(
-        n_populations=int(pd.unique(labels).size),
-        reason="ok",
+        n_populations=n_pop,
+        reason="degenerate_density" if density_degenerate else "ok",
         labels=labels,
         bandwidth=k,
         depth=depth,
+        confidence=confidence,
+        depth_sensitivity=sensitivity,
+        n_populations_loose=n_loose,
+        n_populations_strict=n_strict,
     )
 
 
@@ -448,6 +531,11 @@ def resolution_from_density_field(
         return int(adata.obs[leiden_key].nunique())
 
     res, n_got, calls = resolution_for_n_clusters(leiden_fn, est.n_populations)
+    # Hard floor even if bisection returned something lower (should not with lo=0.2).
+    if float(res) < float(AUTO_RESOLUTION_LO):
+        res = float(AUTO_RESOLUTION_LO)
+        n_got = int(leiden_fn(res))
+        calls += 1
     if leiden_key in adata.obs:  # DataFrame.pop takes no default
         del adata.obs[leiden_key]
     diag.update(
@@ -455,7 +543,11 @@ def resolution_from_density_field(
             "resolution_source": "density_field",
             "n_populations_target": int(est.n_populations),
             "n_clusters_achieved": int(n_got),
+            # Signed gap: achieved − target (0 = hit; Leiden is only weakly
+            # monotone in resolution so a non-zero gap is normal).
+            "n_target_gap": int(n_got) - int(est.n_populations),
             "n_leiden_calls": int(calls),
+            "resolution_floor": float(AUTO_RESOLUTION_LO),
         }
     )
     if n_got != est.n_populations:
@@ -469,15 +561,38 @@ def resolution_from_density_field(
             n_got,
             res,
         )
+    # Under-partition relative to the density estimate: rare populations are
+    # often absorbed into majority clusters; specificity then cannot score them.
+    if int(n_got) < max(2, int(est.n_populations) - 1) or (
+        int(est.n_populations) >= 4 and int(n_got) <= int(est.n_populations) - 2
+    ):
+        msg = (
+            f"resolution='auto' targeted ~{est.n_populations} populations from the "
+            f"density field but Leiden only formed {n_got} communities at "
+            f"resolution={float(res):.4g}. Rare types may be unresolved in the "
+            "intermediate partition (specificity cannot score them). Consider "
+            "passing a higher float resolution (e.g. 0.5–1.0) or checking "
+            "clustering diagnostics."
+        )
+        warnings.warn(msg, UserWarning, stacklevel=3)
+        logger.warning(msg)
+        diag["under_partition_warning"] = True
     return float(res), diag
+
+
+# Floor for resolution="auto" bisection. Values near 0.05 routinely collapse
+# multi-type data to a handful of coarse communities and erase rare populations
+# from the intermediate partition (specificity then cannot score them).
+AUTO_RESOLUTION_LO = 0.2
+AUTO_RESOLUTION_HI = 4.0
 
 
 def resolution_for_n_clusters(
     leiden_fn,
     n_target: int,
     *,
-    lo: float = 0.05,
-    hi: float = 4.0,
+    lo: float = AUTO_RESOLUTION_LO,
+    hi: float = AUTO_RESOLUTION_HI,
     max_calls: int = 12,
 ) -> tuple[float, int, int]:
     """Bisect Leiden's resolution until it yields ``n_target`` communities.
@@ -489,7 +604,13 @@ def resolution_for_n_clusters(
     target can be unreachable; the closest resolution found is returned along
     with the count actually achieved, and the caller decides whether that is
     good enough. Returns ``(resolution, n_clusters, n_calls)``.
+
+    ``lo`` defaults to :data:`AUTO_RESOLUTION_LO` (0.2), not 0.05 — ultra-low
+    resolutions were observed to miss rare populations entirely while still
+    reporting a high ARI on the coarse majority partition.
     """
+    lo = max(float(lo), float(AUTO_RESOLUTION_LO))
+    hi = max(float(hi), lo)
     best: tuple[float, int] | None = None
     calls = 0
 
@@ -497,8 +618,17 @@ def resolution_for_n_clusters(
         nonlocal best, calls
         n = int(leiden_fn(res))
         calls += 1
-        if best is None or abs(n - n_target) < abs(best[1] - n_target):
+        # Prefer closer to n_target. On an exact-distance tie prefer the
+        # *higher* resolution: low-res misses rare populations (the reason
+        # AUTO_RESOLUTION_LO was raised from 0.05 → 0.2). Strict ``<`` used
+        # to keep the first hit (always ``lo``), biasing every tie low.
+        if best is None:
             best = (res, n)
+        else:
+            d_new = abs(n - n_target)
+            d_old = abs(best[1] - n_target)
+            if d_new < d_old or (d_new == d_old and res > best[0]):
+                best = (res, n)
         return n
 
     n_lo, n_hi = evaluate(lo), evaluate(hi)

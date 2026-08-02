@@ -14,15 +14,30 @@ Post-call diagnosis is written to ``adata.uns['scfair']['hvg']['diagnosis']``
 when ``diagnose=True`` (default).
 """
 
-from ._auto_n import estimate_n_top_structure, select_n_top_from_structure
-from ._diagnosis import diagnose_from_labels
+from ._auto_n import (
+    estimate_n_top_structure,
+    explain_structure_rule,
+    select_n_top_from_structure,
+)
+from ._diagnosis import (
+    diagnose_from_labels,
+    recommend_cluster_resolution,
+    resolve_cluster_resolution,
+    resolve_hvg_mode,
+)
 from ._granularity import estimate_n_populations
 from ._highly_variable_genes import highly_variable_genes
+from ._options import HVGOptions
 
 __all__ = [
     "highly_variable_genes",
+    "HVGOptions",
     "diagnose_from_labels",
+    "recommend_cluster_resolution",
+    "resolve_cluster_resolution",
+    "resolve_hvg_mode",
     "estimate_n_populations",
     "estimate_n_top_structure",
+    "explain_structure_rule",
     "select_n_top_from_structure",
 ]

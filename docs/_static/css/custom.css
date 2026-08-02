@@ -1,0 +1,74 @@
+/* scFair documentation polish on top of sphinx_book_theme. */
+
+:root {
+  --scfair-accent: #2a6f8e;
+  --scfair-accent-2: #3d5a80;
+  --scfair-accent-soft: #e6f0f4;
+  --scfair-code-bg: #f7f9fb;
+  --scfair-code-border: #e3e8ee;
+  --scfair-table-head: #eef3f6;
+  --scfair-table-stripe: #f7fafb;
+  --scfair-table-border: #dce3ea;
+}
+
+html[data-theme="dark"] {
+  --scfair-accent: #56a6c2;
+  --scfair-accent-2: #7aa2c9;
+  --scfair-accent-soft: #17313a;
+  --scfair-code-bg: #1b1f24;
+  --scfair-code-border: #2c333c;
+  --scfair-table-head: #222831;
+  --scfair-table-stripe: #1c2126;
+  --scfair-table-border: #2c333c;
+}
+
+.bd-main .bd-content {
+  max-width: 88rem;
+}
+
+.bd-article {
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.bd-article h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.bd-article h2 {
+  margin-top: 1.6em;
+  border-bottom: 1px solid var(--scfair-table-border);
+  padding-bottom: 0.25em;
+}
+
+.bd-article table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.bd-article th {
+  background: var(--scfair-table-head);
+}
+
+.bd-article th,
+.bd-article td {
+  border: 1px solid var(--scfair-table-border);
+  padding: 0.4em 0.65em;
+}
+
+div.highlight pre,
+.bd-article pre {
+  background: var(--scfair-code-bg) !important;
+  border: 1px solid var(--scfair-code-border);
+  border-radius: 6px;
+}
+
+a {
+  text-decoration-thickness: 1px;
+}
+
+.admonition {
+  border-radius: 6px;
+}

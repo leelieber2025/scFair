@@ -21,7 +21,7 @@ keywords = [
     "bioinformatics",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
@@ -43,25 +43,42 @@ dependencies = [
     # `flavor="seurat_v3_paper"` is also 1.10+.
     "scanpy>=1.10",
     "scipy>=1.10",
+    # Direct imports: silhouette / NearestNeighbors / KMeans / ARI (not only via scanpy).
+    "scikit-learn>=1.2",
     # Required, not optional: every balanced method runs an intermediate Leiden
     # via sc.tl.leiden(flavor="igraph"). flavor="igraph" does not need leidenalg.
     "igraph>=0.10",
     # Also required, not optional: the DEFAULT flavor="seurat_v3" is implemented in
-    # scanpy as `from skmisc.loess import loess`. Without it scanpy raises, scFair
-    # catches it and silently continues on flavor="seurat" instead — a different
-    # method from the one every documented benchmark used.
+    # scanpy as `from skmisc.loess import loess`. Without it scanpy raises; scFair
+    # can fall back to flavor="seurat" only when strict=False (emits warnings.warn
+    # and records flavor_used / fallback_reason in uns).
     "scikit-misc>=0.3",
 ]
+
+[tool.setuptools.package-data]
+scfair = ["py.typed"]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.4.0",
+    # Pin major.minor so CI does not drift when ruff expands its default rule set.
+    "ruff>=0.4.0,<0.17",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-book-theme>=1.1",
+    "myst-nb>=1.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.5",
 ]
 
 [project.urls]
 Homepage = "https://github.com/leelieber2025/scFair"
+Documentation = "https://scfair.readthedocs.io"
+Changelog = "https://scfair.readthedocs.io/en/latest/changelog.html"
+Source = "https://github.com/leelieber2025/scFair"
+Issues = "https://github.com/leelieber2025/scFair/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -72,12 +89,21 @@ version = {attr = "scfair._version.__version__"}
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# Explicit rule set — do not follow ruff's expanding defaults (C408/RUF046/…),
+# which would turn green CI red overnight after a ruff minor bump.
+select = ["E4", "E7", "E9", "F", "I"]
+
 [tool.ruff.lint.per-file-ignores]
 # Benchmark scripts deliberately insert the examples/ directory on sys.path
 # before importing sibling modules, so their imports cannot all sit at the top.
 "examples/*.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["scfair"]

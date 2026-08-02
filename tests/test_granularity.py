@@ -17,12 +17,13 @@ import numpy as np
 import pytest
 
 from scfair.pp._granularity import (
+    AUTO_RESOLUTION_LO,
     DEFAULT_BANDWIDTH_FRAC,
     MIN_BANDWIDTH,
     default_bandwidth,
     estimate_n_populations,
-    knn_graph,
     knn_density,
+    knn_graph,
     merge_peaks,
     population_count_from_embedding,
     resolution_for_n_clusters,
@@ -175,3 +176,60 @@ def test_bisection_reports_targets_outside_the_bracket():
     _, n, calls = resolution_for_n_clusters(leiden, 40, lo=0.05, hi=4.0)
     assert n == 10  # the bracket's best
     assert calls == 2  # gives up immediately, no search
+
+
+def test_bisection_floors_lo_to_auto_resolution_lo():
+    """Ultra-low lo (e.g. 0.05) is raised to AUTO_RESOLUTION_LO so rare types
+    are not erased by a near-zero resolution that still reports high ARI on
+    the coarse majority partition."""
+    seen: list[float] = []
+
+    def leiden(res: float) -> int:
+        seen.append(float(res))
+        return int(np.clip(round(2 + 12 * res), 1, 40))
+
+    res, n, _ = resolution_for_n_clusters(leiden, 8, lo=0.05, hi=4.0)
+    assert res >= AUTO_RESOLUTION_LO - 1e-12
+    assert min(seen) >= AUTO_RESOLUTION_LO - 1e-12
+    assert n == 8
+
+
+def test_population_count_exposes_confidence_margin():
+    est = population_count_from_embedding(blobs())
+    assert est.reason == "ok"
+    assert est.confidence in ("high", "moderate", "low")
+    assert est.depth_sensitivity is not None
+    assert est.n_populations_loose is not None
+    assert est.n_populations_strict is not None
+    d = est.to_dict()
+    assert "confidence" in d
+    assert "depth_sensitivity" in d
+
+
+def test_knn_density_finite_on_duplicate_points():
+    """Identical coordinates must not yield all-NaN density (loess of merge_peaks)."""
+    # Two collapsed clusters of 25 identical points each.
+    a = np.tile([0.0, 0.0, 0.0], (25, 1))
+    b = np.tile([10.0, 0.0, 0.0], (25, 1))
+    X = np.vstack([a, b])
+    rho = knn_density(X, k=5)
+    assert np.all(np.isfinite(rho)), f"non-finite dens: nan={np.isnan(rho).sum()}"
+    assert rho.max() > 0
+    est = population_count_from_embedding(X, bandwidth=5)
+    # Flat / floored field → low confidence (must not claim high).
+    assert est.confidence == "low"
+    assert est.n_populations is not None
+    # With two graph-separated components, count should not explode to n_obs.
+    assert est.n_populations <= 10
+
+
+def test_bisection_tie_prefers_higher_resolution():
+    """Equal |n−target| must keep the higher resolution (rare-type bias)."""
+
+    # lo→n=6, hi→n=10; target=8 is equidistant (gap 2). Prefer hi.
+    def leiden(res: float) -> int:
+        return 6 if res < 1.0 else 10
+
+    res, n, _ = resolution_for_n_clusters(leiden, 8, lo=0.2, hi=4.0)
+    assert n == 10
+    assert res >= 1.0

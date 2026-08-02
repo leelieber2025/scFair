@@ -1,0 +1,51 @@
+# Source distribution (sdist) contents for PyPI / GitHub source installs.
+# The wheel only ships the runtime package (src/scfair + package data).
+
+include LICENSE
+include README.md
+include CHANGELOG.md
+include SECURITY.md
+include CITATION.cff
+include pyproject.toml
+include MANIFEST.in
+include .gitignore
+include .readthedocs.yaml
+
+graft tests
+graft docs
+prune docs/_build
+# Local research notes and paper tables are not part of the public docs site.
+global-exclude docs/PAPER_*
+global-exclude docs/DEVELOPMENT_LOG.md
+global-exclude docs/PACKAGE_VALUE.md
+global-exclude docs/gold.md
+global-exclude docs/review.md
+global-exclude docs/AUTO_N_*
+global-exclude docs/CELLBRF_*
+global-exclude docs/DATA_SOURCES.md
+
+graft examples
+# Never ship large or regenerable example outputs / data
+prune examples/data
+prune examples/results
+global-exclude examples/**/__pycache__/*
+
+graft .github/workflows
+
+recursive-exclude src/scfair.egg-info *
+prune build
+prune dist
+prune data
+prune .git
+prune .mypy_cache
+prune .pytest_cache
+prune .ruff_cache
+prune .tox
+prune htmlcov
+global-exclude *.pyc
+global-exclude __pycache__/*
+global-exclude *.egg-info
+global-exclude *.egg-info/*
+global-exclude *.h5ad
+global-exclude *.zip
+global-exclude .DS_Store

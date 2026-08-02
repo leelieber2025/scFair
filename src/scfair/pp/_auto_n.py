@@ -38,7 +38,7 @@ AutoNMethod = Literal[
 # Genes-per-population multiplier for the `populations` estimator.
 # Provisional: the direction (more populations need more genes) is
 # established but the exact constant is not well-calibrated yet; see
-# `examples/auto_n_populations.py`.
+# https://github.com/leelieber2025/scFair/blob/master/examples/auto_n_populations.py
 GENES_PER_POPULATION = 150
 
 
@@ -46,6 +46,41 @@ def _clip_k(k: int, k_min: int, k_max: int, n_genes: int) -> int:
     k_max_eff = min(k_max, n_genes)
     k_min_eff = min(k_min, k_max_eff)
     return int(max(k_min_eff, min(int(k), k_max_eff)))
+
+
+def _annotate_k_bound_clamp(
+    k: int,
+    k_source: str,
+    *,
+    k_min: int,
+    k_max: int,
+    n_genes: int,
+) -> str:
+    """Tag ``k_source`` when final k sits on a hard bound (not pure structure).
+
+    Default ``n_top_min=500`` on panel / filtered matrices often yields
+    ``k == n_vars`` via clipping; recording only ``k_source='structure'`` then
+    misrepresents a bound-dominated answer as data-driven.
+    """
+    k_max_eff = min(int(k_max), max(int(n_genes), 1))
+    k_min_eff = min(int(k_min), k_max_eff)
+    k_i = int(k)
+    src = str(k_source or "structure")
+    tags: list[str] = []
+    # Upper bound: hit n_vars or user max.
+    if k_i >= k_max_eff:
+        if k_max_eff >= int(n_genes):
+            tags.append(f"clamped_n_vars:{k_i}")
+        else:
+            tags.append(f"clamped_max:{k_i}")
+    # Lower bound: only when min is binding and we are not already at n_vars.
+    elif k_i <= k_min_eff and int(k_min) > 1 and k_min_eff == int(k_min):
+        tags.append(f"clamped_min:{k_i}")
+    for t in tags:
+        key = t.split(":", 1)[0]
+        if key not in src:
+            src = f"{src}+{t}"
+    return src
 
 
 def select_n_top_elbow(
@@ -100,7 +135,7 @@ def select_n_top_knee(
         # decreasing convex-looking curve
         kl = KneeLocator(x, y, curve="convex", direction="decreasing", interp_method="interp1d")
         k = int(kl.knee) if kl.knee is not None else select_n_top_elbow(s, k_min=k_min, k_max=k_max)
-    except Exception as exc:
+    except (ImportError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
         logger.debug("KneeLocator failed (%s); using elbow.", exc)
         k = select_n_top_elbow(s, k_min=k_min, k_max=k_max)
     return _clip_k(k, k_min, k_max, n)
@@ -427,7 +462,38 @@ def select_n_top_from_populations(
     return _clip_k(int(round(effective * float(genes_per_population))), k_min, k_max, n_genes)
 
 
-def select_n_top_from_structure(
+# SHORT list is safe only when the density field is trusted. Large atlases with
+# few density cores (Zheng-like FACS multi-type under-count) or low density
+# confidence must not collapse to k=500 — holdout/edge scans showed that
+# short-k systematically loses to fixed 2000 there.
+SHORT_BLOCK_N_OBS = 10_000
+SHORT_BLOCK_ND_MAX = 10  # inclusive: nd ≤ this counts as "few" on large n
+SHORT_FLOOR_K = 2000
+
+# Soft one-rung buffer on classical structure picks (always on; cheap).
+# Does **not** replace anti-SHORT: untrusted density still floors short_* to
+# short_floor_k after this lift (500→1000 then →2000 when blocked).
+# Intermediate / LONG continuous k values are left unchanged.
+K_BUFFER_LADDER: dict[int, int] = {
+    500: 1000,
+    1000: 1500,
+    1500: 2000,
+}
+
+
+def apply_structure_k_buffer(k: int) -> tuple[int, int | None]:
+    """Lift discrete structure rungs: 500→1000, 1000→1500, 1500→2000.
+
+    Returns ``(k_out, k_raw_or_None)``. ``k_raw`` is set only when a lift applied.
+    """
+    raw = int(k)
+    target = K_BUFFER_LADDER.get(raw)
+    if target is None or int(target) <= raw:
+        return raw, None
+    return int(target), raw
+
+
+def explain_structure_rule(
     *,
     valley_median: float,
     frac_shallow: float,
@@ -438,38 +504,35 @@ def select_n_top_from_structure(
     n_leiden: int | None = None,
     version: str = "v7",
     k_min: int = 500,
-    k_max: int = 4000,
+    k_max: int = 5000,
     n_genes: int = 50_000,
-    # guards; exposed for experiments
     atlas_n_obs: int = 10_000,
     atlas_n_pops: int = 15,
     atlas_k_floor: int = 2000,
     density_surplus_ratio: float = 1.0,
-    # v7 fine-atlas band parameters
     fine_nd_lo: int = 12,
     fine_nd_hi: int = 20,
     fine_vm_lo: float = 0.78,
     fine_ratio_hi: float = 1.12,
-) -> int:
-    """Structure-aware ``n_top`` (density valleys + pop count).
+    density_confidence: str | None = None,
+    density_depth_sensitivity: int | None = None,
+    short_block_n_obs: int = SHORT_BLOCK_N_OBS,
+    short_block_nd_max: int = SHORT_BLOCK_ND_MAX,
+    short_floor_k: int = SHORT_FLOOR_K,
+    hvg_mode: str | None = None,
+) -> dict[str, Any]:
+    """Explain structure auto_n: same inputs as the selector, plus branch labels.
 
-    Default for ``n_top_genes="auto"`` / ``auto_n_method="structure"`` is
-    v7; older versions (v4-v6) remain selectable via ``version=``.
+    ``hvg_mode="fine"`` floors SHORT soft-buffer results to ≥2000 so fine
+    multi-type boards do not ship a 1000-gene compact list.
 
-    Rationale
-    ---------
-    Global variance elbows are blind to structure. 3D density **valley
-    geometry** tracks best-k better: few cores + shallow valleys → longer
-    lists; many deep valleys on compact data → shorter lists.
-
-    v7 adds a **fine-atlas band** guard: on large ``n_obs`` datasets with
-    density cores in a mid band, deep valleys, and Leiden not far above
-    density (``n_leiden/n_density_pops <= fine_ratio_hi``), it allocates a
-    per-population budget instead of falling through to the short-k rules
-    below.
-
-    Pass ``n_obs`` and ``n_leiden`` for v5+; without them behaviour
-    approximates v4.
+    Returns
+    -------
+    dict
+        ``n_top`` (chosen k), ``rule_branch`` (stable string id),
+        ``ratio`` (nl/nd), band / SHORT eligibility flags for diagnostics.
+        When SHORT is blocked, ``short_blocked`` / ``short_block_reason`` /
+        ``short_k_raw`` are set and k is floored to ``short_floor_k``.
     """
     ver = str(version).lower().strip()
     if ver not in ("v4", "v5", "v6", "v7"):
@@ -483,14 +546,120 @@ def select_n_top_from_structure(
     n_cells = int(n_obs) if n_obs is not None else None
     nl = float(n_leiden) if n_leiden is not None else float("nan")
     ratio = (nl / nd) if (np.isfinite(nl) and np.isfinite(nd) and nd > 0) else float("nan")
+    conf = str(density_confidence).lower() if density_confidence else None
+    sens = int(density_depth_sensitivity) if density_depth_sensitivity is not None else None
+    floor_k = int(short_floor_k)
+    mode_l = str(hvg_mode or "").lower().strip()
+    fine_mode = mode_l == "fine"
 
-    # LONG: few density cores + almost-all shallow valleys
+    def _short_block_reasons() -> list[str]:
+        reasons: list[str] = []
+        if conf == "low":
+            reasons.append("density_confidence_low")
+        if sens is not None and sens >= 3:
+            reasons.append("density_depth_sensitivity_high")
+        if (
+            n_cells is not None
+            and n_cells >= int(short_block_n_obs)
+            and np.isfinite(nd)
+            and nd <= float(short_block_nd_max)
+        ):
+            # Large atlas + few density cores: field often under-resolves
+            # multi-type FACS structure (Zheng edge) while SHORT still fires.
+            reasons.append("large_n_few_density_pops")
+        return reasons
+
+    def _out(k: int, branch: str, **extra: Any) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "n_top": int(k),
+            "rule_branch": branch,
+            "version": ver,
+            "valley_median": vm,
+            "frac_shallow": fs,
+            "n_density_pops": int(nd) if np.isfinite(nd) else None,
+            "n_leiden": int(nl) if np.isfinite(nl) else None,
+            "ratio": float(ratio) if np.isfinite(ratio) else None,
+            "n_obs": n_cells,
+            "v7_band_eligible": False,
+            "v7_band_miss": None,
+            "density_confidence": conf,
+            "density_depth_sensitivity": sens,
+            "short_blocked": False,
+            "short_block_reason": None,
+            "short_k_raw": None,
+            "k_buffer_raw": None,
+        }
+        d.update(extra)
+        return d
+
+    def _emit(k: int, branch: str, **extra: Any) -> dict[str, Any]:
+        """Clip k → soft rung buffer; residual anti-SHORT only if still ≤500.
+
+        Soft ladder (500→1000, 1000→1500, 1500→2000) is the **primary** hedge.
+        The old hard anti-SHORT floor to 2000 used to fire on every ``short_*``
+        branch under low density confidence and **swallowed** the soft lift
+        (500→1000 then immediately →2000). That left users seeing
+        ``floored n_top=2000`` with raw k=500 and no visible soft buffer.
+
+        Anti-SHORT now only applies when the post-buffer k is **still** ≤500
+        (ladder miss / buffer off) and density is untrusted.
+        """
+        base_branch = str(branch)
+        k_rule = _clip_k(int(k), k_min, k_max, n_genes)
+        k_buf, buf_raw = apply_structure_k_buffer(k_rule)
+        k_clip = _clip_k(int(k_buf), k_min, k_max, n_genes)
+        branch_out = base_branch
+        if buf_raw is not None and k_clip != buf_raw:
+            branch_out = f"{base_branch}+k_buffer:{buf_raw}→{k_clip}"
+        # Fine product mode: do not ship SHORT soft lists (500→1000). Floor to
+        # classical 2000 so multi-type atlases keep length (seurat-like).
+        if (
+            fine_mode
+            and k_clip < 2000
+            and (base_branch.startswith("short_") or k_rule <= 500 or k_clip <= 1000)
+        ):
+            k_pre = int(k_clip)
+            k_clip = _clip_k(2000, k_min, k_max, n_genes)
+            branch_out = f"{branch_out}+fine_mode_floor:{k_pre}→{k_clip}"
+        # Residual hard-SHORT after soft buffer only (soft lift already moved
+        # classical short/mid rungs to ≥1000).
+        if k_clip <= 500:
+            reasons = _short_block_reasons()
+            if reasons and k_clip < floor_k:
+                k_floor = _clip_k(floor_k, k_min, k_max, n_genes)
+                why = "+".join(reasons)
+                return _out(
+                    k_floor,
+                    f"{base_branch}+anti_short:{why}",
+                    short_blocked=True,
+                    short_block_reason=why,
+                    short_k_raw=int(k_rule),
+                    k_buffer_raw=buf_raw,
+                    **extra,
+                )
+        return _out(
+            k_clip,
+            branch_out,
+            k_buffer_raw=buf_raw,
+            **extra,
+        )
+
+    # LONG: few density cores + almost-all shallow valleys.
+    # Continuous in mean_stability (was a hard 3000/4000 cliff at ms=0.8 that
+    # jumped 1000 genes on tiny feature noise). Maps ms∈[0.5, 0.9] → [2500, k_max].
     if np.isfinite(fs) and fs >= 0.85 and np.isfinite(nd) and nd <= 4.5:
-        k = 4000 if (np.isfinite(ms) and ms >= 0.8) else 3000
-        return _clip_k(k, k_min, k_max, n_genes)
+        lo = 2500
+        hi = int(k_max)
+        if hi <= lo:
+            k = hi
+        elif np.isfinite(ms):
+            t = float(np.clip((float(ms) - 0.5) / 0.4, 0.0, 1.0))
+            k = int(round(lo + t * (hi - lo)))
+        else:
+            k = int(round(0.5 * (lo + hi)))
+        return _emit(k, "long_shallow_few_cores")
 
     # --- atlas / fine-structure guards (skip SHORT-hard) ---
-    # v5: any large multi-core atlas
     v5_guard = (
         ver == "v5"
         and n_cells is not None
@@ -498,7 +667,6 @@ def select_n_top_from_structure(
         and np.isfinite(nd)
         and nd >= float(atlas_n_pops)
     )
-    # v6: strict density surplus (nl/nd < 1)
     density_surplus = np.isfinite(ratio) and ratio < float(density_surplus_ratio)
     v6_guard = (
         ver == "v6"
@@ -508,53 +676,153 @@ def select_n_top_from_structure(
         and np.isfinite(nd)
         and nd >= 12
     )
-    # v7: fine-atlas band — mid density-pop count, deep valleys, and
-    # near-parity leiden/density ratio (excludes higher-nd / higher-ratio
-    # cases).
-    v7_guard = (
-        ver == "v7"
-        and n_cells is not None
-        and n_cells >= int(atlas_n_obs)
-        and np.isfinite(nd)
-        and float(fine_nd_lo) <= nd <= float(fine_nd_hi)
-        and np.isfinite(vm)
-        and vm >= float(fine_vm_lo)
-        and np.isfinite(ratio)
-        and ratio <= float(fine_ratio_hi)
-    )
+    v7_checks = {
+        "n_obs_ok": n_cells is not None and n_cells >= int(atlas_n_obs),
+        "nd_in_band": np.isfinite(nd) and float(fine_nd_lo) <= nd <= float(fine_nd_hi),
+        "vm_ok": np.isfinite(vm) and vm >= float(fine_vm_lo),
+        "ratio_ok": np.isfinite(ratio) and ratio <= float(fine_ratio_hi),
+    }
+    v7_guard = ver == "v7" and all(v7_checks.values())
+    v7_miss = None
+    if ver == "v7" and not v7_guard:
+        v7_miss = [name for name, ok in v7_checks.items() if not ok]
+
     if v5_guard or v6_guard or v7_guard:
         k_budget = int(round(100.0 * nd))
         k = max(int(atlas_k_floor), min(int(k_max), k_budget))
-        return _clip_k(k, k_min, k_max, n_genes)
+        branch = (
+            "v7_fine_atlas_band"
+            if v7_guard
+            else ("v6_density_surplus" if v6_guard else "v5_large_atlas")
+        )
+        return _emit(
+            k,
+            branch,
+            v7_band_eligible=bool(v7_guard),
+            v7_band_miss=v7_miss,
+        )
 
-    # SHORT-hard: many deep density cores (compact / classical short-k)
+    # SHORT-hard
     if np.isfinite(vm) and vm >= 0.80 and np.isfinite(nd) and nd >= 6:
-        return _clip_k(500, k_min, k_max, n_genes)
+        return _emit(500, "short_hard_vm0.80_nd6", v7_band_miss=v7_miss)
     if np.isfinite(vm) and vm >= 0.70 and np.isfinite(nd) and nd >= 12:
-        return _clip_k(500, k_min, k_max, n_genes)
+        return _emit(500, "short_hard_vm0.70_nd12", v7_band_miss=v7_miss)
 
-    # MID: deep valleys, moderate pop count (CITE-like)
-    # unstable mid (low min/mean pair-stability) bumps one rung up (1500->2000)
+    # MID
     if np.isfinite(vm) and vm >= 0.65 and np.isfinite(nd) and 6 <= nd < 12:
         k_mid = 1500
+        branch = "mid_1500"
         if np.isfinite(mu) and mu < 0.1 and np.isfinite(ms) and ms < 0.55:
             k_mid = 2000
-        return _clip_k(k_mid, k_min, k_max, n_genes)
+            branch = "mid_unstable_bump_2000"
+        return _emit(k_mid, branch, v7_band_miss=v7_miss)
 
-    # unstable coarse (false-split risk) → short, unless the LONG pattern
-    # above already applied
     if np.isfinite(mu) and mu < 0.25 and np.isfinite(nd) and nd <= 5:
         if not (np.isfinite(fs) and fs >= 0.85):
-            return _clip_k(500, k_min, k_max, n_genes)
+            return _emit(500, "short_unstable_coarse", v7_band_miss=v7_miss)
         if mu < 0.2:
-            return _clip_k(500, k_min, k_max, n_genes)
+            return _emit(500, "short_unstable_coarse", v7_band_miss=v7_miss)
 
     if np.isfinite(vm) and vm >= 0.65:
-        return _clip_k(1000, k_min, k_max, n_genes)
+        return _emit(1000, "soft_1000_vm", v7_band_miss=v7_miss)
     if np.isfinite(ms) and ms < 0.45 and np.isfinite(vm) and vm >= 0.5:
-        return _clip_k(1000, k_min, k_max, n_genes)
+        return _emit(1000, "soft_1000_low_stability", v7_band_miss=v7_miss)
 
-    return _clip_k(2000, k_min, k_max, n_genes)
+    return _emit(2000, "default_2000", v7_band_miss=v7_miss)
+
+
+def select_n_top_from_structure(
+    *,
+    valley_median: float,
+    frac_shallow: float,
+    n_density_pops: int,
+    mean_stability: float | None = None,
+    min_stability: float | None = None,
+    n_obs: int | None = None,
+    n_leiden: int | None = None,
+    version: str = "v7",
+    k_min: int = 500,
+    k_max: int = 5000,
+    n_genes: int = 50_000,
+    # guards; exposed for experiments
+    atlas_n_obs: int = 10_000,
+    atlas_n_pops: int = 15,
+    atlas_k_floor: int = 2000,
+    density_surplus_ratio: float = 1.0,
+    # v7 fine-atlas band parameters
+    fine_nd_lo: int = 12,
+    fine_nd_hi: int = 20,
+    fine_vm_lo: float = 0.78,
+    fine_ratio_hi: float = 1.12,
+    density_confidence: str | None = None,
+    density_depth_sensitivity: int | None = None,
+    short_block_n_obs: int = SHORT_BLOCK_N_OBS,
+    short_block_nd_max: int = SHORT_BLOCK_ND_MAX,
+    short_floor_k: int = SHORT_FLOOR_K,
+    hvg_mode: str | None = None,
+) -> int:
+    """Structure-aware ``n_top`` (density valleys + pop count).
+
+    Used when ``n_top_genes="auto"`` / ``auto_n_method="structure"``
+    (product default ``n_top_genes`` is fixed 2000; auto is opt-in).
+    Default rule version is v7; older versions (v4-v6) remain via ``version=``.
+
+    Rationale
+    ---------
+    Global variance elbows are blind to structure. 3D density **valley
+    geometry** tracks best-k better: few cores + shallow valleys → longer
+    lists; many deep valleys on compact data → shorter lists.
+
+    v7 adds a **fine-atlas band** guard: on large ``n_obs`` datasets with
+    density cores in a mid band, deep valleys, and Leiden not far above
+    density (``n_leiden/n_density_pops <= fine_ratio_hi``), it allocates a
+    per-population budget instead of falling through to the short-k rules
+    below.
+
+    **Soft k buffer (primary):** classical discrete picks are lifted one rung
+    (500→1000, 1000→1500, 1500→2000) before use. This is the product hedge
+    against under-selection; LONG / continuous k unchanged.
+
+    **Anti-SHORT floor (residual only):** if k is **still** ≤500 after the soft
+    buffer (ladder miss) **and** density is untrusted (low confidence / high
+    depth sensitivity / large n + few density cores), floor to
+    ``short_floor_k`` (default 2000). Soft buffer is **not** overridden to
+    2000 just because the pre-buffer rule was ``short_*``.
+
+    Pass ``n_obs`` and ``n_leiden`` for v5+; without them behaviour
+    approximates v4.
+
+    For a machine-readable branch label, use :func:`explain_structure_rule`.
+    """
+    return int(
+        explain_structure_rule(
+            valley_median=valley_median,
+            frac_shallow=frac_shallow,
+            n_density_pops=n_density_pops,
+            mean_stability=mean_stability,
+            min_stability=min_stability,
+            n_obs=n_obs,
+            n_leiden=n_leiden,
+            version=version,
+            k_min=k_min,
+            k_max=k_max,
+            n_genes=n_genes,
+            atlas_n_obs=atlas_n_obs,
+            atlas_n_pops=atlas_n_pops,
+            atlas_k_floor=atlas_k_floor,
+            density_surplus_ratio=density_surplus_ratio,
+            fine_nd_lo=fine_nd_lo,
+            fine_nd_hi=fine_nd_hi,
+            fine_vm_lo=fine_vm_lo,
+            fine_ratio_hi=fine_ratio_hi,
+            density_confidence=density_confidence,
+            density_depth_sensitivity=density_depth_sensitivity,
+            short_block_n_obs=short_block_n_obs,
+            short_block_nd_max=short_block_nd_max,
+            short_floor_k=short_floor_k,
+            hvg_mode=hvg_mode,
+        )["n_top"]
+    )
 
 
 def _prepare_structure_embedding(
@@ -653,11 +921,11 @@ def _structure_features_from_embedding(
 
     from scfair.pp._granularity import (
         DEFAULT_DEPTH,
+        _embedding_3d,
         default_bandwidth,
         knn_density,
         knn_graph,
         population_count_from_embedding,
-        _embedding_3d,
     )
 
     n_boot = max(1, int(stability_n_boot))
@@ -689,7 +957,7 @@ def _structure_features_from_embedding(
         masks = {c: (labels == c).to_numpy() for c in active}
         try:
             nn = _nearest_cluster_map(X_pca, masks)
-        except Exception:
+        except (ValueError, TypeError, RuntimeError, np.linalg.LinAlgError):
             nn = {}
         scores: list[float] = []
         seen: set[tuple[str, str]] = set()
@@ -708,7 +976,7 @@ def _structure_features_from_embedding(
                         random_state=random_state,
                     )
                 )
-            except Exception:
+            except (ValueError, TypeError, RuntimeError, FloatingPointError, ArithmeticError):
                 continue
         if scores:
             mean_stab = float(np.mean(scores))
@@ -728,6 +996,8 @@ def _structure_features_from_embedding(
             "stability_n_boot": n_boot,
             "bandwidth": None,
             "reason": "no_embedding",
+            "density_confidence": "none",
+            "density_depth_sensitivity": None,
         }
     bw = default_bandwidth(X3.shape[0])
     nbrs = knn_graph(X3, min(15, X3.shape[0] - 1))
@@ -781,6 +1051,8 @@ def _structure_features_from_embedding(
         "stability_n_boot": n_boot,
         "bandwidth": int(bw) if bw is not None else None,
         "reason": "ok",
+        "density_confidence": str(est.confidence),
+        "density_depth_sensitivity": est.depth_sensitivity,
     }
 
 
@@ -842,6 +1114,17 @@ def _aggregate_structure_features(feats: Sequence[dict[str, Any]]) -> dict[str, 
         vals = [float(f[key]) for f in feats if key in f and np.isfinite(float(f.get(key, np.nan)))]
         return int(round(float(np.median(vals)))) if vals else 0
 
+    # Worst confidence across seeds (low < moderate < high < none/missing).
+    conf_rank = {"low": 0, "moderate": 1, "high": 2, "none": 3}
+    confs = [str(f.get("density_confidence") or "none").lower() for f in feats]
+    worst_conf = min(confs, key=lambda c: conf_rank.get(c, 3))
+    sens_vals = [
+        int(f["density_depth_sensitivity"])
+        for f in feats
+        if f.get("density_depth_sensitivity") is not None
+    ]
+    worst_sens = int(max(sens_vals)) if sens_vals else None
+
     out: dict[str, Any] = {
         "n_obs": int(feats[0].get("n_obs") or 0),
         "n_leiden": _nanmed_int("n_leiden"),
@@ -854,6 +1137,8 @@ def _aggregate_structure_features(feats: Sequence[dict[str, Any]]) -> dict[str, 
         "bandwidth": feats[0].get("bandwidth"),
         "reason": "ok_aggregated",
         "n_seeds_aggregated": len(feats),
+        "density_confidence": worst_conf,
+        "density_depth_sensitivity": worst_sens,
     }
     return out
 
@@ -917,6 +1202,56 @@ def _combine_structure_k(
     return k_agg, "aggregated_features"
 
 
+def _apply_short_floor_if_needed(
+    *,
+    k: int,
+    k_source: str,
+    n_obs: int | None,
+    n_density_pops: int,
+    density_confidence: str | None,
+    density_depth_sensitivity: int | None,
+    k_min: int,
+    k_max: int,
+    n_genes: int,
+    short_block_n_obs: int = SHORT_BLOCK_N_OBS,
+    short_block_nd_max: int = SHORT_BLOCK_ND_MAX,
+    short_floor_k: int = SHORT_FLOOR_K,
+) -> tuple[int, str, str | None]:
+    """Post-combine SHORT floor only (same conditions as :func:`explain_structure_rule`).
+
+    Soft k-buffer is **not** re-applied here: ``explain_structure_rule`` /
+    per-seed and aggregated rules already lifted 500→1000 / 1000→1500 /
+    1500→2000. Re-buffering after combine double-lifted mid rungs (e.g.
+    soft_1000 → 1500 in the rule, then 1500 → 2000 again here).
+
+    Returns ``(k, k_source, post_block_tag_or_None)``.
+    """
+    k_cur = int(k)
+    # Residual hard-SHORT only (≤500). Buffered soft_1000/mid already ≥1000.
+    if k_cur > 500:
+        return k_cur, k_source, None
+    reasons: list[str] = []
+    conf = str(density_confidence).lower() if density_confidence else None
+    if conf == "low":
+        reasons.append("density_confidence_low")
+    if density_depth_sensitivity is not None and int(density_depth_sensitivity) >= 3:
+        reasons.append("density_depth_sensitivity_high")
+    n_cells = int(n_obs) if n_obs is not None else None
+    nd = float(n_density_pops)
+    if (
+        n_cells is not None
+        and n_cells >= int(short_block_n_obs)
+        and np.isfinite(nd)
+        and nd <= float(short_block_nd_max)
+    ):
+        reasons.append("large_n_few_density_pops")
+    if not reasons:
+        return k_cur, k_source, None
+    k_new = _clip_k(int(short_floor_k), k_min, k_max, n_genes)
+    why = "+".join(reasons)
+    return int(k_new), f"anti_short_floor:{why}", f"anti_short:{why}"
+
+
 def estimate_n_top_structure(
     adata: Any,
     *,
@@ -924,10 +1259,11 @@ def estimate_n_top_structure(
     random_state: int = 0,
     version: str = "v7",
     k_min: int = 500,
-    k_max: int = 4000,
+    k_max: int = 5000,
     n_genes: int | None = None,
     n_seeds: int = 1,
     progress: bool = False,
+    hvg_mode: str | None = None,
     **feature_kwargs: Any,
 ) -> tuple[int, dict[str, Any]]:
     """End-to-end structure-aware ``n_top``: features → rule v7 (default).
@@ -936,7 +1272,9 @@ def estimate_n_top_structure(
     passes ``n_seeds=``:data:`PRODUCT_STRUCTURE_N_SEEDS` (3) so pred_k is
     multi-seed stable. This function's own default remains ``n_seeds=1``
     for fast one-shot / probe calls only — do not rely on the default for
-    shipped auto behaviour.
+    shipped auto behaviour. ``k_max`` defaults to 5000 to match
+    ``n_top_max`` / HVGOptions (was 4000, which silently capped the documented
+    5000 bound).
 
     When ``n_seeds>1``, each seed rebuilds its own HVG@2000 + PCA +
     neighbors graph from scratch, rather than sharing one graph across
@@ -950,6 +1288,8 @@ def estimate_n_top_structure(
     ``stability_n_boot=5`` by default. Final k via
     :func:`_combine_structure_k`.
 
+    ``hvg_mode="fine"`` floors SHORT soft lists to ≥2000 after the rule.
+
     Returns
     -------
     k, detail
@@ -961,6 +1301,9 @@ def estimate_n_top_structure(
     n_hvg = int(feature_kwargs.pop("n_hvg", 2000))
     min_cluster_size = int(feature_kwargs.pop("min_cluster_size", 30))
     stability_n_boot = int(feature_kwargs.pop("stability_n_boot", STRUCTURE_STABILITY_N_BOOT))
+    # allow hvg_mode via kwargs for older call sites
+    if hvg_mode is None and "hvg_mode" in feature_kwargs:
+        hvg_mode = feature_kwargs.pop("hvg_mode")
     if feature_kwargs:
         logger.debug("estimate_n_top_structure ignoring kwargs %s", feature_kwargs)
 
@@ -1009,13 +1352,25 @@ def estimate_n_top_structure(
             k_min=k_min,
             k_max=k_max,
             n_genes=n_genes_eff,
+            density_confidence=feat_i.get("density_confidence"),
+            density_depth_sensitivity=feat_i.get("density_depth_sensitivity"),
+            hvg_mode=hvg_mode,
         )
         per_seed_feats.append(feat_i)
         per_seed_k.append(int(k_i))
 
     feat = _aggregate_structure_features(per_seed_feats)
+    # Refine mode with structure features when still auto/unknown
+    if hvg_mode is None or str(hvg_mode).lower() == "auto":
+        from scfair.pp._diagnosis import resolve_hvg_mode
+
+        hvg_mode = resolve_hvg_mode(
+            mode="auto",
+            n_obs=feat.get("n_obs"),
+            n_density_pops=feat.get("n_density_pops"),
+        )["mode"]
     k_vote = _vote_structure_k(per_seed_k)
-    k_from_agg = select_n_top_from_structure(
+    rule_kw = dict(
         valley_median=feat.get("valley_median", float("nan")),
         frac_shallow=feat.get("frac_shallow", float("nan")),
         n_density_pops=int(feat.get("n_density_pops") or 0),
@@ -1027,23 +1382,83 @@ def estimate_n_top_structure(
         k_min=k_min,
         k_max=k_max,
         n_genes=n_genes_eff,
+        density_confidence=feat.get("density_confidence"),
+        density_depth_sensitivity=feat.get("density_depth_sensitivity"),
+        hvg_mode=hvg_mode,
     )
+    rule_explain = explain_structure_rule(**rule_kw)
+    k_from_agg = int(rule_explain["n_top"])
     k, k_source = _combine_structure_k(
         k_from_agg=int(k_from_agg),
         k_vote=int(k_vote),
         per_seed_k=per_seed_k,
         n_obs=feat.get("n_obs"),
     )
+    # Safety: unanimous seed SHORT can bypass the aggregated rule when every
+    # seed already applied anti-short… or when they all missed it (legacy path).
+    # Re-apply floor if final k is still hard-short under block conditions.
+    k, k_source, post_block = _apply_short_floor_if_needed(
+        k=int(k),
+        k_source=k_source,
+        n_obs=feat.get("n_obs"),
+        n_density_pops=int(feat.get("n_density_pops") or 0),
+        density_confidence=feat.get("density_confidence"),
+        density_depth_sensitivity=feat.get("density_depth_sensitivity"),
+        k_min=k_min,
+        k_max=k_max,
+        n_genes=n_genes_eff,
+    )
+    if str(hvg_mode).lower() == "fine" and int(k) < 2000:
+        # _clip_k already respects k_max / n_genes (do not bypass user ceiling).
+        k = _clip_k(2000, k_min, k_max, n_genes_eff)
+        k_source = f"{k_source}+fine_mode_floor:{int(k)}"
+    k_source = _annotate_k_bound_clamp(
+        int(k),
+        str(k_source),
+        k_min=int(k_min),
+        k_max=int(k_max),
+        n_genes=int(n_genes_eff),
+    )
+    # Final k may differ from aggregated rule (unanimous vote / anti-short).
+    # Re-attach branch for the *effective* k when combine overrode agg.
+    rule_branch = str(rule_explain.get("rule_branch") or "unknown")
+    if int(k) != int(k_from_agg):
+        rule_branch = f"{rule_branch}+combine:{k_source}"
+    if post_block:
+        rule_branch = f"{rule_branch}+{post_block}"
     detail = {
         "strategy": "structure",
         "version": version,
         "n_top_selected": int(k),
+        "hvg_mode": hvg_mode,
         "features": feat,
         "n_seeds": n_seeds,
         "per_seed_k": list(per_seed_k),
         "k_from_aggregated_features": int(k_from_agg),
         "k_vote": int(k_vote),
         "k_source": k_source,
+        "rule_branch": rule_branch,
+        "short_blocked": bool(rule_explain.get("short_blocked") or post_block),
+        "short_block_reason": rule_explain.get("short_block_reason")
+        or (post_block.split(":", 1)[-1] if post_block else None),
+        "short_k_raw": rule_explain.get("short_k_raw"),
+        "k_buffer_raw": rule_explain.get("k_buffer_raw"),
+        "rule_explain": {
+            "rule_branch": rule_explain.get("rule_branch"),
+            "ratio": rule_explain.get("ratio"),
+            "v7_band_eligible": rule_explain.get("v7_band_eligible"),
+            "v7_band_miss": rule_explain.get("v7_band_miss"),
+            "n_density_pops": rule_explain.get("n_density_pops"),
+            "n_leiden": rule_explain.get("n_leiden"),
+            "valley_median": rule_explain.get("valley_median"),
+            "n_obs": rule_explain.get("n_obs"),
+            "density_confidence": rule_explain.get("density_confidence"),
+            "density_depth_sensitivity": rule_explain.get("density_depth_sensitivity"),
+            "short_blocked": rule_explain.get("short_blocked"),
+            "short_block_reason": rule_explain.get("short_block_reason"),
+            "short_k_raw": rule_explain.get("short_k_raw"),
+            "k_buffer_raw": rule_explain.get("k_buffer_raw"),
+        },
         "shared_embedding": False,
         "stability_n_boot": int(stability_n_boot),
     }
@@ -1318,7 +1733,7 @@ def resolve_n_top_genes(
                     random_state=random_state,
                     version="v7",
                     k_min=k_min,
-                    k_max=min(k_max, 4000),
+                    k_max=int(k_max),
                     n_genes=n_genes,
                     # Product stability: not the library default n_seeds=1.
                     n_seeds=PRODUCT_STRUCTURE_N_SEEDS,
@@ -1329,12 +1744,10 @@ def resolve_n_top_genes(
                     {
                         "strategy": "structure",
                         "n_top_selected": k,
+                        "k_source": structure_detail.get("k_source"),
+                        "rule_branch": structure_detail.get("rule_branch"),
                         "method_picks": picks,
                         "structure": structure_detail,
-                        "depth": None,
-                        "silhouette_curve": None,
-                        "cumfrac": None,
-                        "ensemble": None,
                     }
                 )
                 logger.info(
@@ -1343,7 +1756,14 @@ def resolve_n_top_genes(
                     (structure_detail or {}).get("features"),
                 )
                 return k, meta
-            except Exception as exc:
+            except (
+                ImportError,
+                ValueError,
+                TypeError,
+                RuntimeError,
+                MemoryError,
+                np.linalg.LinAlgError,
+            ) as exc:
                 logger.warning("structure auto_n failed (%s); falling back to ensemble.", exc)
                 structure_detail = {"error": str(exc)}
                 name = "ensemble"
@@ -1375,7 +1795,7 @@ def resolve_n_top_genes(
                 ens_ceiling = int(knobs["soft_ceiling"])
                 ens_anchor = int(knobs["anchor"])
                 depth_meta = {**stats, **knobs}
-            except Exception as exc:
+            except (ValueError, TypeError, KeyError, RuntimeError, AttributeError) as exc:
                 logger.warning("depth-aware auto knobs failed (%s); using defaults.", exc)
                 depth_meta = {"error": str(exc)}
 

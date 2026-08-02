@@ -17,11 +17,28 @@ logger = logging.getLogger(__name__)
 UNS_KEY = "scfair"
 
 
-def _is_integer_counts_like(X: Any, max_check: int = 100_000, atol: float = 1e-6) -> bool:
+# Full integer check is cheap (~tens of ms at 1e7 floats). Above this, subsample.
+_INTEGER_COUNTS_FULL_CHECK_UPTO = 10_000_000
+
+
+def _is_integer_counts_like(
+    X: Any,
+    max_check: int = 100_000,
+    atol: float = 1e-6,
+    *,
+    full_check_upto: int = _INTEGER_COUNTS_FULL_CHECK_UPTO,
+) -> bool:
     """Return True if the matrix looks like non-negative integer counts.
 
     Tolerant of float storage of integer values (common after aggregation).
-    Large matrices are subsampled deterministically (seed 0) for performance.
+
+    - ``nnz ≤ full_check_upto`` (default 1e7): check **all** stored values so a
+      single fractional entry at the end of a large sparse ``.data`` is not
+      missed by strided sampling.
+    - larger: two deterministic strided passes (``max_check`` samples).
+
+    Uses **atol only** (``rtol=0``): a relative tolerance would accept e.g.
+    ``100000.5`` as integer-like (``rtol * 1e5 ≈ 1``).
     """
     if sparse.issparse(X):
         data = X.data
@@ -39,19 +56,19 @@ def _is_integer_counts_like(X: Any, max_check: int = 100_000, atol: float = 1e-6
     if vals.size == 0:
         return True
 
-    if vals.size > max_check:
-        rng = np.random.default_rng(0)
-        stride = max(1, vals.size // (max_check // 2))
-        stride_vals = vals[::stride]
-        n_random = max_check - stride_vals.size
-        if n_random > 0:
-            random_vals = rng.choice(vals, size=min(n_random, vals.size), replace=False)
-            vals = np.concatenate([stride_vals, random_vals])
-        else:
-            vals = stride_vals[:max_check]
+    n_full = int(full_check_upto)
+    if vals.size > n_full:
+        # Two strided passes with different offsets — O(max_check) memory, not
+        # O(nnz). rng.choice(..., replace=False) would copy the full .data array.
+        half = max(1, max_check // 2)
+        stride = max(1, vals.size // half)
+        stride_vals = vals[::stride][:half]
+        offset = int(stride // 2)
+        second = vals[offset::stride][: max_check - stride_vals.size]
+        vals = np.concatenate([stride_vals, second]) if second.size else stride_vals
 
     rounded = np.round(vals)
-    return bool(np.all(vals >= 0) and np.allclose(vals, rounded, atol=atol, rtol=1e-5))
+    return bool(np.all(vals >= 0) and np.allclose(vals, rounded, atol=atol, rtol=0.0))
 
 
 def _clear_log_preprocess_metadata(adata: ad.AnnData) -> None:
@@ -174,7 +191,9 @@ def resolve_aligned_raw_counts(
     """Return a count matrix aligned to current cells/genes, or None if unsafe.
 
     Prefers the label-indexed uns snapshot (survives HVG/cell subset), then
-    ``layers[layer]``, then integer-looking ``adata.raw``.
+    ``layers[layer]``, then integer-looking ``adata.raw`` **column-aligned by
+    ``var_names``** (so a full-gene ``.raw`` still works after HVG subset —
+    the usual scanpy pattern where ``raw.n_vars > adata.n_vars``).
     """
     try:
         snap_result = _align_snapshot_counts(
@@ -196,13 +215,35 @@ def resolve_aligned_raw_counts(
     if layer in adata.layers:
         candidates.append((f"layers['{layer}']", adata.layers[layer]))
     raw = getattr(adata, "raw", None)
-    if (
-        raw is not None
-        and raw.shape[1] == adata.n_vars
-        and hasattr(raw, "var_names")
-        and np.array_equal(raw.var_names, adata.var_names)
-    ):
-        candidates.append(("adata.raw", raw.X))
+    if raw is not None and hasattr(raw, "var_names") and raw.X is not None:
+        # Align .raw columns to current genes (superset is the common case).
+        try:
+            raw_var = pd.Index(np.asarray(raw.var_names).astype(str))
+            cur_var = pd.Index(adata.var_names.astype(str))
+        except Exception:
+            raw_var = None
+            cur_var = None
+        if (
+            raw_var is not None
+            and cur_var is not None
+            and raw_var.is_unique
+            and cur_var.is_unique
+            and int(getattr(raw, "n_obs", raw.X.shape[0])) == int(adata.n_obs)
+        ):
+            col_idx = raw_var.get_indexer(cur_var)
+            if (col_idx >= 0).all():
+                Xr = raw.X
+                if sparse.issparse(Xr):
+                    mat = Xr[:, col_idx]
+                else:
+                    mat = np.asarray(Xr)[:, col_idx]
+                candidates.append(("adata.raw", mat))
+            else:
+                logger.debug(
+                    "adata.raw present but missing %d of %d current genes; not used.",
+                    int((col_idx < 0).sum()),
+                    int(adata.n_vars),
+                )
 
     for source_name, mat in candidates:
         n_cols = mat.shape[1] if hasattr(mat, "shape") else 0
@@ -222,7 +263,7 @@ def resolve_aligned_raw_counts(
             continue
 
         raw_gene_list = adata.uns.get(UNS_KEY, {}).get("raw_gene_list")
-        if raw_gene_list is not None:
+        if raw_gene_list is not None and source_name.startswith("layers"):
             stored = np.asarray(raw_gene_list)
             current = adata.var_names.to_numpy()
             if len(stored) == adata.n_vars and not np.array_equal(stored, current):

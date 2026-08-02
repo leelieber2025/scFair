@@ -1,0 +1,71 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Third-party datasets: never committed, cited instead ---
+# These come from 10x Genomics, CELLxGENE, figshare/scIB, Zenodo (Zhao et al.
+# 2025), CraftedExperiment (Liu et al. 2025) and CellBRF. We have no right to
+# redistribute them, several files exceed GitHub's 100 MB per-file limit, and the
+# tree is ~5.6 GB. Sources and accessions: docs/DATA_SOURCES.md
+data/
+examples/data/
+
+# Belt and braces: raw matrix / archive formats anywhere in the tree.
+*.h5ad
+*.h5
+*.rds
+*.RData
+*.mtx
+*.mtx.gz
+*.loom
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.txt.gz
+*.csv.gz
+*.xlsx
+
+# --- Locally generated outputs: not committed ---
+# Every table, figure and log under here is produced by the benchmark scripts.
+examples/results/
+
+# --- Local research notes (not part of the public docs site / release) ---
+# Keep on disk for development; do not publish to GitHub / RTD / PyPI sdist.
+docs/PAPER_*
+docs/DEVELOPMENT_LOG.md
+docs/PACKAGE_VALUE.md
+docs/gold.md
+docs/review.md
+docs/AUTO_N_*
+docs/CELLBRF_*
+docs/DATA_SOURCES.md
+docs/**/*.csv
+
+# Sphinx build products
+docs/_build/
+docs/api/generated/
+
+# --- Editors / OS ---
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Claude Code harness internals
+.claude/

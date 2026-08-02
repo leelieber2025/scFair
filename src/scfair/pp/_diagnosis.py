@@ -54,6 +54,15 @@ from ._auto_n import select_n_top_elbow
 
 logger = logging.getLogger(__name__)
 
+# Downstream clustering protocol tiers (advisory; does not change HVG genes).
+# Validated on seurat_v4 20k: append@2000+200 loses on l2 at Leiden 0.8 but
+# wins at 1.5; deeper append_budget=500 did not beat m=200 there.
+_FINE_N_TYPES = 15
+_FINE_N_DENSITY_POPS = 15
+_RES_COARSE = 0.8
+_RES_FINE = 1.5
+_HVG_MODES = frozenset({"auto", "balanced", "fine", "compact"})
+
 # Operational cut-offs (documented, not magic biology). Tuned to be conservative:
 # "strong" should fire on Cao-like majority + long tail; "balanced" on even blobs.
 _MAX_FRAC_STRONG = 0.60
@@ -163,7 +172,7 @@ def cluster_size_metrics(
 def check_config(
     *,
     n_top_genes: Any = None,
-    balance_method: str | None = "hybrid",
+    balance_method: str | None = "append",
     neighbor_contrast: float = 0.0,
     resolution: float | None = None,
     blend_global: float | None = None,
@@ -185,6 +194,16 @@ def check_config(
     emitted once, at the earliest point it is known.
     """
     method = str(balance_method or "none")
+    # Normalize aliases so hybrid_rerank / inverse_size match the right checks.
+    _method_alias = {
+        "hybrid_rerank": "hybrid",
+        "rerank": "hybrid",
+        "weighted_score": "score",
+        "size_power": "score",
+        "inverse_size": "score",
+        "cell_reweight": "reweight",
+    }
+    method = _method_alias.get(method, method)
     flags: list[str] = []
     tips: list[str] = []
 
@@ -194,6 +213,9 @@ def check_config(
             "balance_method='none' is the scanpy-like global HVG path; "
             "no cluster-fair reallocation is applied."
         )
+    elif method == "append":
+        # Product default: silent on success; no intermediate clustering cost.
+        pass
 
     k = None
     if isinstance(n_top_genes, (int, np.integer)):
@@ -239,14 +261,316 @@ def check_config(
             "weight on it amplifies them rather than rescuing starved ones. "
             "Keep blend_global near 0.95; do not lower it to 'fix "
             "fairness'. Allocation fairness belongs in post-hoc "
-            "allocation_method research ('starved_topup' / 'coverage'; "
-            "'cap' is deprecated), off by default pending ARI validation."
+            "allocation_method research ('starved_topup' / 'coverage'), "
+            "off by default; 'cap' was removed."
         )
 
     if log:
         for tip in tips:
             logger.warning("config: %s", tip)
     return {"flags": flags, "tips": tips}
+
+
+def recommend_cluster_resolution(
+    *,
+    n_types: int | None = None,
+    n_density_pops: float | int | None = None,
+    rule_branch: str | None = None,
+) -> dict[str, Any]:
+    """Suggest post-HVG Leiden resolution (advisory; does not change genes).
+
+    Protocol tiers used in internal evaluation:
+
+    - **coarse** (default): resolution ``0.8`` — Easy / ≤~12 types.
+    - **fine**: resolution ``1.5`` (sweep optional ``[0.8, 1.5, 2.0]``) when
+      labels or structure look multi-type/fine-grained. On seurat_v4 l2,
+      product ``append`` @2000+200 lost at 0.8 but won at 1.5; raising
+      ``append_budget`` to 500 did not beat m=200.
+
+    Parameters
+    ----------
+    n_types
+        Number of label classes if known (e.g. author ``celltype.l2``).
+    n_density_pops
+        Structure density-core count when available.
+    rule_branch
+        Structure auto ``rule_branch`` string (detects ``v7_fine_atlas``).
+    """
+    reasons: list[str] = []
+    branch = str(rule_branch or "")
+    if n_types is not None and int(n_types) >= _FINE_N_TYPES:
+        reasons.append(f"n_types={int(n_types)}>={_FINE_N_TYPES}")
+    if n_density_pops is not None:
+        try:
+            nd = float(n_density_pops)
+            if np.isfinite(nd) and nd >= _FINE_N_DENSITY_POPS:
+                reasons.append(f"n_density_pops={nd:.0f}>={_FINE_N_DENSITY_POPS}")
+        except (TypeError, ValueError):
+            pass
+    if "fine_atlas" in branch or branch.startswith("v7_fine_atlas"):
+        reasons.append("structure_fine_atlas_band")
+
+    if reasons:
+        return {
+            "tier": "fine",
+            "resolution": float(_RES_FINE),
+            "resolution_sweep": [0.8, 1.5, 2.0],
+            "primary_metric": "macro_f1",
+            "reasons": reasons,
+            "note": (
+                "Fine multi-type setting: cluster / evaluate at Leiden "
+                f"resolution≈{_RES_FINE} (not only 0.8). Prefer macro-F1 "
+                "alongside ARI. Product append keeps append_budget=200 "
+                "(deeper budgets were not better on seurat_v4 l2)."
+            ),
+        }
+    return {
+        "tier": "coarse",
+        "resolution": float(_RES_COARSE),
+        "resolution_sweep": [0.8],
+        "primary_metric": "ARI",
+        "reasons": [],
+        "note": (
+            f"Coarse / default setting: Leiden resolution≈{_RES_COARSE} is "
+            "enough for matched-k ARI vs scanpy HVG."
+        ),
+    }
+
+
+def resolve_hvg_mode(
+    adata: Any | None = None,
+    *,
+    mode: str = "auto",
+    n_types: int | None = None,
+    n_obs: int | None = None,
+    n_density_pops: float | int | None = None,
+    rule_branch: str | None = None,
+    label_key: str | None = None,
+) -> dict[str, Any]:
+    """Choose product HVG operating mode: ``compact`` / ``balanced`` / ``fine``.
+
+    ``mode="auto"`` (default):
+
+    - **fine** (k floor ≥2000, res 1.5) only when **labels** say multi-type
+      (``n_types≥15``) or structure is **v7 fine-atlas band**. High density
+      pop count alone does **not** force fine — that was wrongly re-raising
+      SHORT soft lists (500→1000) back to 2000 and undoing compact wins
+      (base 1000 + append 200 = 1200).
+    - **compact** — structure SHORT geometry: soft buffer 500→1000 kept,
+      append 200, res 0.8 (v3 / pancreas-like).
+    - **balanced** — default fixed-2000 product path.
+
+    Explicit ``mode`` in {balanced, fine, compact} skips detection.
+    """
+    m = str(mode or "auto").lower().strip()
+    if m not in _HVG_MODES:
+        raise ValueError(f"mode must be one of {sorted(_HVG_MODES)}, got {mode!r}")
+
+    # Fill from adata
+    if adata is not None:
+        if n_obs is None:
+            n_obs = int(getattr(adata, "n_obs", 0) or 0) or None
+        if n_types is None and label_key and label_key in getattr(adata, "obs", {}):
+            try:
+                n_types = int(pd.Series(adata.obs[label_key]).astype(str).nunique())
+            except Exception:
+                n_types = None
+        if n_density_pops is None or rule_branch is None:
+            try:
+                h = (adata.uns.get("scfair") or {}).get("hvg") or {}
+            except Exception:
+                h = {}
+            auto_n = h.get("auto_n") if isinstance(h, Mapping) else {}
+            if not isinstance(auto_n, Mapping):
+                auto_n = {}
+            st = auto_n.get("structure") if isinstance(auto_n.get("structure"), Mapping) else {}
+            rx = st.get("rule_explain") if isinstance(st.get("rule_explain"), Mapping) else st
+            feat = st.get("features") if isinstance(st.get("features"), Mapping) else {}
+            if rule_branch is None:
+                rule_branch = (
+                    auto_n.get("rule_branch")
+                    or st.get("rule_branch")
+                    or (rx or {}).get("rule_branch")
+                )
+            if n_density_pops is None:
+                n_density_pops = (rx or {}).get("n_density_pops")
+                if n_density_pops is None:
+                    n_density_pops = feat.get("n_density_pops")
+
+    reasons: list[str] = []
+    branch = str(rule_branch or "")
+
+    def _as_fine() -> dict[str, Any]:
+        return {
+            "mode": "fine",
+            "n_top_floor": 2000,
+            "append_budget": 200,
+            "allow_short_soft_buffer": False,
+            "cluster_resolution": float(_RES_FINE),
+            "reasons": list(reasons),
+            "auto": m == "auto",
+            "note": (
+                "fine mode: k floor ≥2000 (no SHORT→1000 list), append_budget=200, "
+                f"downstream Leiden≈{_RES_FINE}."
+            ),
+        }
+
+    def _as_compact() -> dict[str, Any]:
+        # High density-pop count still suggests finer *downstream* clustering,
+        # but gene-list stays short (soft 500→1000).
+        res = float(_RES_COARSE)
+        if n_density_pops is not None:
+            try:
+                if float(n_density_pops) >= _FINE_N_DENSITY_POPS:
+                    res = float(_RES_FINE)
+            except (TypeError, ValueError):
+                pass
+        return {
+            "mode": "compact",
+            "n_top_floor": None,
+            "append_budget": 200,
+            "allow_short_soft_buffer": True,
+            "cluster_resolution": res,
+            "reasons": list(reasons),
+            "auto": m == "auto",
+            "note": (
+                "compact mode: structure short soft-buffer (500→1000) allowed, "
+                f"append_budget=200, downstream Leiden≈{res}."
+            ),
+        }
+
+    def _as_balanced() -> dict[str, Any]:
+        return {
+            "mode": "balanced",
+            "n_top_floor": 2000,
+            "append_budget": 200,
+            "allow_short_soft_buffer": True,
+            "cluster_resolution": float(_RES_COARSE),
+            "reasons": list(reasons),
+            "auto": m == "auto",
+            "note": (
+                "balanced mode: product default append @k≈2000 + budget 200, "
+                f"downstream Leiden≈{_RES_COARSE}."
+            ),
+        }
+
+    if m == "fine":
+        reasons.append("user_mode_fine")
+        return _as_fine()
+    if m == "compact":
+        reasons.append("user_mode_compact")
+        return _as_compact()
+    if m == "balanced":
+        reasons.append("user_mode_balanced")
+        return _as_balanced()
+
+    # ---- auto detection (order matters) ----
+    # 1) True fine: author multi-type labels or v7 fine-atlas gene budget.
+    if n_types is not None and int(n_types) >= _FINE_N_TYPES:
+        reasons.append(f"n_types={int(n_types)}>={_FINE_N_TYPES}")
+        return _as_fine()
+    if "fine_atlas" in branch or branch.startswith("v7_fine_atlas"):
+        reasons.append("structure_fine_atlas_band")
+        return _as_fine()
+
+    # 2) Structure SHORT / soft 500→1000 → compact (keep 1000+append).
+    # Do NOT promote to fine just because n_density_pops is large — that
+    # re-floored k to 2000 and wiped measured compact wins (1200 genes).
+    if (
+        branch.startswith("short_")
+        or "+k_buffer:500→1000" in branch
+        or "short_hard" in branch
+        or "short_unstable" in branch
+    ):
+        reasons.append("structure_short_geometry")
+        return _as_compact()
+
+    reasons.append("default_balanced")
+    return _as_balanced()
+
+
+def resolve_cluster_resolution(
+    adata: Any | None = None,
+    *,
+    resolution: float | str = "auto",
+    label_key: str | None = None,
+    n_types: int | None = None,
+    n_density_pops: float | int | None = None,
+    rule_branch: str | None = None,
+) -> dict[str, Any]:
+    """Pick Leiden resolution: ``"auto"`` → coarse 0.8 / fine 1.5, or honor a float.
+
+    **Automatic switch** (when ``resolution="auto"``):
+
+    - fine (1.5) if ``n_types≥15``, density pops ≥15, or structure
+      ``v7_fine_atlas`` branch (from ``adata.uns['scfair']['hvg']`` when
+      present);
+    - else coarse (0.8).
+
+    Pass an explicit float to override. Does not modify ``adata`` or HVG genes.
+
+    Parameters
+    ----------
+    adata
+        Optional AnnData: used to read ``label_key`` counts and structure meta
+        under ``uns['scfair']['hvg']``.
+    resolution
+        ``"auto"`` (default) or a Leiden resolution float.
+    label_key
+        ``obs`` column for type count when ``n_types`` is not given.
+    """
+    if not (
+        resolution is None or (isinstance(resolution, str) and str(resolution).lower() == "auto")
+    ):
+        try:
+            res_f = float(resolution)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"resolution must be 'auto' or a float, got {resolution!r}") from exc
+        return {
+            "tier": "manual",
+            "resolution": res_f,
+            "resolution_sweep": [res_f],
+            "primary_metric": "ARI",
+            "reasons": ["user_override"],
+            "note": f"User-fixed Leiden resolution={res_f}.",
+            "auto": False,
+        }
+
+    # Fill gaps from adata
+    if adata is not None:
+        if n_types is None and label_key is not None and label_key in getattr(adata, "obs", {}):
+            try:
+                n_types = int(pd.Series(adata.obs[label_key]).astype(str).nunique())
+            except Exception:
+                n_types = None
+        h = {}
+        try:
+            h = (adata.uns.get("scfair") or {}).get("hvg") or {}
+        except Exception:
+            h = {}
+        auto_n = h.get("auto_n") if isinstance(h, Mapping) else None
+        if not isinstance(auto_n, Mapping):
+            auto_n = {}
+        st = auto_n.get("structure") if isinstance(auto_n.get("structure"), Mapping) else {}
+        rx = st.get("rule_explain") if isinstance(st.get("rule_explain"), Mapping) else st
+        feat = st.get("features") if isinstance(st.get("features"), Mapping) else {}
+        if rule_branch is None:
+            rule_branch = (
+                auto_n.get("rule_branch") or st.get("rule_branch") or (rx or {}).get("rule_branch")
+            )
+        if n_density_pops is None:
+            n_density_pops = (rx or {}).get("n_density_pops")
+            if n_density_pops is None:
+                n_density_pops = feat.get("n_density_pops")
+
+    rec = recommend_cluster_resolution(
+        n_types=n_types,
+        n_density_pops=n_density_pops,
+        rule_branch=str(rule_branch) if rule_branch else None,
+    )
+    rec = dict(rec)
+    rec["auto"] = True
+    return rec
 
 
 def diagnose_from_labels(
@@ -267,12 +591,16 @@ def diagnose_from_labels(
     metrics = cluster_size_metrics(counts)
     tips = _imbalance_tips(metrics, source="user_labels")
     rec = _recommendation_from_imbalance(metrics)
+    n_types = int(metrics.get("n_clusters") or 0)
+    downstream = recommend_cluster_resolution(n_types=n_types if n_types > 0 else None)
     if rec == "keep_current":
         tips.append(
             "Imbalance does not predict whether scFair will beat scanpy here. "
             "If the choice matters, run both at matched k and "
             "compare over a range of clustering resolutions, not one."
         )
+    if downstream["tier"] == "fine":
+        tips.append(downstream["note"])
     return {
         "source": "user_labels",
         "metrics": metrics,
@@ -280,6 +608,7 @@ def diagnose_from_labels(
         "recommendation": rec,
         "benefit_evidence": "none" if rec == "use_scanpy_or_none" else "not_predictable",
         "known_no_gain_regime": rec == "use_scanpy_or_none",
+        "downstream_clustering": downstream,
         "tips": tips,
     }
 
@@ -290,6 +619,7 @@ def diagnose_hvg_run(
     n_top_genes_used: int | None,
     n_top_is_auto: bool = False,
     auto_n_strategy: str | None = None,
+    structure_meta: Mapping[str, Any] | None = None,
     resolution: float | None = None,
     neighbor_contrast: float = 0.0,
     min_cluster_size: int | None = None,
@@ -307,6 +637,11 @@ def diagnose_hvg_run(
     diagnosis is complete, but its tips are **not** re-logged — one finding,
     one message, at the earliest point it could be known. Pass ``None`` and the
     parameter-only checks are recomputed and logged here instead.
+
+    ``structure_meta`` is the structure auto_n detail dict (from
+    ``estimate_n_top_structure`` / ``auto_n['structure']``) when
+    ``n_top_genes='auto'`` used the structure path. Used for short-k and
+    fine-atlas band tips.
     """
     method = str(balance_method or "none")
 
@@ -319,12 +654,15 @@ def diagnose_hvg_run(
             kept = {k: int(v) for k, v in raw_sizes.items() if str(k) not in dropped}
             sizes = kept if kept else raw_sizes
 
+    # append freezes global HVG + secondary ranks; no intermediate clustering.
+    uses_clusters = method not in ("none", "append")
+
     metrics = cluster_size_metrics(sizes)
-    if method != "none" and n_clusters_used is not None and metrics["n_clusters"] == 0:
+    if uses_clusters and n_clusters_used is not None and metrics["n_clusters"] == 0:
         # Clustering diag missing sizes but we know how many scored. Guarded on
-        # method: with balance_method='none' no intermediate clustering runs at
-        # all, so "fewer than 2 populations" would be a category error -- there
-        # is no finding about the data, only about the configuration.
+        # method: with balance_method='none'/'append' no intermediate clustering
+        # runs at all, so "fewer than 2 populations" would be a category error
+        # -- there is no finding about the data, only about the configuration.
         if int(n_clusters_used) < 2:
             metrics = {**metrics, "n_clusters": int(n_clusters_used), "imbalance": "degenerate"}
 
@@ -360,13 +698,35 @@ def diagnose_hvg_run(
         tips = []
 
     # --- post-run only: findings that needed the clustering to exist ---
-    if n_kept < 2 and method != "none":
+    n_total_clusters = None
+    if clustering and clustering.get("n_clusters_total") is not None:
+        n_total_clusters = int(clustering["n_clusters_total"])
+
+    if n_kept < 2 and uses_clusters:
         flags.append("insufficient_clusters")
         tips.append(
             f"Only {n_kept} intermediate cluster(s) pass min_cluster_size"
             f"{f'={min_cluster_size}' if min_cluster_size is not None else ''}. "
             "Cluster-vs-rest specificity has no signal → result ≈ scanpy HVG. "
             "Lower min_cluster_size, raise resolution, or use balance_method='none'."
+        )
+
+    # Two (or fewer) intermediate communities: every specificity / allocation
+    # mechanism is already degraded — equal-share "fairness" on 2 blobs is a
+    # no-op that looks balanced. Treat as a hard structural warning even when
+    # both pass min_cluster_size.
+    if (
+        uses_clusters
+        and n_total_clusters is not None
+        and int(n_total_clusters) <= 2
+        and "insufficient_clusters" not in flags
+    ):
+        flags.append("coarse_partition")
+        tips.append(
+            f"Intermediate Leiden resolved only {int(n_total_clusters)} community(ies). "
+            "Cluster-vs-rest specificity and post-hoc allocation (starved_topup / "
+            "coverage) cannot recover rare types that were never split out. "
+            "Pass a higher float resolution (e.g. 1.0–2.0) or use balance_method='none'."
         )
 
     # `auto` resolves k only during the run, so a k>=3000 that came from auto
@@ -396,6 +756,14 @@ def diagnose_hvg_run(
                 "bounding n_top_max, or passing n_top_genes=2000."
             )
 
+    # Structure auto: explain short/mid k and v7 band (protocol vs geometry).
+    if n_top_is_auto and strat in ("structure", "auto") and k is not None:
+        stips, sflags = _structure_auto_tips(k=k, structure_meta=structure_meta)
+        for f in sflags:
+            if f not in flags:
+                flags.append(f)
+        tips.extend(stips)
+
     if n_dropped > 0 and method != "none":
         flags.append("clusters_dropped")
         size_detail = ""
@@ -420,8 +788,24 @@ def diagnose_hvg_run(
         )
 
     # --- descriptive: what the intermediate populations look like ---
+    # Imbalance is measured on the *intermediate partition*, not on true
+    # cell-type sizes. When that partition is coarse (≤2 blobs), failed
+    # structure looks "balanced" (max/min≈1) and would otherwise recommend
+    # keep_current — the reverse of the right advice.
+    imbalance_source = "intermediate_clusters"
     if method != "none":
-        tips.extend(_imbalance_tips(metrics, source="intermediate_clusters"))
+        if n_total_clusters is not None and int(n_total_clusters) <= 2:
+            imbalance_source = "intermediate_clusters_unreliable"
+            tips.append(
+                f"imbalance metrics (n={n_total_clusters}, "
+                f"max/min={_fmt_ratio(metrics.get('max_min_ratio'))}) describe the "
+                "collapsed intermediate partition, not the data. Coarse Leiden "
+                "partitions often look balanced while rare types are absorbed. "
+                "Use scfair.pp.diagnose_from_labels(obs['cell_type']) for true "
+                "size imbalance, or raise resolution."
+            )
+        else:
+            tips.extend(_imbalance_tips(metrics, source="intermediate_clusters"))
 
     if clustering:
         var_ratio = clustering.get("pca_variance_ratio")
@@ -431,6 +815,18 @@ def diagnose_hvg_run(
             if pc_tip:
                 flags.append("pc_elbow")
                 tips.append(pc_tip)
+
+        if clustering.get("resolution_source") == "fallback":
+            if "resolution_fallback" not in flags:
+                flags.append("resolution_fallback")
+            res_used = clustering.get("resolution")
+            tips.append(
+                f"resolution='auto' fell back to {res_used} "
+                f"(density field unusable: "
+                f"{(clustering.get('granularity') or {}).get('reason', 'unknown')}). "
+                "If results look under-partitioned, pass an explicit float "
+                "resolution (e.g. 1.0–2.0)."
+            )
 
         if clustering.get("resolution_source") == "density_field":
             target = clustering.get("n_populations_target")
@@ -451,6 +847,54 @@ def diagnose_hvg_run(
                     f"{achieved}{call_note} — Leiden's cluster count is a step "
                     "function of resolution and can skip the exact target. Not "
                     "necessarily wrong, but the two counts disagree."
+                )
+
+        # Under-partition / unresolved-rare signal: clusters_dropped only
+        # catches communities that *formed* then fell under min_cluster_size.
+        # When Leiden never splits a rare type out of a majority blob, the
+        # drop list stays empty while specificity still cannot score it.
+        if clustering.get("under_partition_warning"):
+            if "under_partition" not in flags:
+                flags.append("under_partition")
+            tips.append(
+                "Intermediate Leiden under-partitioned relative to the density "
+                "field target (rare types may be absorbed into majority "
+                "communities). clusters_dropped will not list them. Pass a "
+                "higher float resolution (e.g. 0.5–1.0) if rare recovery matters."
+            )
+        min_frac = clustering.get("min_cluster_frac")
+        n_total = clustering.get("n_clusters_total")
+        if (
+            method != "none"
+            and min_frac is not None
+            and n_total is not None
+            and int(n_total) >= 3
+            and float(min_frac) >= 0.08
+            and int(n_total) <= 6
+        ):
+            # Coarse partition whose smallest blob is still large (≥8% of
+            # cells): possible that a rarer type exists but was not resolved.
+            if "possible_unresolved_rare" not in flags:
+                flags.append("possible_unresolved_rare")
+            tips.append(
+                f"Smallest intermediate community is {100.0 * float(min_frac):.1f}% of "
+                f"cells across only {int(n_total)} communities. If a rarer type "
+                "exists in the data, it may be unresolved (absorbed, not "
+                "dropped). Check clustering.min_cluster_frac / raise resolution."
+            )
+
+        # Allocation layer may report "n_starved=0" because structure only
+        # produced 2 units — that is not "checked and fair".
+        for prefix in ("starved_topup", "coverage"):
+            status = clustering.get(f"{prefix}_allocation_status")
+            if status == "skipped_structure_too_coarse":
+                if "allocation_skipped_coarse" not in flags:
+                    flags.append("allocation_skipped_coarse")
+                n_u = clustering.get(f"{prefix}_n_units")
+                tips.append(
+                    f"allocation_method='{prefix}' was requested but skipped: "
+                    f"structure resolved only {n_u} unit(s) (need ≥3). "
+                    "n_starved=0 here means 'nothing to check', not 'fair'."
                 )
 
     imbalance = metrics["imbalance"]
@@ -483,10 +927,31 @@ def diagnose_hvg_run(
     # `not_predictable` carries no separate tip text; `evidence` /
     # `recommendation` below expose it programmatically.
 
+    # Downstream clustering protocol (P0 coarse / P1 fine) — advisory only.
+    nd_for_res = None
+    branch_for_res = None
+    if structure_meta is not None:
+        sm0 = dict(structure_meta)
+        rx0 = sm0.get("rule_explain") if isinstance(sm0.get("rule_explain"), Mapping) else sm0
+        feat0 = sm0.get("features") if isinstance(sm0.get("features"), Mapping) else {}
+        nd_for_res = (rx0 or {}).get("n_density_pops")
+        if nd_for_res is None:
+            nd_for_res = feat0.get("n_density_pops")
+        branch_for_res = sm0.get("rule_branch") or (rx0 or {}).get("rule_branch")
+    downstream = recommend_cluster_resolution(
+        n_density_pops=nd_for_res,
+        rule_branch=str(branch_for_res) if branch_for_res else None,
+    )
+    if downstream["tier"] == "fine" and "downstream_fine_resolution" not in flags:
+        flags.append("downstream_fine_resolution")
+        if downstream["note"] not in tips:
+            tips.append(downstream["note"])
+
     out: dict[str, Any] = {
-        "source": "intermediate_clusters" if sizes else "config_only",
+        "source": imbalance_source if sizes else "config_only",
         "metrics": metrics,
         "imbalance": imbalance,
+        "imbalance_source": imbalance_source if sizes else "config_only",
         "n_clusters_kept": n_kept,
         "n_clusters_dropped": n_dropped,
         "n_top_genes_used": k,
@@ -496,6 +961,7 @@ def diagnose_hvg_run(
         "benefit_evidence": evidence,
         "recommendation": recommendation,
         "known_no_gain_regime": evidence == "none",
+        "downstream_clustering": downstream,
         "tips": tips,
         "thresholds": {
             "max_frac_strong": _MAX_FRAC_STRONG,
@@ -513,6 +979,151 @@ def diagnose_hvg_run(
     return out
 
 
+def _structure_auto_tips(
+    *,
+    k: int,
+    structure_meta: Mapping[str, Any] | None,
+) -> tuple[list[str], list[str]]:
+    """Tips for structure auto_n k: short list, mid list, v7 band miss."""
+    tips: list[str] = []
+    flags: list[str] = []
+    sm = dict(structure_meta or {})
+    # Prefer nested rule_explain; fall back to top-level keys.
+    rx = sm.get("rule_explain") if isinstance(sm.get("rule_explain"), Mapping) else sm
+    branch = str(sm.get("rule_branch") or (rx or {}).get("rule_branch") or "")
+    feat = sm.get("features") if isinstance(sm.get("features"), Mapping) else {}
+    nd = (rx or {}).get("n_density_pops")
+    if nd is None:
+        nd = feat.get("n_density_pops")
+    nl = (rx or {}).get("n_leiden")
+    if nl is None:
+        nl = feat.get("n_leiden")
+    vm = (rx or {}).get("valley_median")
+    if vm is None:
+        vm = feat.get("valley_median")
+    ratio = (rx or {}).get("ratio")
+    if ratio is None and nl is not None and nd is not None:
+        try:
+            nd_f, nl_f = float(nd), float(nl)
+            ratio = (nl_f / nd_f) if nd_f > 0 else None
+        except (TypeError, ValueError):
+            ratio = None
+    v7_miss = (rx or {}).get("v7_band_miss")
+    k_source = sm.get("k_source")
+    short_blocked = bool(sm.get("short_blocked") or (rx or {}).get("short_blocked"))
+    short_why = sm.get("short_block_reason") or (rx or {}).get("short_block_reason")
+    short_raw = sm.get("short_k_raw")
+    if short_raw is None:
+        short_raw = (rx or {}).get("short_k_raw")
+    dens_conf = (rx or {}).get("density_confidence") or feat.get("density_confidence")
+
+    def _fmt_num(x: Any, ndigits: int = 3) -> str:
+        try:
+            return f"{float(x):.{ndigits}f}"
+        except (TypeError, ValueError):
+            return str(x)
+
+    parts = []
+    if nd is not None:
+        parts.append(f"nd={nd}")
+    if nl is not None:
+        parts.append(f"nl={nl}")
+    if ratio is not None:
+        parts.append(f"nl/nd={_fmt_num(ratio)}")
+    if vm is not None:
+        parts.append(f"vm={_fmt_num(vm)}")
+    if dens_conf is not None:
+        parts.append(f"density_conf={dens_conf}")
+    if branch:
+        parts.append(f"branch={branch}")
+    if k_source:
+        parts.append(f"k_source={k_source}")
+    feat_s = ", ".join(parts) if parts else "structure features unavailable"
+
+    # Soft buffer and/or fine-mode k floor (keep messages accurate).
+    k_buf_raw = (rx or {}).get("k_buffer_raw")
+    if k_buf_raw is None and structure_meta is not None:
+        k_buf_raw = structure_meta.get("k_buffer_raw")
+    if "fine_mode_floor" in branch:
+        flags.append("structure_fine_mode_floor")
+        tips.append(
+            f"structure auto fine-mode k floor → n_top={k} ({feat_s}). "
+            "Multi-type / fine-atlas mode keeps list length ≥2000 (does not "
+            "keep SHORT soft lists at 1000). Use mode='compact' to allow "
+            "base≈1000 + append."
+        )
+    elif "k_buffer" in branch or (k_buf_raw is not None and int(k) != int(k_buf_raw)):
+        flags.append("structure_k_buffer")
+        # Prefer ladder target in branch (500→1000) over final k when a
+        # later floor changed the number.
+        shown = str(k)
+        if "k_buffer:" in branch:
+            try:
+                shown = branch.split("k_buffer:", 1)[1].split("+", 1)[0]
+            except Exception:
+                shown = f"{int(k_buf_raw)}→{k}" if k_buf_raw is not None else str(k)
+        elif k_buf_raw is not None:
+            shown = f"{int(k_buf_raw)}→{k}"
+        tips.append(
+            f"structure auto soft-buffered n_top={shown} ({feat_s}). "
+            "Classical discrete picks lift one rung (500→1000, 1000→1500, "
+            "1500→2000). Pass a fixed n_top_genes if you want a classical 2000."
+        )
+
+    # Residual anti-SHORT floor (only when post-buffer k was still ≤500).
+    if short_blocked or "anti_short" in branch:
+        flags.append("structure_short_blocked")
+        raw_note = f" (rule raw k={short_raw})" if short_raw is not None else ""
+        why_note = f" reason={short_why}" if short_why else ""
+        tips.append(
+            f"structure auto residual SHORT floor{raw_note} → n_top={k} "
+            f"({feat_s}).{why_note} Soft buffer did not lift above 500 and "
+            "density was untrusted, so k was floored to ~2000. Pass "
+            "n_top_genes=2000 for a classical protocol."
+        )
+    elif int(k) <= 500:
+        flags.append("structure_short_k")
+        tips.append(
+            f"structure auto chose n_top={k} ({feat_s}). Density geometry favours a "
+            "short HVG list (many cores / deep valleys), not a classical ~2000 "
+            "global HVG. This is intentional on compact multi-core data; if the "
+            "dataset is a large multi-type atlas and results look under-selected, "
+            "pass n_top_genes=2000 explicitly."
+        )
+        if v7_miss:
+            flags.append("structure_v7_band_miss")
+            tips.append(
+                "v7 fine-atlas floor (would raise k toward 2000 on seurat-like "
+                f"atlases) did not apply; missing condition(s): {list(v7_miss)}. "
+                "Typical misses: valley_median < 0.78, nl/nd > 1.12, or "
+                "n_density_pops outside [12, 20]."
+            )
+    elif int(k) <= 1500 and "short" not in branch:
+        flags.append("structure_mid_k")
+        tips.append(
+            f"structure auto chose n_top={k} ({feat_s}). Mid list for "
+            "CITE-like / intermediate structure. For a classical fixed "
+            "protocol use n_top_genes=2000."
+        )
+    elif int(k) >= 2000 and branch.startswith("v7_fine_atlas"):
+        flags.append("structure_v7_band_floor")
+        tips.append(
+            f"structure auto chose n_top={k} via v7 fine-atlas band ({feat_s}): "
+            "large n_obs, mid density-pop count, deep valleys, Leiden≈density. "
+            "This path prevents seurat-like short-k collapse."
+        )
+        # Pair gene-list floor with fine downstream protocol (measured seurat_v4).
+        flags.append("downstream_fine_resolution")
+        tips.append(
+            "Fine-atlas structure: for multi-type / l2-style labels, cluster at "
+            f"Leiden resolution≈{_RES_FINE} (0.8 under-partitions). Product "
+            "append_budget=200 is enough — deeper append did not beat m=200 on "
+            "seurat_v4 l2 at res=1.5."
+        )
+
+    return tips, flags
+
+
 def _assess(*, method: str, flags: Sequence[str]) -> tuple[str, str]:
     """Return (benefit_evidence, recommendation).
 
@@ -526,10 +1137,23 @@ def _assess(*, method: str, flags: Sequence[str]) -> tuple[str, str]:
     # measured or structural: nothing to gain here
     if method == "none":
         return "none", "use_scanpy_or_none"
+    if method == "append":
+        # Product path: global base + secondary ranks; no cluster re-rank claim.
+        return "not_predictable", "keep_current"
     if "insufficient_clusters" in flagset:
         return "none", "use_scanpy_or_none"
     if "k_ge_3000" in flagset:
         return "none", "use_scanpy_or_none"
+
+    # Structure layer failed before scoring/allocation can help. Do not emit
+    # keep_current just because the collapsed partition looks balanced.
+    if flagset & {
+        "coarse_partition",
+        "resolution_fallback",
+        "under_partition",
+        "allocation_skipped_coarse",
+    }:
+        return "structure_unreliable", "raise_resolution"
 
     # the two settings target the same failure and cancel out
     if "nc_low_resolution" in flagset:

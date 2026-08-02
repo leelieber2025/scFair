@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -569,9 +571,16 @@ def test_mito_ribo_name_helpers():
     assert _is_mito_name("MT-CO3")
     assert _is_mito_name("mt-Nd1")
     assert not _is_mito_name("COX4I1")
+    assert not _is_mito_name("MTOR")
     assert _is_ribo_name("RPL19")
     assert _is_ribo_name("RPS6")
+    assert _is_ribo_name("RPSA")
+    assert _is_ribo_name("RPLP0")
     assert not _is_ribo_name("RPA1")
+    # kinases share RPS6 prefix but are not ribosomal proteins
+    assert not _is_ribo_name("RPS6KA1")
+    assert not _is_ribo_name("RPS6KB1")
+    assert not _is_ribo_name("RPS6KA3")
 
 
 def test_hvg_global_only(adata_for_hvg):
@@ -579,9 +588,27 @@ def test_hvg_global_only(adata_for_hvg):
     scf.pp.highly_variable_genes(ad, n_top_genes=30, balance_method="none", flavor="seurat_v3")
     assert int(ad.var["highly_variable"].sum()) == 30
     assert "counts" in ad.layers
-    assert "raw_snapshot" in ad.uns[UNS_KEY]
+    # Default store_raw=False: layers['counts'] only, no second full matrix in uns.
+    assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
     assert ad.uns[UNS_KEY]["hvg"]["balance_method"] == "none"
+    assert ad.uns[UNS_KEY]["hvg"]["store_raw"] is False
     assert "scfair_score" in ad.var
+
+
+def test_hvg_store_raw_true_writes_snapshot(adata_for_hvg):
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=20,
+        balance_method="none",
+        options=HVGOptions(store_raw=True),
+        diagnose=False,
+    )
+    assert "raw_snapshot" in ad.uns[UNS_KEY]
+    assert ad.uns[UNS_KEY]["raw_snapshot"]["backend"] == "inline"
+    assert ad.uns[UNS_KEY]["hvg"]["store_raw"] is True
 
 
 def test_hvg_score_mode(adata_for_hvg):
@@ -648,7 +675,8 @@ def test_hvg_reweight_mode(adata_for_hvg):
     assert "scfair_hvg_clusters" in ad.obs
 
 
-def test_hvg_inverse_size_alias_sets_beta_0(adata_for_hvg):
+def test_hvg_inverse_size_alias_sets_beta_neg1(adata_for_hvg):
+    """``inverse_size`` → score with true inverse-size weights (β=-1)."""
     ad = adata_for_hvg.copy()
     scf.pp.highly_variable_genes(
         ad,
@@ -658,7 +686,27 @@ def test_hvg_inverse_size_alias_sets_beta_0(adata_for_hvg):
         random_state=0,
     )
     assert ad.uns[UNS_KEY]["hvg"]["balance_method"] == "score"
-    assert ad.uns[UNS_KEY]["hvg"]["balance_power"] == 0.0
+    assert ad.uns[UNS_KEY]["hvg"]["balance_power"] == -1.0
+
+
+def test_balance_power_allows_negative(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=20,
+        balance_method="score",
+        balance_power=-0.5,
+        min_cluster_size=20,
+        random_state=0,
+        diagnose=False,
+    )
+    assert ad.uns[UNS_KEY]["hvg"]["balance_power"] == -0.5
+
+
+def test_balance_power_rejects_out_of_range(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(ValueError, match=r"balance_power.*\[-2, 2\]"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="score", balance_power=-3.0)
 
 
 @pytest.mark.parametrize("flavor", ["seurat", "cell_ranger", "seurat_v3_paper"])
@@ -732,7 +780,9 @@ def test_hvg_inplace_false_returns_dataframe(adata_for_hvg):
 def test_hvg_subset_true(adata_for_hvg):
     ad = adata_for_hvg.copy()
     n_full = ad.n_vars
-    scf.pp.highly_variable_genes(ad, n_top_genes=25, balance_method="none", subset=True)
+    # subset=True auto-enables store_raw so full gene universe is recoverable.
+    with pytest.warns(UserWarning, match="subset=True requires a raw_snapshot"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=25, balance_method="none", subset=True)
     assert ad.n_vars == 25
     assert len(ad.uns[UNS_KEY]["raw_snapshot"]["var_names"]) == n_full
 
@@ -778,6 +828,261 @@ def test_public_api_surface(adata_for_hvg):
 # ---------------------------------------------------------------------------
 
 
+def _hvg_selected(ad) -> set[str]:
+    return set(ad.var_names[ad.var["highly_variable"]].astype(str))
+
+
+def _run_hvg_kwargs(ad, **kw):
+    """Call highly_variable_genes; return selected gene set."""
+    from scfair.pp import HVGOptions
+
+    # Default research knobs small enough for the fixture (do not drop
+    # an explicitly passed options=).
+    if "options" not in kw and "append_budget" not in kw:
+        kw["options"] = HVGOptions(append_budget=5)
+    kw.setdefault("diagnose", False)
+    kw.setdefault("balance_method", "append")
+    scf.pp.highly_variable_genes(ad, **kw)
+    return _hvg_selected(ad)
+
+
+def test_same_object_second_call_matches_clean_object(adata_for_hvg):
+    """Core anti-pollution contract (G1/G2/G3 pattern).
+
+    Real workflows re-use one AnnData to compare layer / flavor / k. Suite tests
+    that always ``adata.copy()`` never see leftover ``layers['counts']``,
+    snapshot, or flavor score columns. Rule: after call_a then call_b on the
+    *same* object, the result of call_b must equal call_b alone on a clean copy.
+    """
+    from scfair.pp import HVGOptions
+
+    rng = np.random.default_rng(42)
+    alt = rng.poisson(6.0, size=adata_for_hvg.X.shape).astype(np.float32)
+
+    scenarios = [
+        # (name, prepare_shared, kwargs_a, kwargs_b)
+        (
+            "layer_alt_then_default",
+            lambda ad: ad.layers.__setitem__("alt", alt.copy()),
+            dict(
+                n_top_genes=25,
+                layer="alt",
+                options=HVGOptions(append_budget=5),
+            ),
+            dict(n_top_genes=25, options=HVGOptions(append_budget=5)),
+        ),
+        (
+            "flavor_seurat_v3_then_seurat",
+            None,
+            dict(
+                n_top_genes=25,
+                flavor="seurat_v3",
+                options=HVGOptions(append_budget=5),
+            ),
+            dict(
+                n_top_genes=25,
+                flavor="seurat",
+                options=HVGOptions(append_budget=5),
+            ),
+        ),
+        (
+            "k_20_then_k_35",
+            None,
+            dict(n_top_genes=20, options=HVGOptions(append_budget=5)),
+            dict(n_top_genes=35, options=HVGOptions(append_budget=5)),
+        ),
+        (
+            "append_then_none",
+            None,
+            dict(
+                n_top_genes=25,
+                balance_method="append",
+                options=HVGOptions(append_budget=8),
+            ),
+            dict(n_top_genes=25, balance_method="none"),
+        ),
+        (
+            "none_then_append",
+            None,
+            dict(n_top_genes=25, balance_method="none"),
+            dict(
+                n_top_genes=25,
+                balance_method="append",
+                options=HVGOptions(append_budget=5),
+            ),
+        ),
+    ]
+
+    for name, prepare, kw_a, kw_b in scenarios:
+        dirty = adata_for_hvg.copy()
+        clean = adata_for_hvg.copy()
+        if prepare is not None:
+            prepare(dirty)
+            prepare(clean)
+        _run_hvg_kwargs(dirty, **kw_a)
+        sel_dirty_b = _run_hvg_kwargs(dirty, **kw_b)
+        sel_clean_b = _run_hvg_kwargs(clean, **kw_b)
+        assert sel_dirty_b == sel_clean_b, (
+            f"{name}: second call on reused object ≠ clean object "
+            f"(only_dirty={sel_dirty_b - sel_clean_b}, "
+            f"only_clean={sel_clean_b - sel_dirty_b})"
+        )
+
+
+def test_layer_does_not_hijack_later_default_calls(adata_for_hvg):
+    """G1: layer='alt' must not make subsequent layer=None calls reuse alt."""
+    from scfair.pp import HVGOptions
+
+    rng = np.random.default_rng(11)
+    alt = rng.poisson(6.0, size=adata_for_hvg.X.shape).astype(np.float32)
+
+    ad_alt = adata_for_hvg.copy()
+    ad_alt.layers["alt"] = alt.copy()
+    sel_alt = _run_hvg_kwargs(
+        ad_alt, n_top_genes=25, layer="alt", options=HVGOptions(append_budget=5)
+    )
+    if "counts" in ad_alt.layers:
+        assert not np.array_equal(np.asarray(ad_alt.layers["counts"]), np.asarray(alt))
+
+    dirty = adata_for_hvg.copy()
+    dirty.layers["alt"] = alt.copy()
+    _run_hvg_kwargs(dirty, n_top_genes=25, layer="alt", options=HVGOptions(append_budget=5))
+    sel_after = _run_hvg_kwargs(dirty, n_top_genes=25, options=HVGOptions(append_budget=5))
+    sel_fresh = _run_hvg_kwargs(
+        adata_for_hvg.copy(), n_top_genes=25, options=HVGOptions(append_budget=5)
+    )
+    assert sel_after == sel_fresh
+    assert sel_after != sel_alt
+
+
+def test_x_swap_after_first_call_uses_new_matrix(adata_for_hvg):
+    """G2: after .X swap, selection follows .X; user counts layer not clobbered."""
+    from scfair.pp import HVGOptions
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER
+
+    rng = np.random.default_rng(12)
+    ad = adata_for_hvg.copy()
+    sel_old = _run_hvg_kwargs(ad, n_top_genes=20, options=HVGOptions(append_budget=5))
+    # First call may have materialised counts from X1.
+    counts_user = rng.poisson(4.0, size=ad.X.shape).astype(np.float32)
+    ad.layers["counts"] = counts_user.copy()
+    X2 = rng.poisson(9.0, size=ad.X.shape).astype(np.float32)
+    ad.X = X2
+    with pytest.warns(UserWarning, match="left unchanged|internal layer"):
+        sel_new = _run_hvg_kwargs(ad, n_top_genes=20, options=HVGOptions(append_budget=5))
+    # User matrix intact; ephemeral layer cleaned up.
+    assert np.array_equal(np.asarray(ad.layers["counts"]), np.asarray(counts_user))
+    assert INTERNAL_COUNTS_LAYER not in ad.layers
+
+    ad_ref = adata_for_hvg.copy()
+    ad_ref.X = X2.copy()
+    sel_ref = _run_hvg_kwargs(ad_ref, n_top_genes=20, options=HVGOptions(append_budget=5))
+    assert sel_new == sel_ref
+    assert sel_new != sel_old
+
+
+def test_mode_with_fixed_int_k_warns(adata_for_hvg):
+    """E3: mode= only steers auto k; fixed int k should warn once."""
+    with pytest.warns(UserWarning, match="mode=.*no effect|n_top_genes is a fixed int"):
+        scf.pp.highly_variable_genes(
+            adata_for_hvg.copy(),
+            n_top_genes=20,
+            mode="fine",
+            balance_method="none",
+            diagnose=False,
+        )
+
+
+def test_flavor_rerun_does_not_reuse_prior_score_columns(adata_for_hvg):
+    """G3: second flavor on same object equals clean run of that flavor."""
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    sel_v3 = _run_hvg_kwargs(
+        ad, n_top_genes=25, flavor="seurat_v3", options=HVGOptions(append_budget=5)
+    )
+    assert "variances_norm" in ad.var.columns
+
+    sel_seurat = _run_hvg_kwargs(
+        ad, n_top_genes=25, flavor="seurat", options=HVGOptions(append_budget=5)
+    )
+    assert "dispersions_norm" in ad.var.columns or "dispersions" in ad.var.columns
+
+    sel_fresh = _run_hvg_kwargs(
+        adata_for_hvg.copy(),
+        n_top_genes=25,
+        flavor="seurat",
+        options=HVGOptions(append_budget=5),
+    )
+    assert sel_seurat == sel_fresh
+    assert sel_seurat != sel_v3 or "variances_norm" not in ad.var.columns
+
+
+def test_hybrid_degenerates_to_global_when_no_clusters(adata_for_hvg):
+    """H1: n_clusters_used=0 must not be logged as a successful hybrid run."""
+    ad = adata_for_hvg.copy()
+    ad_none = adata_for_hvg.copy()
+    # Force every Leiden cluster below min size → specificity has no signal.
+    with pytest.warns(UserWarning, match="n_clusters_used=0|degenerated|≈ scanpy"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=20,
+            balance_method="hybrid",
+            min_cluster_size=100_000,
+            diagnose=False,
+            random_state=0,
+        )
+    scf.pp.highly_variable_genes(
+        ad_none,
+        n_top_genes=20,
+        balance_method="none",
+        diagnose=False,
+        random_state=0,
+    )
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["n_clusters_used"] == 0
+    assert meta["selection"] == "hybrid_degenerated_to_global"
+    assert meta.get("degenerated_to_global") is True
+    assert "hybrid_global_anchor" not in str(meta["selection"])
+    assert set(ad.var_names[ad.var["highly_variable"]]) == set(
+        ad_none.var_names[ad_none.var["highly_variable"]]
+    )
+
+
+def test_highly_variable_rank_is_nan_outside_selection(adata_for_hvg):
+    """scanpy convention: only selected genes have finite highly_variable_rank."""
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(ad, n_top_genes=20, balance_method="none", diagnose=False)
+    rank = ad.var["highly_variable_rank"]
+    hv = ad.var["highly_variable"].to_numpy()
+    n_hv = int(hv.sum())
+    assert n_hv == 20
+    assert int(rank.notna().sum()) == n_hv
+    assert bool(np.all(np.isnan(rank.to_numpy()[~hv])))
+    assert bool(np.all(np.isfinite(rank.to_numpy()[hv])))
+    # Downstream scanpy-style filters must work (inf used to pass every gene).
+    filtered = ad.var.dropna(subset=["highly_variable_rank"])
+    assert len(filtered) == n_hv
+    # Selected ranks cast cleanly after dropna.
+    _ = filtered["highly_variable_rank"].astype(int)
+
+
+def test_append_rank_matches_final_selection_size(adata_for_hvg):
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=20,
+        balance_method="append",
+        options=HVGOptions(append_budget=5),
+        diagnose=False,
+    )
+    n_sel = int(ad.var["highly_variable"].sum())
+    assert n_sel == 25
+    assert int(ad.var["highly_variable_rank"].notna().sum()) == n_sel
+
+
 def test_hybrid_pool_is_the_true_top_2k():
     """The candidate pool must be ordered by all-gene scores, not by rank.
 
@@ -792,8 +1097,8 @@ def test_hybrid_pool_is_the_true_top_2k():
     names = [f"g{i}" for i in range(n)]
     # descending variability: g0 highest ... g19 lowest
     global_scores = pd.Series(np.linspace(1.0, 0.0, n), index=names)
-    # mimic scanpy: only the top-5 carry a finite rank, the rest are +inf
-    rank = pd.Series(np.inf, index=names)
+    # mimic scanpy / public scFair column: only the top-5 carry a finite rank
+    rank = pd.Series(np.nan, index=names)
     rank.iloc[:5] = np.arange(1, 6)
     # a gene just outside the top-5 (true rank 6) is the most specific one
     spec = pd.Series(0.0, index=names)
@@ -922,13 +1227,26 @@ def test_duplicate_var_names_rejected_with_actionable_message(adata_for_hvg):
         scf.pp.highly_variable_genes(ad, n_top_genes=20)
 
 
-@pytest.mark.parametrize(
-    "lo,hi,msg", [(300, 100, "contradictory"), (0, 100, ">= 1"), (10, 0, ">= 1")]
-)
-def test_auto_bounds_are_validated(adata_for_hvg, lo, hi, msg):
+@pytest.mark.parametrize("lo,hi,msg", [(0, 100, ">= 1"), (10, 0, ">= 1")])
+def test_auto_bounds_reject_nonpositive(adata_for_hvg, lo, hi, msg):
     ad = adata_for_hvg.copy()
     with pytest.raises(ValueError, match=msg):
         scf.pp.highly_variable_genes(ad, n_top_genes="auto", n_top_min=lo, n_top_max=hi)
+
+
+def test_auto_bounds_reject_min_gt_max(adata_for_hvg):
+    """Contradictory [n_top_min, n_top_max] must raise, not silently clamp."""
+    ad = adata_for_hvg.copy()
+    with pytest.raises(ValueError, match="n_top_min=.*> n_top_max"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes="auto",
+            n_top_min=300,
+            n_top_max=100,
+            auto_n_method="elbow",
+            balance_method="none",
+            diagnose=False,
+        )
 
 
 def test_unknown_strategy_fails_before_any_clustering(adata_for_hvg):
@@ -963,15 +1281,30 @@ def test_global_score_skips_the_flavor_pass(adata_for_hvg):
     assert _hvg_names(ad) == list(gs.sort_values(ascending=False).index[:20])
 
 
-def test_scale_clustering_default_is_bit_identical(adata_for_hvg):
-    """Experimental knob: off by default, and off must change nothing."""
-    kw = dict(n_top_genes=40, balance_method="hybrid", min_cluster_size=20, random_state=0)
-    a = adata_for_hvg.copy()
-    scf.pp.highly_variable_genes(a, **kw)
-    b = adata_for_hvg.copy()
-    scf.pp.highly_variable_genes(b, scale_clustering=False, **kw)
-    assert _hvg_names(a) == _hvg_names(b)
-    assert a.uns[UNS_KEY]["hvg"]["scale_clustering"] is False
+def test_scale_clustering_default_is_true(adata_for_hvg):
+    """Default scale_clustering=True (zero-centre intermediate PCA)."""
+    from scfair.pp import HVGOptions
+
+    assert HVGOptions().scale_clustering is True
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad, n_top_genes=40, balance_method="hybrid", min_cluster_size=20, random_state=0
+    )
+    assert ad.uns[UNS_KEY]["hvg"]["scale_clustering"] is True
+
+
+def test_scale_clustering_false_still_runs(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=40,
+        balance_method="hybrid",
+        min_cluster_size=20,
+        random_state=0,
+        scale_clustering=False,
+    )
+    assert ad.uns[UNS_KEY]["hvg"]["scale_clustering"] is False
+    assert int(ad.var["highly_variable"].sum()) == 40
 
 
 def test_logfc_space_default_is_bit_identical(adata_for_hvg):
@@ -987,14 +1320,20 @@ def test_logfc_space_default_is_bit_identical(adata_for_hvg):
 @pytest.mark.parametrize("space", ["linear", "linear_regularised"])
 def test_logfc_space_alternatives_run_and_are_recorded(adata_for_hvg, space):
     a = adata_for_hvg.copy()
-    scf.pp.highly_variable_genes(
-        a,
-        n_top_genes=40,
-        balance_method="score",
-        logfc_space=space,
-        min_cluster_size=20,
-        random_state=0,
+    ctx = (
+        pytest.warns(UserWarning, match="benchmark")
+        if space == "linear"
+        else contextlib.nullcontext()
     )
+    with ctx:
+        scf.pp.highly_variable_genes(
+            a,
+            n_top_genes=40,
+            balance_method="score",
+            logfc_space=space,
+            min_cluster_size=20,
+            random_state=0,
+        )
     assert int(a.var["highly_variable"].sum()) == 40
     assert a.uns[UNS_KEY]["hvg"]["logfc_space"] == space
 
@@ -1009,22 +1348,27 @@ def test_logfc_space_invalid(adata_for_hvg):
 # ---------------------------------------------------------------------------
 
 
-def test_allocation_method_none_matches_cap_false(adata_for_hvg):
+def test_allocation_method_none_matches_default(adata_for_hvg):
+    """allocation_method='none' matches the default product path."""
+    ad_a = adata_for_hvg.copy()
+    ad_b = adata_for_hvg.copy()
+    if "counts" not in ad_a.layers:
+        ad_a.layers["counts"] = ad_a.X.copy()
+        ad_b.layers["counts"] = ad_b.X.copy()
     kw = dict(
-        n_top_genes=40,
+        n_top_genes=20,
         balance_method="hybrid",
+        flavor="seurat_v3",
+        layer="counts",
         min_cluster_size=20,
-        resolution=0.5,
-        random_state=0,
         diagnose=False,
+        random_state=0,
     )
-    a = adata_for_hvg.copy()
-    scf.pp.highly_variable_genes(a, allocation_method="none", **kw)
-    b = adata_for_hvg.copy()
-    scf.pp.highly_variable_genes(b, cap_allocation=False, **kw)
-    assert _hvg_names(a) == _hvg_names(b)
-    assert a.uns[UNS_KEY]["hvg"]["allocation_method"] == "none"
-    assert a.uns[UNS_KEY]["hvg"]["cap_allocation"] is False
+    scf.pp.highly_variable_genes(ad_a, **kw)
+    scf.pp.highly_variable_genes(ad_b, allocation_method="none", **kw)
+    assert (ad_a.var["highly_variable"].to_numpy() == ad_b.var["highly_variable"].to_numpy()).all()
+    assert ad_a.uns[UNS_KEY]["hvg"]["allocation_method"] == "none"
+    assert ad_a.uns[UNS_KEY]["hvg"]["cap_allocation"] is False
 
 
 def test_allocation_method_default_is_none(adata_for_hvg):
@@ -1146,9 +1490,10 @@ def test_allocation_method_starved_alias(adata_for_hvg):
     assert a.uns[UNS_KEY]["hvg"]["allocation_method"] == "starved_topup"
 
 
-def test_cap_allocation_emits_deprecation(adata_for_hvg):
+def test_cap_allocation_removed(adata_for_hvg):
+    """allocation_method='cap' / cap_allocation raise (removed 0.2.0)."""
     a = adata_for_hvg.copy()
-    with pytest.warns(DeprecationWarning, match="deprecated"):
+    with pytest.raises(ValueError, match="removed"):
         scf.pp.highly_variable_genes(
             a,
             n_top_genes=40,
@@ -1159,7 +1504,17 @@ def test_cap_allocation_emits_deprecation(adata_for_hvg):
             random_state=0,
             diagnose=False,
         )
-    assert a.uns[UNS_KEY]["hvg"]["allocation_method"] == "cap"
+    with pytest.raises(ValueError, match="removed"):
+        scf.pp.highly_variable_genes(
+            a,
+            n_top_genes=40,
+            balance_method="hybrid",
+            min_cluster_size=20,
+            resolution=0.5,
+            cap_allocation=True,
+            random_state=0,
+            diagnose=False,
+        )
 
 
 def test_starved_topup_stays_in_hybrid_pool(adata_for_hvg):
@@ -1503,3 +1858,578 @@ def test_consensus_is_recorded_and_scores_change(adata_for_hvg):
     assert b.uns[UNS_KEY]["hvg"]["consensus_resolutions"] == [0.5, 1.0, 2.0]
     assert a.uns[UNS_KEY]["hvg"]["consensus_resolutions"] is None
     assert not np.allclose(a.var["scfair_score"].to_numpy(), b.var["scfair_score"].to_numpy())
+
+
+def test_flavor_used_recorded_on_success(adata_for_hvg):
+    """Successful seurat_v3 path records flavor_used == requested."""
+    ad = adata_for_hvg.copy()
+    if "counts" not in ad.layers:
+        ad.layers["counts"] = ad.X.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=20,
+        balance_method="none",
+        flavor="seurat_v3",
+        layer="counts",
+        diagnose=False,
+    )
+    h = ad.uns[UNS_KEY]["hvg"]
+    assert h.get("flavor_used") == "seurat_v3"
+    assert h.get("flavor_requested") == "seurat_v3"
+    assert h.get("fallback_reason") is None
+
+
+def test_seurat_v3_fallback_warns_and_records(monkeypatch, adata_for_hvg):
+    """When seurat_v3 fails, warn + record seurat fallback (strict=False)."""
+    import scfair.pp._highly_variable_genes as hvg_mod
+
+    ad = adata_for_hvg.copy()
+    if "counts" not in ad.layers:
+        ad.layers["counts"] = ad.X.copy()
+
+    real_once = hvg_mod._run_hvg_once
+    calls = {"n": 0}
+
+    def boom(*args, **kwargs):
+        calls["n"] += 1
+        if kwargs.get("flavor") in ("seurat_v3", "seurat_v3_paper") and calls["n"] == 1:
+            raise RuntimeError("simulated seurat_v3 failure")
+        return real_once(*args, **kwargs)
+
+    monkeypatch.setattr(hvg_mod, "_run_hvg_once", boom)
+    with pytest.warns(UserWarning, match="falling back to flavor='seurat'"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=15,
+            balance_method="none",
+            flavor="seurat_v3",
+            layer="counts",
+            diagnose=False,
+            strict=False,
+        )
+    h = ad.uns[UNS_KEY]["hvg"]
+    assert h["flavor_used"] == "seurat"
+    assert h["flavor_requested"] == "seurat_v3"
+    assert h["fallback_reason"] is not None
+    assert "RuntimeError" in str(h["fallback_reason"])
+
+
+def test_seurat_v3_strict_raises(monkeypatch, adata_for_hvg):
+    import scfair.pp._highly_variable_genes as hvg_mod
+
+    ad = adata_for_hvg.copy()
+    if "counts" not in ad.layers:
+        ad.layers["counts"] = ad.X.copy()
+
+    def boom(*args, **kwargs):
+        if kwargs.get("flavor") in ("seurat_v3", "seurat_v3_paper"):
+            raise RuntimeError("simulated seurat_v3 failure")
+        raise AssertionError("should not reach other flavors under strict")
+
+    monkeypatch.setattr(hvg_mod, "_run_hvg_once", boom)
+    with pytest.raises(RuntimeError, match="strict=True"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=15,
+            balance_method="none",
+            flavor="seurat_v3",
+            layer="counts",
+            diagnose=False,
+            strict=True,
+        )
+
+
+def test_n_top_genes_1_does_not_unpack_crash(adata_for_hvg):
+    """Early cluster abort must return a 4-tuple (cluster_labels, valid, weight_map, X_pca)."""
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=1,
+        balance_method="hybrid",
+        diagnose=False,
+        random_state=0,
+    )
+    assert int(ad.var["highly_variable"].sum()) == 1
+    assert "scfair_version" in ad.uns[UNS_KEY]["hvg"]
+
+
+def test_negative_counts_raise_clear_error(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    ad.X = ad.X - 1.0
+    with pytest.raises(ValueError, match="negative"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="none", diagnose=False)
+
+
+def test_nan_counts_raise_clear_error(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    X = np.asarray(ad.X, dtype=float).copy()
+    X[0, 0] = np.nan
+    ad.X = X
+    with pytest.raises(ValueError, match="non-finite"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="none", diagnose=False)
+
+
+def test_scfair_version_recorded(adata_for_hvg):
+    from scfair import __version__
+
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="none", diagnose=False)
+    assert ad.uns[UNS_KEY]["hvg"]["scfair_version"] == __version__
+
+
+def test_hybrid_scfair_score_nan_outside_pool(adata_for_hvg):
+    """scfair_score must match the pool-normalized blend used for selection."""
+    ad = adata_for_hvg.copy()
+    k = 15
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=k,
+        balance_method="hybrid",
+        min_cluster_size=20,
+        diagnose=False,
+        random_state=0,
+    )
+    score = ad.var["scfair_score"]
+    sel = set(ad.var_names[ad.var["highly_variable"]].astype(str))
+    # Selected genes must have finite scores; outside the 2k pool → NaN.
+    assert score.loc[list(sel)].notna().all()
+    n_nan = int(score.isna().sum())
+    assert n_nan >= 1 or ad.n_vars <= 2 * k
+    # Top-k by scfair_score among finite entries should match selected set.
+    finite = score.dropna().sort_values(ascending=False)
+    top_k = set(finite.index[:k].astype(str))
+    assert top_k == sel
+
+
+def test_cluster_pool_and_genes_mutex_even_for_none(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(ValueError, match="either cluster_pool or cluster_genes"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            cluster_pool=20,
+            cluster_genes=["g0"],
+            diagnose=False,
+        )
+
+
+def test_default_n_top_genes_is_2000():
+    """Product default is fixed 2000 + append, not structure auto / hybrid."""
+    import inspect
+
+    sig = inspect.signature(scf.pp.highly_variable_genes)
+    assert sig.parameters["n_top_genes"].default == 2000
+    assert sig.parameters["balance_method"].default == "append"
+
+
+def test_duplicate_obs_names_rejected_at_entry(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    names = list(ad.obs_names)
+    names[1] = names[0]
+    ad.obs_names = names
+    with pytest.raises(ValueError, match="obs_names"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="hybrid", diagnose=False)
+
+
+def test_does_not_clobber_scanpy_uns_hvg(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    ad.uns["hvg"] = {"flavor": "seurat_v3", "user_key": 42}
+    scf.pp.highly_variable_genes(
+        ad, n_top_genes=15, balance_method="none", flavor="seurat_v3", diagnose=False
+    )
+    assert ad.uns["hvg"]["user_key"] == 42
+    # flavor reflects the method that actually ran
+    assert ad.uns["hvg"]["flavor"] == ad.uns[UNS_KEY]["hvg"]["flavor_used"]
+
+
+def test_near_identity_k_warns(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    # Select ≥80% of genes → near-identity warning
+    k = max(10, int(0.85 * ad.n_vars))
+    with pytest.warns(UserWarning, match="nearly identity|80%|% of the matrix"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=k, balance_method="none", diagnose=False)
+
+
+def test_structure_auto_n_records_k_source(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes="auto",
+        n_top_min=20,
+        n_top_max=60,
+        balance_method="none",
+        diagnose=False,
+        random_state=0,
+    )
+    auto = ad.uns[UNS_KEY]["hvg"]["auto_n"]
+    assert auto is not None
+    assert auto.get("strategy") == "structure" or "structure" in str(auto.get("strategy"))
+    # k_source must be present when structure path ran (not buried only in nested dict)
+    if auto.get("strategy") == "structure":
+        assert auto.get("k_source") is not None
+        assert "depth" not in auto  # dead None placeholders removed
+        assert "ensemble" not in auto
+
+
+def test_starved_topup_skips_when_few_units():
+    """n_units<3 is skipped_structure_too_coarse, not checked_no_starved."""
+    import numpy as np
+    import pandas as pd
+
+    from scfair.pp._highly_variable_genes import _starved_topup_allocate
+
+    sel = [f"g{i}" for i in range(30)]
+    score = pd.Series(np.linspace(1.0, 0.0, 30), index=sel)
+    ranks = {"0": sel[:15], "1": sel[10:]}
+    with pytest.warns(UserWarning, match="skipped"):
+        out, diag = _starved_topup_allocate(sel, ranks, score, 30)
+    assert out == sel
+    assert diag["allocation_status"] == "skipped_structure_too_coarse"
+    assert diag["n_units"] == 2
+    assert diag["n_starved"] == 0
+
+
+def test_allocation_method_not_duplicated_on_clustering(adata_for_hvg):
+    """allocation_method lives only on top-level hvg meta (request)."""
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=30,
+        balance_method="hybrid",
+        allocation_method="starved_topup",
+        min_cluster_size=20,
+        resolution=0.5,
+        diagnose=True,
+        random_state=0,
+    )
+    h = ad.uns[UNS_KEY]["hvg"]
+    assert h["allocation_method"] == "starved_topup"
+    cl = h.get("clustering") or {}
+    assert "allocation_method" not in cl
+
+
+def test_all_zero_counts_layer_raises_clear_error(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    ad.layers["counts"] = np.zeros_like(ad.X)
+    # Explicit layer= pins the zero matrix. (Default layer=None would detect
+    # fingerprint mismatch vs integer .X and refresh counts — G2.)
+    with pytest.raises(ValueError, match="all zeros|degenerate|empty"):
+        scf.pp.highly_variable_genes(
+            ad, n_top_genes=10, balance_method="none", layer="counts", diagnose=False
+        )
+
+
+def test_stale_zero_counts_refreshed_from_integer_X(adata_for_hvg):
+    """Zero decoy in layers['counts'] must not stick when .X is real counts."""
+    ad = adata_for_hvg.copy()
+    ad.layers["counts"] = np.zeros_like(ad.X)
+    with pytest.warns(UserWarning, match="differs from the current integer-like"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="none", diagnose=False)
+    assert int(ad.var["highly_variable"].sum()) == 10
+
+
+def test_failed_call_rolls_back_partial_var_mask(adata_for_hvg):
+    """A raised error must not leave a misleading highly_variable mask."""
+    ad = adata_for_hvg.copy()
+    assert "highly_variable" not in ad.var.columns
+    with pytest.raises(ValueError, match="cluster_genes"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=15,
+            balance_method="hybrid",
+            cluster_genes=["not_a_real_gene_xyz"],
+            diagnose=False,
+        )
+    assert "highly_variable" not in ad.var.columns
+    assert ad.uns.get("scfair", {}).get("hvg_failed", {}).get("failed") is True
+
+
+def test_options_dict_raises_typeerror(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(TypeError, match="HVGOptions"):
+        scf.pp.highly_variable_genes(
+            ad, n_top_genes=20, options={"cluster_pool": 40}, diagnose=False
+        )
+
+
+def test_options_conflicts_with_legacy_kwarg(adata_for_hvg):
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    with pytest.raises(ValueError, match="Conflicting research knobs"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=20,
+            cluster_pool=40,
+            options=HVGOptions(cluster_pool=70),
+            diagnose=False,
+        )
+
+
+def test_n_top_max_below_default_min_raises(adata_for_hvg):
+    """Lowering only n_top_max below default min=500 is a hard error."""
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    with pytest.raises(ValueError, match="n_top_min=.*> n_top_max"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes="auto",
+            options=HVGOptions(n_top_max=30, n_top_min=500, auto_n_method="elbow"),
+            balance_method="none",
+            diagnose=False,
+        )
+
+
+def test_n_top_bounds_consistent_works(adata_for_hvg):
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes="auto",
+        options=HVGOptions(n_top_min=10, n_top_max=30, auto_n_method="elbow"),
+        balance_method="none",
+        diagnose=False,
+    )
+    n = int(ad.uns[UNS_KEY]["hvg"]["n_top_genes_used"])
+    assert 1 <= n <= 30
+
+
+def test_strict_must_be_bool(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(TypeError, match="strict must be bool"):
+        scf.pp.highly_variable_genes(
+            ad, n_top_genes=10, balance_method="none", strict="yes", diagnose=False
+        )
+
+
+def test_options_recorded_in_uns(adata_for_hvg):
+    """All resolved HVGOptions fields land in uns for reproducibility."""
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    ad.obs["batch"] = ["a"] * (ad.n_obs // 2) + ["b"] * (ad.n_obs - ad.n_obs // 2)
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=15,
+        balance_method="none",
+        flavor="seurat",
+        diagnose=False,
+        options=HVGOptions(batch_key="batch", n_bins=40, min_mean=0.05),
+    )
+    h = ad.uns[UNS_KEY]["hvg"]
+    assert h["batch_key"] == "batch"
+    assert "options" in h
+    assert h["options"]["batch_key"] == "batch"
+    assert h["options"]["n_bins"] == 40
+    assert h["options"]["min_mean"] == 0.05
+    assert h["options"]["n_top_min"] == 500
+    assert h["n_top_min"] == 500
+    assert h["n_top_max"] == 5000
+
+
+def test_hvg_base_plus_append_helper():
+    from scfair.pp._highly_variable_genes import _hvg_base_plus_append
+
+    scores = pd.Series(
+        {f"g{i}": float(100 - i) for i in range(20)},
+        dtype=float,
+    )
+    sel, meta = _hvg_base_plus_append(scores, n_base=5, n_append=3)
+    assert sel == ["g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7"]
+    assert meta["n_base"] == 5
+    assert meta["n_append_used"] == 3
+    assert meta["n_final"] == 8
+    assert meta["append_source"] == "secondary_global_hvg"
+
+    sel0, meta0 = _hvg_base_plus_append(scores, n_base=5, n_append=0)
+    assert sel0 == ["g0", "g1", "g2", "g3", "g4"]
+    assert meta0["n_append_used"] == 0
+
+    # Cap at available genes
+    sel_all, meta_all = _hvg_base_plus_append(scores, n_base=18, n_append=10)
+    assert len(sel_all) == 20
+    assert meta_all["n_append_used"] == 2
+
+
+def test_append_default_freezes_base_and_extends(adata_for_hvg):
+    """Default append: top-k global base is frozen; +m secondary; no clusters."""
+    from scfair.pp import HVGOptions
+
+    ad_none = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(ad_none, n_top_genes=20, balance_method="none", diagnose=False)
+    base_genes = list(ad_none.var_names[ad_none.var["highly_variable"]])
+    assert len(base_genes) == 20
+
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=20,
+        balance_method="append",
+        options=HVGOptions(append_budget=5),
+        diagnose=False,
+    )
+    selected = list(ad.var_names[ad.var["highly_variable"]])
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["balance_method"] == "append"
+    assert meta["selection"] == "hvg_base_plus_secondary_append"
+    assert meta["append_budget"] == 5
+    assert meta["append"]["n_base"] == 20
+    assert meta["append"]["n_append_used"] == 5
+    assert meta["n_highly_variable_final"] == 25
+    assert len(selected) == 25
+    # Frozen base: global top-20 must all be present (order may differ by rank ties)
+    assert set(base_genes).issubset(set(selected))
+    # No intermediate clustering
+    assert "scfair_hvg_clusters" not in ad.obs
+    assert meta["n_clusters_used"] == 0
+    assert meta["resolution"] is None
+
+
+def test_append_is_package_default(adata_for_hvg):
+    """Bare call (no balance_method) uses append with default budget 200."""
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    # Fixture has 80 genes; override budget so we don't fill the matrix.
+    scf.pp.highly_variable_genes(
+        ad, n_top_genes=20, options=HVGOptions(append_budget=8), diagnose=False
+    )
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["balance_method"] == "append"
+    assert meta["append_budget"] == 8
+    assert int(ad.var["highly_variable"].sum()) == 28
+    assert meta["append"]["n_base"] == 20
+    assert meta["append"]["n_append_used"] == 8
+    # Signature default remains append (options only overrides budget).
+    import inspect
+
+    assert (
+        inspect.signature(scf.pp.highly_variable_genes).parameters["balance_method"].default
+        == "append"
+    )
+
+
+def test_append_budget_zero_matches_none(adata_for_hvg):
+    from scfair.pp import HVGOptions
+
+    ad_a = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(ad_a, n_top_genes=25, balance_method="none", diagnose=False)
+    ad_b = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad_b,
+        n_top_genes=25,
+        balance_method="append",
+        options=HVGOptions(append_budget=0),
+        diagnose=False,
+    )
+    assert set(ad_a.var_names[ad_a.var["highly_variable"]]) == set(
+        ad_b.var_names[ad_b.var["highly_variable"]]
+    )
+    assert int(ad_b.var["highly_variable"].sum()) == 25
+
+
+def test_hybrid_rerank_alias_still_clusters(adata_for_hvg):
+    """Legacy hybrid path still runs intermediate clustering."""
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=30,
+        balance_method="hybrid_rerank",
+        min_cluster_size=20,
+        diagnose=False,
+        random_state=0,
+    )
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["balance_method"] == "hybrid"
+    assert "scfair_hvg_clusters" in ad.obs
+    assert int(ad.var["highly_variable"].sum()) == 30
+
+
+def test_append_does_not_flag_insufficient_clusters(adata_for_hvg):
+    """Diagnosis must not claim degenerate populations for the no-cluster path."""
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=20,
+        balance_method="append",
+        options=HVGOptions(append_budget=5),
+        diagnose=True,
+    )
+    diag = ad.uns[UNS_KEY]["hvg"]["diagnosis"]
+    assert "insufficient_clusters" not in (diag.get("flags") or [])
+    assert not any("Fewer than 2 populations" in t for t in (diag.get("tips") or []))
+
+
+def test_tiny_n_vars_seurat_v3_does_not_segfault():
+    """n_vars ≤ loess min must not C-segfault; fall back to seurat (strict=False)."""
+    import anndata as anndata_mod
+
+    rng = np.random.default_rng(0)
+    X = rng.poisson(1.0, size=(300, 3)).astype(np.float32)
+    ad = anndata_mod.AnnData(X=X)
+    ad.obs_names = [f"c{i}" for i in range(300)]
+    ad.var_names = [f"g{i}" for i in range(3)]
+    # Must complete without process death. Fallback → seurat; may select all 3.
+    with pytest.warns(UserWarning, match="loess|n_vars|seurat"):
+        scf.pp.highly_variable_genes(
+            ad, n_top_genes=1, balance_method="none", flavor="seurat_v3", diagnose=False
+        )
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["flavor_used"] == "seurat"
+    assert "n_vars_too_small_for_loess" in str(meta.get("fallback_reason") or "")
+
+
+def test_tiny_n_vars_strict_raises():
+    import anndata as anndata_mod
+
+    rng = np.random.default_rng(1)
+    X = rng.poisson(1.0, size=(100, 3)).astype(np.float32)
+    ad = anndata_mod.AnnData(X=X)
+    ad.obs_names = [f"c{i}" for i in range(100)]
+    ad.var_names = [f"g{i}" for i in range(3)]
+    with pytest.raises(ValueError, match="loess|n_vars|strict"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=1,
+            balance_method="none",
+            flavor="seurat_v3",
+            strict=True,
+            diagnose=False,
+        )
+
+
+def test_append_budget_capped_to_n_top(adata_for_hvg):
+    """Absolute append_budget must not exceed n_top (panel blow-up guard)."""
+    from scfair.pp import HVGOptions
+
+    ad = adata_for_hvg.copy()  # 80 genes
+    with pytest.warns(UserWarning, match="append_budget"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=20,
+            balance_method="append",
+            options=HVGOptions(append_budget=200),
+            diagnose=False,
+        )
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["append_budget"] == 20  # capped to n_top
+    assert meta["append_budget_requested"] == 200
+    assert meta["append_budget_capped"] is True
+    assert int(ad.var["highly_variable"].sum()) == 40  # 20+20
+
+
+def test_non_integer_counts_warns_and_records(adata_for_hvg):
+    """log1p-normalized .X snapshotted as counts must warn + record in uns."""
+    ad = adata_for_hvg.copy()
+    sc.pp.normalize_total(ad, target_sum=1e4)
+    sc.pp.log1p(ad)
+    with pytest.warns(UserWarning, match="integer counts|raw integer"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=15, balance_method="none", diagnose=False)
+    meta = ad.uns[UNS_KEY]["hvg"]
+    assert meta["counts_integer_like"] is False
+    assert meta["counts_warning"] == "non_integer_counts"

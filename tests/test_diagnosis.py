@@ -15,6 +15,7 @@ from scfair.pp._diagnosis import (
     cluster_size_metrics,
     diagnose_from_labels,
     diagnose_hvg_run,
+    recommend_cluster_resolution,
 )
 
 
@@ -313,3 +314,172 @@ def test_no_gain_regime_does_not_get_the_tuning_advice(adata_for_hvg):
     scf.pp.highly_variable_genes(a, n_top_genes=40, balance_method="none")
     tips = a.uns[UNS_KEY]["hvg"]["diagnosis"]["tips"]
     assert not any("Sweep it" in t for t in tips)
+
+
+def test_structure_auto_tips_short_k_mentions_fixed_2000():
+    from scfair.pp._diagnosis import _structure_auto_tips
+
+    tips, flags = _structure_auto_tips(
+        k=500,
+        structure_meta={
+            "rule_branch": "short_hard_vm0.70_nd12",
+            "k_source": "unanimous_seed_vote",
+            "rule_explain": {
+                "rule_branch": "short_hard_vm0.70_nd12",
+                "n_density_pops": 14,
+                "n_leiden": 19,
+                "ratio": 1.36,
+                "valley_median": 0.71,
+                "v7_band_miss": ["vm_ok", "ratio_ok"],
+            },
+        },
+    )
+    assert "structure_short_k" in flags
+    assert "structure_v7_band_miss" in flags
+    blob = " ".join(tips).lower()
+    assert "n_top=500" in blob or "n_top=500" in " ".join(tips)
+    assert "n_top_genes=2000" in " ".join(tips)
+    assert "v7" in blob
+
+
+def test_structure_auto_tips_v7_band_floor():
+    from scfair.pp._diagnosis import _structure_auto_tips
+
+    tips, flags = _structure_auto_tips(
+        k=2000,
+        structure_meta={
+            "rule_branch": "v7_fine_atlas_band",
+            "rule_explain": {
+                "rule_branch": "v7_fine_atlas_band",
+                "n_density_pops": 17,
+                "n_leiden": 16,
+                "ratio": 0.94,
+                "valley_median": 0.80,
+                "v7_band_eligible": True,
+            },
+        },
+    )
+    assert "structure_v7_band_floor" in flags
+    assert "downstream_fine_resolution" in flags
+    assert any("fine-atlas" in t.lower() or "v7" in t.lower() for t in tips)
+    assert any("1.5" in t for t in tips)
+
+
+def test_resolve_hvg_mode_auto():
+    from scfair.pp._diagnosis import resolve_hvg_mode
+
+    assert resolve_hvg_mode(mode="auto", n_types=31)["mode"] == "fine"
+    assert resolve_hvg_mode(mode="auto", n_types=31)["cluster_resolution"] == 1.5
+    assert resolve_hvg_mode(mode="auto", n_types=31)["allow_short_soft_buffer"] is False
+    assert resolve_hvg_mode(mode="auto", n_types=8)["mode"] == "balanced"
+    assert (
+        resolve_hvg_mode(mode="auto", rule_branch="short_hard_vm0.80_nd6+k_buffer:500→1000")["mode"]
+        == "compact"
+    )
+    # High density-pop count alone must NOT force fine (would re-floor 1000→2000).
+    assert (
+        resolve_hvg_mode(
+            mode="auto",
+            n_density_pops=17,
+            rule_branch="short_hard_vm0.70_nd12+k_buffer:500→1000",
+        )["mode"]
+        == "compact"
+    )
+    assert (
+        resolve_hvg_mode(mode="auto", n_density_pops=17, n_obs=20_000)["mode"] != "fine"
+        or resolve_hvg_mode(mode="auto", n_density_pops=17, n_obs=20_000)["mode"] == "balanced"
+    )
+    # bare nd without short → balanced, not fine
+    assert resolve_hvg_mode(mode="auto", n_density_pops=17)["mode"] == "balanced"
+    assert resolve_hvg_mode(mode="fine")["mode"] == "fine"
+
+
+def test_recommend_cluster_resolution_tiers():
+    from scfair.pp._diagnosis import resolve_cluster_resolution
+
+    coarse = recommend_cluster_resolution(n_types=8)
+    assert coarse["tier"] == "coarse"
+    assert coarse["resolution"] == 0.8
+
+    fine = recommend_cluster_resolution(n_types=31)
+    assert fine["tier"] == "fine"
+    assert fine["resolution"] == 1.5
+    assert 1.5 in fine["resolution_sweep"]
+
+    fine_st = recommend_cluster_resolution(rule_branch="v7_fine_atlas_band")
+    assert fine_st["tier"] == "fine"
+
+    fine_nd = recommend_cluster_resolution(n_density_pops=18)
+    assert fine_nd["tier"] == "fine"
+
+    # auto switch
+    r = resolve_cluster_resolution(resolution="auto", n_types=31)
+    assert r["auto"] is True and r["resolution"] == 1.5 and r["tier"] == "fine"
+    r2 = resolve_cluster_resolution(resolution="auto", n_types=8)
+    assert r2["resolution"] == 0.8 and r2["tier"] == "coarse"
+    r3 = resolve_cluster_resolution(resolution=2.0)
+    assert r3["tier"] == "manual" and r3["resolution"] == 2.0 and r3["auto"] is False
+
+
+def test_diagnose_from_labels_fine_downstream():
+    # 20 equal types → fine tier tip
+    labels = [f"t{i}" for i in range(20) for _ in range(10)]
+    d = diagnose_from_labels(labels)
+    assert d["downstream_clustering"]["tier"] == "fine"
+    assert d["downstream_clustering"]["resolution"] == 1.5
+    assert any("1.5" in t for t in d["tips"])
+
+
+def test_diagnose_hvg_run_structure_meta_short():
+    diag = diagnose_hvg_run(
+        balance_method="hybrid",
+        n_top_genes_used=500,
+        n_top_is_auto=True,
+        auto_n_strategy="structure",
+        structure_meta={
+            "rule_branch": "short_hard_vm0.80_nd6",
+            "features": {"n_density_pops": 8, "n_leiden": 10, "valley_median": 0.85},
+            "rule_explain": {
+                "rule_branch": "short_hard_vm0.80_nd6",
+                "n_density_pops": 8,
+                "n_leiden": 10,
+                "ratio": 1.25,
+                "valley_median": 0.85,
+                "v7_band_miss": ["nd_in_band", "ratio_ok"],
+            },
+        },
+        log=False,
+    )
+    assert "structure_short_k" in diag["flags"]
+    assert any("2000" in t for t in diag["tips"])
+
+
+def test_diagnosis_coarse_partition_and_fallback_not_keep_current():
+    """Collapsed intermediate partition must not recommend keep_current."""
+    from scfair.pp._diagnosis import diagnose_hvg_run
+
+    diag = diagnose_hvg_run(
+        balance_method="hybrid",
+        n_top_genes_used=200,
+        clustering={
+            "n_clusters_total": 2,
+            "n_clusters_kept": 2,
+            "cluster_sizes": {"0": 1000, "1": 1000},
+            "clusters_dropped": [],
+            "resolution": 0.5,
+            "resolution_source": "fallback",
+            "granularity": {"reason": "no_embedding"},
+            "min_cluster_frac": 0.5,
+            "starved_topup_allocation_status": "skipped_structure_too_coarse",
+            "starved_topup_n_units": 2,
+        },
+        n_clusters_used=2,
+        log=False,
+    )
+    assert "coarse_partition" in diag["flags"]
+    assert "resolution_fallback" in diag["flags"]
+    assert "allocation_skipped_coarse" in diag["flags"]
+    assert diag["recommendation"] == "raise_resolution"
+    assert diag["benefit_evidence"] == "structure_unreliable"
+    assert diag["imbalance_source"] == "intermediate_clusters_unreliable"
+    assert any("collapsed" in t or "fallback" in t.lower() or "only 2" in t for t in diag["tips"])

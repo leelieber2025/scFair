@@ -3,9 +3,9 @@
 Public usage::
 
     import scfair as scf
-    scf.pp.highly_variable_genes(adata)  # default: auto n_top via structure v7
-    # classical fixed size:
-    # scf.pp.highly_variable_genes(adata, n_top_genes=2000)
+    scf.pp.highly_variable_genes(adata)  # default: n_top_genes=2000 + append
+    # structure-aware k (opt-in; multi-seed, slower):
+    # scf.pp.highly_variable_genes(adata, n_top_genes="auto")
     # optional pre-call planning from known labels:
     scf.pp.diagnose_from_labels(adata.obs["cell_type"])
     # optional, label-free: how many populations the data supports

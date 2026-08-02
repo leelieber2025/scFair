@@ -2,9 +2,14 @@
 
 Public entry point: :func:`highly_variable_genes`.
 
-Two balanced strategies (plus global-only):
+Product default and balanced strategies:
 
-**hybrid** (default) — keep most of the global HVG ranking, swap in specificity
+**append** (default) — freeze global HVG top-``k``, then append the next ``m``
+  genes from the **same** global ranking (ranks ``k+1 … k+m``). No intermediate
+  clustering and no zero-sum re-rank inside a 2× pool. Final size is
+  ``k + append_budget`` (capped at ``n_vars``).
+
+**hybrid** (opt-in) — keep most of the global HVG ranking, swap in specificity
   1. Global HVG (``flavor``) → Leiden clusters.
   2. Cluster-vs-rest specificity scores (same as ``score``).
   3. Re-rank the top ``2 × n_top`` **global** candidates by
@@ -38,9 +43,11 @@ import scipy.sparse as sparse
 
 from .._utils import UNS_KEY, _is_integer_counts_like
 from ._auto_n import resolve_n_top_genes
-from ._diagnosis import check_config, diagnose_hvg_run
+from ._diagnosis import check_config, diagnose_hvg_run, resolve_hvg_mode
 from ._granularity import DEFAULT_RESOLUTION_FALLBACK, resolution_from_density_field
+from ._options import HVG_OPTION_FIELD_NAMES, HVGOptions, resolve_hvg_options
 from ._raw_counts import (
+    INTERNAL_COUNTS_LAYER,
     _prepare_counts_layer,
     _restore_raw_counts,
     _store_raw_counts,
@@ -56,7 +63,13 @@ _ALL_FLAVORS = _COUNTS_FLAVORS | _LOG_FLAVORS
 _BALANCE_ALIASES = {
     None: "none",
     "none": "none",
+    # Product default: freeze global top-k, append next m from the same ranking
+    # (no intermediate clustering / no pool re-rank).
+    "append": "append",
+    # Legacy in-pool re-rank (2×k hybrid blend); opt-in research path.
     "hybrid": "hybrid",
+    "hybrid_rerank": "hybrid",
+    "rerank": "hybrid",
     "score": "score",
     "weighted_score": "score",
     "size_power": "score",
@@ -66,7 +79,10 @@ _BALANCE_ALIASES = {
 }
 
 BalanceMethod = Literal[
+    "append",
     "hybrid",
+    "hybrid_rerank",
+    "rerank",
     "score",
     "weighted_score",
     "size_power",
@@ -76,23 +92,37 @@ BalanceMethod = Literal[
     "none",
 ]
 
-# Post-hybrid gene reallocation.
-# - "none": hybrid ranking as-is (product default)
+# Post-hybrid gene reallocation (product default is "none").
 # - "coverage": legitimate units + own-marker coverage floor (experimental)
 # - "starved_topup": legitimate units + equal-share starvation top-up
-# - "cap": equal-share ceiling + backfill — **deprecated**, research only
-_ALLOCATION_METHODS = frozenset({"cap", "coverage", "none", "starved_topup"})
+# "cap" was removed in 0.2.0.
+_ALLOCATION_METHODS = frozenset({"coverage", "none", "starved_topup"})
 _ALLOCATION_ALIASES = {
     "starved": "starved_topup",
     "topup": "starved_topup",
     "starved_top_up": "starved_topup",
 }
 
+# Recoverable failures for HVG / graph / scoring paths (intentionally broad
+# but not bare Exception — excludes KeyboardInterrupt / SystemExit).
+_RECOVERABLE_ERRORS: tuple[type[BaseException], ...] = (
+    ImportError,
+    ModuleNotFoundError,
+    ValueError,
+    TypeError,
+    RuntimeError,
+    ArithmeticError,
+    MemoryError,
+    FloatingPointError,
+    np.linalg.LinAlgError,
+)
+
 
 # Stage announcements. The balanced methods run PCA + neighbours + Leiden
-# internally, so a default call on a mid-size dataset blocks for tens of seconds
-# (and `n_top_genes="auto"` does that twice). Messages are emitted *before* each
-# slow stage, not after, so a waiting user can tell the call is alive.
+# internally, so a default hybrid@2000 call on a mid-size dataset blocks for
+# tens of seconds (`n_top_genes="auto"` structure path does ~4 PCA/neighbours
+# builds: 3 seeds + hybrid). Messages are emitted *before* each slow stage,
+# not after, so a waiting user can tell the call is alive.
 def _progress(on: bool, msg: str, *args: Any) -> None:
     text = msg % args if args else msg
     logger.info(text)
@@ -119,55 +149,154 @@ _AUTO_STRATEGIES = frozenset(
 )
 
 _MITO_RE = re.compile(r"^(MT-|MT\.|mt-|mt\.)")
-_RIBO_RE = re.compile(r"^(RPL|RPS|Rpl|Rps)")
+# Ribosomal structural proteins only. Do not match RPS6KA*/RPS6KB* kinases
+# (MAPK / mTOR pathway members that share the RPS6 prefix).
+# Matches RPL13, RPLP0, RPS6, RPSA, Rpl19 — not RPS6KA1 / RPS6KB1.
+_RIBO_RE = re.compile(r"^(?:RPL|Rpl)P?\d+[A-Za-z]?$|^(?:RPS|Rps)(?:A|\d+[A-Za-z]?)$")
+
+
+# Columns scanpy / scFair may write during a partial HVG run.
+_HVG_PARTIAL_VAR_COLS = (
+    "highly_variable",
+    "highly_variable_rank",
+    "means",
+    "variances",
+    "variances_norm",
+    "dispersions",
+    "dispersions_norm",
+    "residual_variances",
+    "highly_variable_nbatches",
+    "highly_variable_intersection",
+    "scfair_score",
+)
+
+# Flavor → primary score column(s) written by scanpy (preferred first).
+# Used so a re-run with a different flavor cannot silently reuse a leftover
+# column from a previous call (G3 state pollution).
+_FLAVOR_SCORE_COLS: dict[str, tuple[str, ...]] = {
+    "seurat_v3": ("variances_norm", "variances"),
+    "seurat_v3_paper": ("variances_norm", "variances"),
+    "pearson_residuals": ("residual_variances",),
+    "seurat": ("dispersions_norm", "dispersions"),
+    "cell_ranger": ("dispersions_norm", "dispersions"),
+}
+
+# Scanpy HVG columns cleared before each flavor run so leftovers cannot win
+# a priority walk in _variability_raw_scores.
+_SCANPY_HVG_VAR_COLS = (
+    "highly_variable",
+    "highly_variable_rank",
+    "means",
+    "variances",
+    "variances_norm",
+    "dispersions",
+    "dispersions_norm",
+    "residual_variances",
+    "highly_variable_nbatches",
+    "highly_variable_intersection",
+)
+
+
+def _snapshot_adata_for_rollback(adata: Any) -> dict[str, Any]:
+    """Capture caller-visible state that a failed HVG call may leave dirty."""
+    var_had = {c: adata.var[c].copy() for c in _HVG_PARTIAL_VAR_COLS if c in adata.var.columns}
+    return {
+        "var_had": var_had,
+        "var_cols": set(adata.var.columns),
+        "had_clusters": "scfair_hvg_clusters" in adata.obs.columns,
+        "clusters": (
+            adata.obs["scfair_hvg_clusters"].copy()
+            if "scfair_hvg_clusters" in adata.obs.columns
+            else None
+        ),
+        "had_scfair_log": "_scfair_log" in getattr(adata, "layers", {}),
+        "had_scfair_counts": INTERNAL_COUNTS_LAYER in getattr(adata, "layers", {}),
+        "uns_scfair": (
+            {k: v for k, v in adata.uns["scfair"].items()}
+            if isinstance(adata.uns.get("scfair"), dict)
+            else None
+        ),
+        "had_uns_hvg": "hvg" in adata.uns,
+        "uns_hvg": dict(adata.uns["hvg"]) if isinstance(adata.uns.get("hvg"), dict) else None,
+    }
+
+
+def _rollback_adata_after_failure(adata: Any, snap: dict[str, Any], exc: BaseException) -> None:
+    """Undo partial HVG annotations so a failed call does not leave a false mask."""
+    # var columns: restore prior values or drop ones we introduced
+    for c in _HVG_PARTIAL_VAR_COLS:
+        if c in snap["var_had"]:
+            adata.var[c] = snap["var_had"][c]
+        elif c in adata.var.columns and c not in snap["var_cols"]:
+            del adata.var[c]
+    # intermediate cluster labels
+    if not snap["had_clusters"] and "scfair_hvg_clusters" in adata.obs.columns:
+        del adata.obs["scfair_hvg_clusters"]
+    elif snap["clusters"] is not None:
+        adata.obs["scfair_hvg_clusters"] = snap["clusters"]
+    # internal log / counts layers
+    if not snap["had_scfair_log"]:
+        try:
+            adata.layers.pop("_scfair_log", None)
+        except Exception:
+            pass
+    if not snap.get("had_scfair_counts"):
+        try:
+            adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
+        except Exception:
+            pass
+    # scfair uns: restore prior dict keys for hvg; always record failure
+    prev = snap["uns_scfair"]
+    if prev is None:
+        if "scfair" in adata.uns and isinstance(adata.uns["scfair"], dict):
+            # keep raw_snapshot if prepare wrote it; drop incomplete hvg
+            store = adata.uns["scfair"]
+            store.pop("hvg", None)
+        else:
+            adata.uns.setdefault("scfair", {})
+    else:
+        # restore shallow copy of prior scfair, then mark failure
+        store = dict(prev)
+        adata.uns["scfair"] = store
+    fail_rec = {
+        "failed": True,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    adata.uns.setdefault("scfair", {})
+    adata.uns["scfair"]["hvg_failed"] = fail_rec
+    # scanpy uns["hvg"]: restore if we had one
+    if snap["uns_hvg"] is not None:
+        adata.uns["hvg"] = dict(snap["uns_hvg"])
+    elif not snap["had_uns_hvg"] and "hvg" in adata.uns:
+        # only drop if we created a stub; if scanpy wrote mid-run, leave
+        # a note rather than guessing — prefer restore-from-snap path above
+        pass
 
 
 def highly_variable_genes(
     adata: Any,
     *,
-    n_top_genes: int | str = "auto",
-    n_top_min: int = 500,
-    n_top_max: int = 5000,
-    auto_n_method: str = "structure",
+    # --- product surface (keep short) ---
+    n_top_genes: int | str = 2000,
     flavor: str = "seurat_v3",
     layer: str | None = None,
     resolution: float | str = "auto",
     min_cluster_size: int = 30,
-    marker_genes: Sequence[str] | None = None,
-    marker_mode: str = "force",
-    marker_extra: bool = True,
-    balance_method: str | None = "hybrid",
-    balance_power: float | None = None,
+    balance_method: str | None = "append",
+    mode: str = "auto",
     blend_global: float = 0.95,
-    neighbor_contrast: float = 0.0,
-    combine: str = "blend",
-    cluster_pool: int | None = None,
-    cluster_genes: Sequence[str] | None = None,
-    consensus_resolutions: Sequence[float] | None = None,
-    allocation_method: str | None = None,
-    cap_allocation: bool = False,
-    cap_ceiling: float = 1.0,
-    cap_merge_threshold: float | None = 0.5,
-    spec_on_legitimate_units: bool = False,
-    scale_clustering: bool = False,
-    logfc_space: str = "log1p",
-    progress: bool | None = None,
-    global_score: pd.Series | None = None,
-    n_pcs: int = 30,
-    n_neighbors: int = 15,
-    span: float = 0.3,
-    n_bins: int = 20,
-    min_mean: float = 0.0125,
-    max_mean: float = 3,
-    min_disp: float = 0.5,
-    max_disp: float = np.inf,
-    batch_key: str | None = None,
-    filter_mito: bool = False,
-    filter_ribo: bool = False,
+    marker_genes: Sequence[str] | None = None,
+    marker_mode: str | None = None,
+    diagnose: bool = True,
+    strict: bool = False,
     random_state: int = 0,
     inplace: bool = True,
     subset: bool = False,
-    diagnose: bool = True,
+    progress: bool | None = None,
+    # --- experimental / secondary ---
+    options: HVGOptions | None = None,
+    **legacy_kwargs: Any,
 ) -> pd.DataFrame | None:
     """Select highly variable genes with optional fair / balanced strategies.
 
@@ -191,10 +320,11 @@ def highly_variable_genes(
     n_top_genes
         Number of HVGs to select, or an automatic strategy:
 
-        - int: fixed count (``2000`` remains the classical community size)
-        - ``"auto"`` (**default**): uses ``auto_n_method`` (default
-          **structure v7**) to pick k, then hybrid re-selects in global
-          top-``2×k`` after k is chosen
+        - int: fixed count (**default ``2000``** — classical community size)
+        - ``"auto"``: uses ``auto_n_method`` (default **structure v7**) to
+          pick k, then hybrid re-selects in global top-``2×k``. Costs ~4×
+          PCA→neighbours (3 structure seeds + 1 hybrid pass); prefer fixed
+          ``2000`` for papers / reproducible protocols.
         - ``"structure"``: density-valley rule **v7** directly
           (``select_n_top_from_structure``) — short/mid/long by valley
           geometry + fine-atlas band guard
@@ -205,16 +335,12 @@ def highly_variable_genes(
 
         Automatic selection ranks a pool of size ``n_top_max`` then cuts
         to chosen k; markers with ``marker_extra=True`` are still appended
-        outside this count.
-
-        **Why default auto/structure (not fixed 2000).** Fixed 2000 is a
-        strong baseline, but structure-aware k adapts to dataset shape —
-        shortening compact multi-core sets and lengthening datasets with
-        genuine long-tail residual structure. Pass an explicit int anytime
-        for reproducibility or paper protocols. ``k>=3000`` still logs a
-        warning under hybrid, since it is an unusually large pick.
+        outside this count. A resolved k ≥ 80% of ``n_vars`` emits a warning
+        (near-identity HVG selection).
     n_top_min, n_top_max
-        Bounds for automatic ``n_top_genes`` (default 500–5000).
+        Bounds for automatic ``n_top_genes`` (default 500–5000). Both ends
+        are respected by structure and ensemble paths (structure ``k_max``
+        matches this ceiling).
     auto_n_method
         When ``n_top_genes='auto'``, which strategy to use (default
         ``"structure"``). Use ``"ensemble"`` for the previous depth-aware
@@ -231,19 +357,17 @@ def highly_variable_genes(
         ``min_cluster_size`` are excluded from weight / specificity mass
         (their cells still keep neutral weight in ``reweight``).
 
-        The intermediate clustering runs ``normalize_total -> log1p -> PCA ->
-        neighbours -> Leiden`` and deliberately **omits** ``sc.pp.scale``, unlike a
-        typical scanpy workflow. Without zero-centring, PCA variance is dominated
-        by highly expressed genes, so the intermediate populations — and therefore
-        every cluster-vs-rest specificity score built on them — lean toward
-        structure defined by abundant genes. This is a known bias, not a
-        deliberate improvement; it is recorded here so it is not mistaken for an
-        oversight.
+        The intermediate clustering runs
+        ``normalize_total -> log1p -> scale(max_value=10) -> PCA -> neighbours ->
+        Leiden`` by default (``scale_clustering=True``). Zero-centring prevents
+        highly expressed genes from dominating intermediate PCA and collapsing
+        multi-type structure (measured ARI gains of ~0.3 on imbalanced synthetic
+        atlases). Pass ``options=HVGOptions(scale_clustering=False)`` to restore
+        the pre-0.2 unscaled path.
 
-        ``resolution`` defaults to **0.5** (changed from 1.0). Broader
-        intermediate clusters give steadier specificity estimates and reduce
-        seed-dependent collapse of rare populations, at the cost of a little
-        size-weighted ARI. Pass ``resolution=1.0`` for the old behaviour.
+        ``resolution`` defaults to **``"auto"``** (density-field target cluster
+        count for intermediate Leiden). Pass a float (e.g. ``0.5`` or ``1.0``)
+        for a fixed Leiden resolution.
     marker_genes
         Optional gene symbols used as prior knowledge (must match ``var_names``).
         ``None`` by default, and scFair ships **no** built-in marker lists — see
@@ -266,11 +390,18 @@ def highly_variable_genes(
            anyway: a panel that must appear in the output for downstream reasons,
            independent of clustering quality.
     marker_mode
-        How to use ``marker_genes``:
+        How to use ``marker_genes``. Default **``None``** resolves to
+        ``"force"`` when ``marker_genes`` is non-empty, else ``"none"``
+        (so the bare default is not "force" with no markers):
 
-        - ``"force"`` (default when markers are given): always include present
-          markers in the final set
+        - ``"force"``: always include present markers in the final set
         - ``"none"``: ignore ``marker_genes``
+    strict
+        If True, do **not** silently fall back when ``flavor="seurat_v3"``
+        fails or structure auto_n raises — re-raise instead. Default False
+        keeps research-friendly recovery but always emits
+        :func:`warnings.warn` and records ``flavor_used`` /
+        ``fallback_reason`` in ``uns``.
 
         A third mode, ``"boost"`` (add a score bonus instead of hard-including),
         was **removed before the first release**. It added the bonus to a score
@@ -287,21 +418,32 @@ def highly_variable_genes(
         Note that this bounds only the *displacement* cost, not the subspace cost
         described under ``marker_genes``.
     balance_method
-        - ``"hybrid"`` (**default**): take the global top ``2 x n_top`` as a
-          candidate pool, re-rank the **whole pool** by
-          ``blend_global * norm(global) + (1 - blend_global) * norm(specificity)``,
-          and keep the top ``n_top``. It does **not** reserve
-          ``blend_global * n_top`` slots for global genes and fill the remainder
-          with cluster-vs-rest genes — that earlier description was wrong.
+        - ``"append"`` (**default**): freeze the global HVG top-``n_top``
+          (scanpy-like base) and **append** the next ``append_budget`` genes
+          from the same global ranking (ranks ``n_top+1 … n_top+m``). Does
+          **not** re-rank inside a 2× pool and does **not** require intermediate
+          clustering — avoids zero-sum displacement of majority-type genes and
+          ADT-style rest-contrast poisoning. Final size is
+          ``n_top + append_budget`` (capped at ``n_vars``). ``append_budget=0``
+          matches ``none``.
+        - ``"hybrid"`` / ``"hybrid_rerank"`` / ``"rerank"``: legacy path —
+          global top ``2×n_top`` pool re-ranked by
+          ``blend_global * norm(global) + (1-blend_global) * norm(specificity)``.
+          Opt-in research; not the product default.
         - ``"score"``: pure specificity ``S_g = Σ_c w_c · logFC^{+}_{g,c}``.
+          **Not suitable for rare-type recovery** when intermediate Leiden
+          fails to isolate the rare population. Prefer ``append`` or ``none``.
         - ``"reweight"``: cell-resample so cluster mass ``∝ n_c^{β}``, then
           one global HVG pass (``flavor``).
-        - ``"none"``: single global HVG (scanpy-like).
-        - Aliases: ``weighted_score`` / ``size_power`` / ``inverse_size`` → score;
+        - ``"none"``: single global HVG (scanpy-like), size exactly ``n_top``.
+        - Aliases: ``weighted_score`` / ``size_power`` → score with default
+          ``β=0.5``; ``inverse_size`` → score with default ``β=-1``;
           ``cell_reweight`` → reweight.
     balance_power
-        ``β`` for cluster mass ``∝ n^{β}`` (default ``0.5``; ``0.0`` for
-        ``inverse_size`` when power is omitted).
+        ``β`` for cluster mass ``w_c ∝ n_c^{β}`` (normalized), range
+        ``[-2, 2]``. Default ``0.5`` (mild large-cluster weight). ``β=0`` is
+        equal weight; ``β<0`` up-weights small clusters. Alias
+        ``inverse_size`` defaults to ``β=-1`` when this is omitted.
     blend_global
         For ``hybrid`` only: weight on the global score when re-ranking a
         global HVG candidate pool
@@ -312,10 +454,11 @@ def highly_variable_genes(
         **Not a fairness / anti-deprivation knob.** Specificity is an
         un-normalised cross-cluster field (weighted sum + max logFC); lowering
         it *increases* equal-share starved clusters and lowers min_share on
-        panels that show deprivation (see
-        ``examples/blend_global_deprivation.py``). Keep the default; use
-        post-hoc ``allocation_method`` research arms for allocation fairness,
-        not a smaller ``blend_global``.
+        panels that show deprivation (see the package repo script
+        ``examples/blend_global_deprivation.py``:
+        https://github.com/leelieber2025/scFair/blob/master/examples/blend_global_deprivation.py
+        ). Keep the default; use post-hoc ``allocation_method`` research arms
+        for allocation fairness, not a smaller ``blend_global``.
     neighbor_contrast
         For ``hybrid`` / ``score``. Fraction of the peak-specificity term taken
         from a **nearest-neighbour** contrast instead of cluster-vs-rest
@@ -401,10 +544,12 @@ def highly_variable_genes(
         ``True``/``False`` force it either way.
 
         Worth knowing why this exists: the balanced methods run a full
-        PCA -> neighbours -> Leiden internally, and the default
-        ``n_top_genes="auto"`` runs it **twice**. On 6.9k cells x 16.7k genes that
-        is roughly 4s for ``balance_method="none"``, 16s for ``hybrid`` at a fixed
-        k, and 29s for ``auto``. It scales with cells x genes.
+        PCA -> neighbours -> Leiden internally. Fixed-k hybrid does it
+        **once**. ``n_top_genes="auto"`` with structure does it about
+        **four** times (3 multi-seed structure feature graphs + 1 hybrid
+        pass) — not twice. On 6.9k cells x 16.7k genes that is roughly 4s
+        for ``balance_method="none"``, ~16s for hybrid@2000, and ~30s+ for
+        auto. It scales with cells x genes.
 
         Messages also always go to the ``scfair.pp._highly_variable_genes`` logger
         at INFO, independent of this setting, for callers that configure logging.
@@ -412,7 +557,9 @@ def highly_variable_genes(
         Optional externally computed global variability score, indexed by
         ``var_names`` (higher = more variable). Replaces the ``flavor`` pass as
         the global anchor, so any baseline can be used underneath the balanced
-        methods. Mainly for benchmarking — see ``examples/hvg_baselines.py``.
+        methods. Mainly for benchmarking — see the repo script
+        https://github.com/leelieber2025/scFair/blob/master/examples/hvg_baselines.py
+        .
     filter_mito, filter_ribo
         If True, exclude mitochondrial / ribosomal gene symbols from the
         selected HVG set (markers are never filtered). Matching is name-based
@@ -469,7 +616,97 @@ def highly_variable_genes(
     correlation exists can flip sign depending on the evaluation protocol.
     Only ``benefit_evidence="none"`` is a measured statement (``k>=3000``,
     fewer than two scoring clusters, or ``balance_method="none"``).
+
+    Experimental knobs (``cluster_pool``, ``allocation_method``, graph
+    sizes, …) live on :class:`~scfair.pp.HVGOptions` and are passed as
+    ``options=...``. Former top-level names still work with a
+    :class:`DeprecationWarning` for one release cycle. ``cap_allocation`` /
+    ``allocation_method='cap'`` were **removed** in 0.2.0.
     """
+    # --- resolve options bag (legacy kwargs still accepted with warning) ---
+    if legacy_kwargs:
+        unknown = set(legacy_kwargs) - HVG_OPTION_FIELD_NAMES
+        if unknown:
+            raise TypeError(
+                f"highly_variable_genes() got unexpected keyword argument(s) "
+                f"{sorted(unknown)}. Product knobs are the short signature; "
+                f"research knobs use options=HVGOptions(...)."
+            )
+    # Resolve first so options/legacy conflicts raise without a misleading deprecation.
+    opt = resolve_hvg_options(options, legacy_kwargs)
+    if legacy_kwargs and options is None:
+        warnings.warn(
+            "Passing research/secondary knobs as top-level keyword arguments is "
+            f"deprecated ({sorted(legacy_kwargs)}); use options=HVGOptions(...). "
+            "See scfair.pp.HVGOptions.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    n_top_min = int(opt.n_top_min)
+    n_top_max = int(opt.n_top_max)
+    auto_n_method = str(opt.auto_n_method)
+    marker_extra = bool(opt.marker_extra)
+    balance_power = opt.balance_power
+    neighbor_contrast = float(opt.neighbor_contrast)
+    combine = str(opt.combine)
+    cluster_pool = opt.cluster_pool
+    cluster_genes = opt.cluster_genes
+    consensus_resolutions = opt.consensus_resolutions
+    allocation_method = opt.allocation_method
+    # renamed from cap_merge_threshold; used by coverage / starved_topup only
+    cap_merge_threshold = opt.unit_merge_threshold
+    # Internal only: private helpers still accept a ceiling kwarg for the
+    # removed "cap" path (never selected). Keep a harmless default.
+    cap_ceiling = 1.0
+    spec_on_legitimate_units = bool(opt.spec_on_legitimate_units)
+    scale_clustering = bool(opt.scale_clustering)
+    logfc_space = str(opt.logfc_space)
+    global_score = opt.global_score
+    n_pcs = int(opt.n_pcs)
+    n_neighbors = int(opt.n_neighbors)
+    span = float(opt.span)
+    n_bins = int(opt.n_bins)
+    min_mean = float(opt.min_mean)
+    max_mean = float(opt.max_mean)
+    min_disp = float(opt.min_disp)
+    max_disp = float(opt.max_disp)
+    batch_key = opt.batch_key
+    filter_mito = bool(opt.filter_mito)
+    filter_ribo = bool(opt.filter_ribo)
+    # append_budget: None → mode default (200); explicit int is never overridden.
+    user_append_budget = opt.append_budget
+    if user_append_budget is not None:
+        append_budget = int(user_append_budget)
+        if append_budget < 0:
+            raise ValueError(f"append_budget must be >= 0, got {append_budget}.")
+    else:
+        append_budget = 200
+    label_key = opt.label_key
+    store_raw = opt.store_raw
+    snapshot_path = opt.snapshot_path
+
+    # Product operating mode (auto → compact / balanced / fine from data).
+    mode_info = resolve_hvg_mode(
+        adata,
+        mode=str(mode),
+        label_key=label_key,
+        n_obs=int(getattr(adata, "n_obs", 0) or 0) or None,
+    )
+    hvg_mode = str(mode_info["mode"])
+    # Mode fills budget only when user did not set append_budget explicitly.
+    if user_append_budget is None and mode_info.get("append_budget") is not None:
+        append_budget = int(mode_info["append_budget"])
+    # Absolute append_budget blows up small panels (n_top=50 + 200 → 250 of 300).
+    # Cap secondary budget at the frozen base size so final ≤ 2×k (still capped
+    # at n_vars later). Track requested vs effective for uns / warnings.
+    append_budget_requested = int(append_budget)
+    append_budget_capped = False
+
+    if not isinstance(strict, bool):
+        raise TypeError(
+            f"strict must be bool, got {type(strict).__name__}={strict!r}. "
+            "Use strict=True or strict=False (string 'yes' is not accepted)."
+        )
     if isinstance(n_top_genes, (int, np.integer)) and int(n_top_genes) < 1:
         raise ValueError("n_top_genes must be >= 1.")
     if flavor not in _ALL_FLAVORS:
@@ -489,6 +726,16 @@ def highly_variable_genes(
     neighbor_contrast = float(neighbor_contrast)
     if logfc_space not in _LOGFC_SPACES:
         raise ValueError(f"logfc_space must be one of {list(_LOGFC_SPACES)}, got {logfc_space!r}.")
+    if logfc_space == "linear":
+        warnings.warn(
+            "logfc_space='linear' uses pseudocount 1e-9 on normalize_total(1e4) "
+            "scale (essentially unregularised; near-zero denominators can explode). "
+            "Prefer the default 'log1p' or 'linear_regularised' (pseudo=1.0). "
+            "'linear' is retained for benchmark parity with scanpy rank_genes_groups "
+            "only.",
+            UserWarning,
+            stacklevel=2,
+        )
     if cluster_pool is not None:
         cluster_pool = int(cluster_pool)
         if cluster_pool < 2:
@@ -503,41 +750,35 @@ def highly_variable_genes(
         balance_method=balance_method,
         neighbor_contrast=neighbor_contrast,
         resolution=resolution,
-        blend_global=blend_global if str(balance_method or "hybrid") == "hybrid" else None,
+        blend_global=blend_global if method == "hybrid" else None,
         log=diagnose,
     )
     if combine not in ("blend", "best_rank"):
         raise ValueError("combine must be 'blend' or 'best_rank'.")
-    if marker_mode not in ("force", "none"):
+    # Resolve marker_mode after marker_genes is known so default None is clear.
+    if marker_mode is None:
+        marker_mode = "force" if marker_genes else "none"
+    elif marker_mode not in ("force", "none"):
         raise ValueError(
-            "marker_mode must be 'force' or 'none'. ('boost' was removed before "
-            "the first release: it was arithmetically equivalent to "
+            "marker_mode must be None, 'force', or 'none'. ('boost' was removed "
+            "before the first release: it was arithmetically equivalent to "
             "marker_mode='force' with marker_extra=False.)"
         )
-    # Resolve post-hybrid allocation. `allocation_method` is the explicit
-    # policy; `cap_allocation` remains a boolean shorthand (deprecated when True).
+    # Post-hybrid allocation (cap removed in 0.2.0).
     if allocation_method is None:
-        allocation_method = "cap" if cap_allocation else "none"
+        allocation_method = "none"
     else:
         allocation_method = str(allocation_method).lower()
         allocation_method = _ALLOCATION_ALIASES.get(allocation_method, allocation_method)
+    if allocation_method == "cap":
+        raise ValueError(
+            "allocation_method='cap' was removed in 0.2.0. Use 'none' (default) "
+            "or research 'starved_topup' / 'coverage' via HVGOptions."
+        )
     if allocation_method not in _ALLOCATION_METHODS:
         raise ValueError(
             f"allocation_method must be one of {sorted(_ALLOCATION_METHODS)}, "
             f"got {allocation_method!r}."
-        )
-    # Keep the bool in sync so metadata / older diagnostics that still read
-    # cap_allocation stay consistent when the caller only set the string.
-    cap_allocation = allocation_method == "cap"
-    if allocation_method == "cap" or (cap_allocation is True and allocation_method == "cap"):
-        warnings.warn(
-            "allocation_method='cap' / cap_allocation=True is deprecated: "
-            "equal-share *ceiling* trim is high-variance on ARI "
-            "and is not the product path. Prefer allocation_method='none' "
-            "(default), or research 'starved_topup' / 'coverage' for "
-            "under-allocation. Cap will be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
         )
 
     # Duplicate gene names break every score/rank alignment in this module
@@ -553,12 +794,26 @@ def highly_variable_genes(
             "name, so names must be unique. Call adata.var_names_make_unique() "
             "first."
         )
+    # Duplicate cell names fail later inside raw_snapshot restore (reweight and
+    # some restore paths). Catch them here so hybrid/score and reweight share
+    # the same early, actionable error.
+    dup_obs = adata.obs_names[adata.obs_names.duplicated()]
+    if len(dup_obs):
+        raise ValueError(
+            f"adata.obs_names has {len(dup_obs)} duplicate entries "
+            f"(e.g. {sorted(set(map(str, dup_obs)))[:3]}). scFair restores raw "
+            "counts by cell name, so barcodes must be unique. Call "
+            "adata.obs_names_make_unique() first."
+        )
     if n_top_min < 1 or n_top_max < 1:
         raise ValueError(f"n_top_min={n_top_min} and n_top_max={n_top_max} must both be >= 1.")
     if n_top_min > n_top_max:
+        # Contradictory bounds must not silently clamp (default min=500 with a
+        # lowered max was a common footgun that hid the real interval).
         raise ValueError(
-            f"n_top_min={n_top_min} > n_top_max={n_top_max}; the bounds for "
-            "automatic n_top_genes are contradictory."
+            f"n_top_min={n_top_min} > n_top_max={n_top_max}. Pass a consistent "
+            "interval, e.g. options=HVGOptions(n_top_min=100, n_top_max=300) "
+            "(default min is 500 — lower both ends when shrinking the range)."
         )
     # inplace=False must leave the caller's object untouched, as in scanpy. Every
     # stage below annotates `adata` (counts layer, var columns, uns, obs clusters),
@@ -567,362 +822,439 @@ def highly_variable_genes(
     if not inplace:
         adata = adata.copy()
 
-    counts_layer = _prepare_counts_layer(adata, layer=layer, counts_layer="counts")
-
-    auto_meta: dict[str, Any] | None = None
-    # Configs loaded from YAML/JSON hand over 2000.0 or "2000"; treat anything
-    # exactly equal to an integer as that integer instead of a strategy name.
-    if not isinstance(n_top_genes, (int, np.integer)):
-        try:
-            as_float = float(n_top_genes)
-        except (TypeError, ValueError):
-            pass
-        else:
-            if np.isfinite(as_float) and float(as_float).is_integer():
-                n_top_genes = int(as_float)
-    n_top_is_auto = not isinstance(n_top_genes, (int, np.integer))
-    if n_top_is_auto and str(n_top_genes) not in _AUTO_STRATEGIES:
-        # Validate here, not inside resolve_n_top_genes: everything between this
-        # point and there runs a full PCA + neighbours + Leiden, so a mistyped
-        # value used to cost tens of seconds before reporting a type error.
-        raise ValueError(
-            f"Unknown n_top_genes={n_top_genes!r}. Pass an int, or one of "
-            f"{sorted(_AUTO_STRATEGIES)}."
+    _hvg_snap = _snapshot_adata_for_rollback(adata)
+    # When subset=True, full-gene recovery after the call needs a snapshot.
+    # Auto-enable store_raw unless the user already asked for ondisk / True.
+    effective_store_raw: bool | str = store_raw
+    if subset and not store_raw:
+        effective_store_raw = True
+        warnings.warn(
+            "subset=True requires a raw_snapshot to recover the full gene universe "
+            "after the call; enabling store_raw=True for this run. Pass "
+            "options=HVGOptions(store_raw=True) or store_raw='ondisk' to silence, "
+            "or subset=False to avoid the extra matrix copy.",
+            UserWarning,
+            stacklevel=2,
         )
-    if n_top_is_auto:
-        # Rank a large pool, then cut to auto-selected k.
-        n_pool = min(int(n_top_max), adata.n_vars)
-        n_top_request = n_pool
-    else:
-        n_top_request = min(int(n_top_genes), adata.n_vars)
-
-    hvg_params = dict(
-        flavor=flavor,
-        counts_layer=counts_layer,
-        span=span,
-        n_bins=n_bins,
-        min_mean=min_mean,
-        max_mean=max_mean,
-        min_disp=min_disp,
-        max_disp=max_disp,
-    )
-
-    show = _progress_default(adata) if progress is None else bool(progress)
-    # Effective auto strategy (auto → auto_n_method). Used to skip a redundant
-    # hybrid@n_top_max pass when structure alone decides k.
-    auto_strategy_eff: str | None = None
-    if n_top_is_auto:
-        auto_strategy_eff = (
-            str(auto_n_method).lower()
-            if str(n_top_genes).lower() == "auto"
-            else str(n_top_genes).lower()
-        )
-    structure_hybrid_fast = (
-        n_top_is_auto and method == "hybrid" and auto_strategy_eff == "structure"
-    )
-    if n_top_is_auto and method in ("hybrid", "score") and not structure_hybrid_fast:
-        _progress(
-            show,
-            "n_top_genes='auto' with balance_method=%r: intermediate graph is "
-            "shared across select + realign when the protocol matches; pass an "
-            "int to skip auto entirely.",
-            method,
-        )
-    elif structure_hybrid_fast:
-        _progress(
-            show,
-            "n_top_genes='auto' (structure): estimate k from structure features, "
-            "then one hybrid pass at that k (no double intermediate clustering).",
-        )
-
-    # --- Pass 1: global HVG (seeds clustering features for balanced modes) ---
-    # Skipped when an anchor is injected: global_score fully overwrites
-    # highly_variable / highly_variable_rank and supplies global_scores, so running
-    # the flavor pass first only to discard it was pure waste — and worst in the
-    # very case the parameter exists for (repeated baseline benchmarking).
-    if global_score is None:
-        _progress(
-            show,
-            "global HVG pass (flavor=%s) over %d genes x %d cells...",
-            flavor,
-            adata.n_vars,
-            adata.n_obs,
-        )
-        _run_hvg(
+    try:
+        counts_layer = _prepare_counts_layer(
             adata,
-            n_top_genes=n_top_request,
-            batch_key=batch_key,
-            **hvg_params,
+            layer=layer,
+            counts_layer="counts",
+            store_raw=effective_store_raw,
+            snapshot_path=snapshot_path,
         )
-    else:
-        _progress(
-            show,
-            "using injected global_score as the anchor; skipping the %s pass.",
-            flavor,
+        counts_validate_info = _validate_counts_matrix(
+            adata,
+            counts_layer=counts_layer,
+            flavor=flavor,
+            span=span,
+            strict=strict,
         )
-    if global_score is not None:
-        # An injected anchor replaces the flavor pass entirely: rank, scores and
-        # the highly_variable mask that seeds the intermediate clustering all
-        # come from it, so the balanced methods sit on top of *that* baseline.
-        gs = pd.Series(global_score).reindex(adata.var_names)
-        if gs.isna().all():
+
+        # Preserve a pre-existing scanpy ``uns["hvg"]`` dict: scanpy's own HVG call
+        # may overwrite it mid-run; we re-merge at the end instead of replacing with
+        # a one-key stub that also lied about flavor after seurat_v3 fallback.
+        _prior_scanpy_hvg = (
+            dict(adata.uns["hvg"]) if isinstance(adata.uns.get("hvg"), dict) else None
+        )
+
+        auto_meta: dict[str, Any] | None = None
+        # Configs loaded from YAML/JSON hand over 2000.0 or "2000"; treat anything
+        # exactly equal to an integer as that integer instead of a strategy name.
+        if not isinstance(n_top_genes, (int, np.integer)):
+            try:
+                as_float = float(n_top_genes)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if np.isfinite(as_float) and float(as_float).is_integer():
+                    n_top_genes = int(as_float)
+        n_top_is_auto = not isinstance(n_top_genes, (int, np.integer))
+        # E3: explicit mode with fixed int k does not change the gene list
+        # (mode only steers auto k / soft floors / append budget defaults).
+        _mode_arg = str(mode or "auto").lower().strip()
+        if (
+            not n_top_is_auto
+            and _mode_arg not in ("auto", "")
+            and _mode_arg in ("compact", "balanced", "fine")
+        ):
+            warnings.warn(
+                f"mode={mode!r} has no effect on gene selection when "
+                f"n_top_genes is a fixed int ({int(n_top_genes)}). "
+                "mode only influences n_top_genes='auto' (k floor / soft "
+                "buffer / product append defaults). Pass n_top_genes='auto' "
+                "to let mode choose k, or ignore this warning if you only "
+                "wanted mode recorded in uns.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if n_top_is_auto and str(n_top_genes) not in _AUTO_STRATEGIES:
+            # Validate here, not inside resolve_n_top_genes: everything between this
+            # point and there runs a full PCA + neighbours + Leiden, so a mistyped
+            # value used to cost tens of seconds before reporting a type error.
             raise ValueError(
-                "global_score does not align with adata.var_names (all NaN after reindex)."
+                f"Unknown n_top_genes={n_top_genes!r}. Pass an int, or one of "
+                f"{sorted(_AUTO_STRATEGIES)}."
             )
-        global_scores = gs.fillna(float(np.nanmin(gs.to_numpy())))
-        global_rank = global_scores.rank(ascending=False, method="average")
-        top_mask = global_rank <= n_top_request
-        adata.var["highly_variable"] = top_mask.to_numpy()
-        adata.var["highly_variable_rank"] = global_rank.where(top_mask, np.inf).to_numpy()
-    else:
-        global_rank = _gene_rank_series(adata)
-        global_scores = _variability_raw_scores(adata)
-
-    # cluster_pool: mask must come from all-gene variability scores, not from
-    # global_rank (that is only finite for the top-n_top_request genes).
-    cluster_mask: np.ndarray | None = None
-    cluster_pool_source = "highly_variable"
-    if cluster_genes is not None and method != "none":
-        if cluster_pool is not None:
-            raise ValueError("Pass either cluster_pool or cluster_genes, not both.")
-        wanted = {str(g) for g in cluster_genes}
-        cluster_mask = adata.var_names.astype(str).isin(wanted)
-        n_found = int(cluster_mask.sum())
-        if n_found < 2:
-            raise ValueError(
-                f"cluster_genes matched only {n_found} of {len(wanted)} names in "
-                "var_names; cannot cluster."
-            )
-        if n_found < len(wanted):
-            logger.warning(
-                "cluster_genes: %d of %d names not in var_names; clustering on %d.",
-                len(wanted) - n_found,
-                len(wanted),
-                n_found,
-            )
-        cluster_pool_source = "cluster_genes"
-    elif cluster_pool is not None and method != "none":
-        n_cp = max(2, min(int(cluster_pool), adata.n_vars))
-        keep = global_scores.sort_values(ascending=False).index[:n_cp]
-        cluster_mask = adata.var_names.isin(keep)
-        cluster_pool_source = "cluster_pool"
-
-    clustering_diag: dict[str, Any] = {}
-    cluster_labels: pd.Series | None = None
-    n_clusters_used = 0
-    cluster_weights: dict[str, float] = {}
-    aggregated: pd.Series | None = None
-    selection_tag = "global"
-    score_type: str | None = None
-    cluster_gene_ranks: dict[str, list[str]] | None = None
-    # Shared across auto select + realign: PCA/Leiden/specificity reuse.
-    intermediate_cache: dict[str, Any] = {}
-
-    # --- Structure + hybrid fast path ---
-    # Structure k does not use hybrid ranking. Running hybrid@n_top_max then
-    # structure then hybrid@k paid for two identical intermediates (same
-    # highly_variable mask). Resolve k first, then a single hybrid@k.
-    if structure_hybrid_fast:
-        from ._auto_n import PRODUCT_STRUCTURE_N_SEEDS, estimate_n_top_structure
-
-        try:
-            n_final, structure_detail = estimate_n_top_structure(
-                adata,
-                counts_layer=counts_layer,
-                random_state=random_state,
-                version="v7",
-                k_min=int(n_top_min),
-                k_max=min(int(n_top_max), int(adata.n_vars)),
-                n_genes=int(adata.n_vars),
-                # Multi-seed for stability; library default alone is n_seeds=1.
-                n_seeds=PRODUCT_STRUCTURE_N_SEEDS,
-                # Per-seed "n/N (%)" progress + a please-wait note (this loop is
-                # the single longest-running, most opaque step in the auto path).
-                progress=show,
-            )
-        except Exception as exc:
-            logger.warning("structure auto_n failed (%s); falling back to ensemble path.", exc)
-            structure_hybrid_fast = False
-            auto_meta = {"structure_error": str(exc)}
+        if n_top_is_auto:
+            # Rank a large pool, then cut to auto-selected k.
+            n_pool = min(int(n_top_max), adata.n_vars)
+            n_top_request = n_pool
         else:
-            n_final = int(n_final)
+            n_top_request = min(int(n_top_genes), adata.n_vars)
+
+        # Cap append_budget ≤ n_base so small panels don't become "select almost
+        # everything" (absolute m=200 on n_top=50 → 250 genes).
+        if method == "append" and not n_top_is_auto:
+            _cap = min(int(append_budget_requested), max(0, int(n_top_request)))
+            if _cap != int(append_budget_requested):
+                append_budget_capped = True
+                warnings.warn(
+                    f"append_budget={append_budget_requested} exceeds n_top_genes="
+                    f"{n_top_request}; capping secondary append at {_cap} "
+                    f"(final ≤ {n_top_request + _cap}, or n_vars). "
+                    "Pass options=HVGOptions(append_budget=N) with N≤n_top, "
+                    "or append_budget=0 to disable.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            append_budget = _cap
+
+        hvg_params = dict(
+            flavor=flavor,
+            counts_layer=counts_layer,
+            span=span,
+            n_bins=n_bins,
+            min_mean=min_mean,
+            max_mean=max_mean,
+            min_disp=min_disp,
+            max_disp=max_disp,
+        )
+
+        show = _progress_default(adata) if progress is None else bool(progress)
+        # Effective auto strategy (auto → auto_n_method). Used to skip a redundant
+        # hybrid@n_top_max pass when structure alone decides k.
+        auto_strategy_eff: str | None = None
+        if n_top_is_auto:
+            auto_strategy_eff = (
+                str(auto_n_method).lower()
+                if str(n_top_genes).lower() == "auto"
+                else str(n_top_genes).lower()
+            )
+        structure_hybrid_fast = (
+            n_top_is_auto and method in ("hybrid", "append") and auto_strategy_eff == "structure"
+        )
+        if n_top_is_auto and method in ("hybrid", "score") and not structure_hybrid_fast:
             _progress(
                 show,
-                "structure auto_n → k=%d; running hybrid once at that k...",
-                n_final,
+                "n_top_genes='auto' with balance_method=%r: intermediate graph is "
+                "shared across select + realign when the protocol matches; pass an "
+                "int to skip auto entirely.",
+                method,
             )
-            selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
-                _score_weighted_select(
-                    adata,
-                    n_top_genes=n_final,
-                    resolution=resolution,
-                    min_cluster_size=min_cluster_size,
-                    n_pcs=n_pcs,
-                    n_neighbors=n_neighbors,
-                    random_state=random_state,
-                    balance_power=beta,
-                    global_rank=global_rank,
-                    global_scores=global_scores,
-                    blend_global=blend_global,
-                    cluster_mask=cluster_mask,
-                    progress=show,
-                    scale_clustering=scale_clustering,
-                    logfc_space=logfc_space,
-                    hybrid=True,
-                    neighbor_contrast=neighbor_contrast,
-                    combine=combine,
-                    diag_out=clustering_diag,
-                    consensus_resolutions=consensus_resolutions,
-                    allocation_method=allocation_method,
-                    cap_ceiling=cap_ceiling,
-                    cap_merge_threshold=cap_merge_threshold,
-                    spec_on_legitimate_units=spec_on_legitimate_units,
-                    graph_cache=intermediate_cache,
-                    **hvg_params,
-                )
+        elif structure_hybrid_fast:
+            _progress(
+                show,
+                "n_top_genes='auto' (structure): estimate k from structure features, "
+                "then %s at that k.",
+                "append secondary HVG" if method == "append" else "one hybrid pass",
             )
-            selection_tag = "hybrid_global_anchor_specificity"
-            score_type = f"hybrid_blend_global={blend_global}"
-            auto_meta = {
-                "strategy": "structure",
-                "n_top_selected": n_final,
-                "method_picks": {"structure": n_final},
-                "structure": structure_detail,
-                "pool_realign": "hybrid_2xk",
-                "n_top_after_realign": int(len(selected)),
-                "structure_hybrid_fast": True,
-                "depth": None,
-                "silhouette_curve": None,
-                "cumfrac": None,
-                "ensemble": None,
+
+        # --- Pass 1: global HVG (seeds clustering features for balanced modes) ---
+        # Skipped when an anchor is injected: global_score fully overwrites
+        # highly_variable / highly_variable_rank and supplies global_scores, so running
+        # the flavor pass first only to discard it was pure waste — and worst in the
+        # very case the parameter exists for (repeated baseline benchmarking).
+        hvg_run_meta: dict[str, Any] = {
+            "flavor_requested": str(flavor),
+            "flavor_used": str(flavor),
+            "fallback_reason": None,
+        }
+        if global_score is None:
+            _progress(
+                show,
+                "global HVG pass (flavor=%s) over %d genes x %d cells...",
+                flavor,
+                adata.n_vars,
+                adata.n_obs,
+            )
+            hvg_run_meta = _run_hvg(
+                adata,
+                n_top_genes=n_top_request,
+                batch_key=batch_key,
+                strict=strict,
+                **hvg_params,
+            )
+        else:
+            hvg_run_meta = {
+                "flavor_requested": str(flavor),
+                "flavor_used": "injected_global_score",
+                "fallback_reason": None,
             }
-            n_top_for_markers = n_final
-
-    if not structure_hybrid_fast:
-        if method == "none":
-            selected = _top_genes_from_rank(global_rank, n_top_request)
-            aggregated = global_scores
-        elif method in ("score", "hybrid"):
-            selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
-                _score_weighted_select(
-                    adata,
-                    n_top_genes=n_top_request,
-                    resolution=resolution,
-                    min_cluster_size=min_cluster_size,
-                    n_pcs=n_pcs,
-                    n_neighbors=n_neighbors,
-                    random_state=random_state,
-                    balance_power=beta,
-                    global_rank=global_rank,
-                    global_scores=global_scores,
-                    blend_global=blend_global if method == "hybrid" else 0.0,
-                    cluster_mask=cluster_mask,
-                    progress=show,
-                    scale_clustering=scale_clustering,
-                    logfc_space=logfc_space,
-                    hybrid=(method == "hybrid"),
-                    neighbor_contrast=neighbor_contrast,
-                    combine=combine,
-                    diag_out=clustering_diag,
-                    consensus_resolutions=consensus_resolutions,
-                    allocation_method=allocation_method,
-                    cap_ceiling=cap_ceiling,
-                    cap_merge_threshold=cap_merge_threshold,
-                    spec_on_legitimate_units=spec_on_legitimate_units,
-                    graph_cache=intermediate_cache if n_top_is_auto else None,
-                    **hvg_params,
-                )
+            _progress(
+                show,
+                "using injected global_score as the anchor; skipping the %s pass.",
+                flavor,
             )
-            if method == "hybrid":
-                selection_tag = "hybrid_global_anchor_specificity"
-                score_type = f"hybrid_blend_global={blend_global}"
-            else:
-                selection_tag = "cluster_vs_rest_specificity"
-                score_type = "weighted_one_sided_logfc"
-            # per-cluster ranks for coverage auto-n
-            if n_top_is_auto and cluster_labels is not None:
-                cluster_gene_ranks = _build_cluster_gene_ranks(
+        if global_score is not None:
+            # An injected anchor replaces the flavor pass entirely: rank, scores and
+            # the highly_variable mask that seeds the intermediate clustering all
+            # come from it, so the balanced methods sit on top of *that* baseline.
+            gs = pd.Series(global_score).reindex(adata.var_names)
+            if gs.isna().all():
+                raise ValueError(
+                    "global_score does not align with adata.var_names (all NaN after reindex)."
+                )
+            global_scores = gs.fillna(float(np.nanmin(gs.to_numpy())))
+            global_rank = global_scores.rank(ascending=False, method="average")
+            top_mask = global_rank <= n_top_request
+            adata.var["highly_variable"] = top_mask.to_numpy()
+            # scanpy convention: finite rank only for selected genes; rest NaN.
+            adata.var["highly_variable_rank"] = global_rank.where(top_mask, np.nan).to_numpy()
+        else:
+            # Use the flavor that actually ran (may differ after seurat_v3→seurat
+            # fallback). Explicit flavor avoids reading leftover score columns
+            # from a previous call on the same object (G3).
+            _flavor_for_scores = str(hvg_run_meta.get("flavor_used") or flavor)
+            global_rank = _gene_rank_series(adata, flavor=_flavor_for_scores)
+            global_scores = _variability_raw_scores(
+                adata, flavor=_flavor_for_scores, flavor_used=_flavor_for_scores
+            )
+
+        # cluster_pool: mask must come from all-gene variability scores, not from
+        # global_rank (that is only finite for the top-n_top_request genes).
+        # Mutual exclusion is checked even for balance_method='none' so conflicts
+        # are never silently ignored.
+        if cluster_genes is not None and cluster_pool is not None:
+            raise ValueError("Pass either cluster_pool or cluster_genes, not both.")
+        cluster_mask: np.ndarray | None = None
+        cluster_pool_source = "highly_variable"
+        if cluster_genes is not None and method != "none":
+            wanted = {str(g) for g in cluster_genes}
+            cluster_mask = adata.var_names.astype(str).isin(wanted)
+            n_found = int(cluster_mask.sum())
+            if n_found < 2:
+                raise ValueError(
+                    f"cluster_genes matched only {n_found} of {len(wanted)} names in "
+                    "var_names; cannot cluster."
+                )
+            if n_found < len(wanted):
+                logger.warning(
+                    "cluster_genes: %d of %d names not in var_names; clustering on %d.",
+                    len(wanted) - n_found,
+                    len(wanted),
+                    n_found,
+                )
+            cluster_pool_source = "cluster_genes"
+        elif cluster_pool is not None and method != "none":
+            n_cp = max(2, min(int(cluster_pool), adata.n_vars))
+            keep = global_scores.sort_values(ascending=False).index[:n_cp]
+            cluster_mask = adata.var_names.isin(keep)
+            cluster_pool_source = "cluster_pool"
+
+        clustering_diag: dict[str, Any] = {}
+        cluster_labels: pd.Series | None = None
+        n_clusters_used = 0
+        cluster_weights: dict[str, float] = {}
+        aggregated: pd.Series | None = None
+        selection_tag = "global"
+        score_type: str | None = None
+        cluster_gene_ranks: dict[str, list[str]] | None = None
+        # Shared across auto select + realign: PCA/Leiden/specificity reuse.
+        intermediate_cache: dict[str, Any] = {}
+        append_meta: dict[str, Any] | None = None
+        # Base k for append reporting (structure/auto/fixed request). Filters use
+        # n_top_for_markers (= base+append); meta n_top_genes_used reports base.
+        n_top_base: int | None = None
+
+        # --- Structure + product path (append or legacy hybrid) ---
+        # Resolve k first; append freezes base-k + secondary HVG; hybrid re-ranks.
+        if structure_hybrid_fast:
+            from ._auto_n import PRODUCT_STRUCTURE_N_SEEDS, estimate_n_top_structure
+
+            try:
+                n_final, structure_detail = estimate_n_top_structure(
                     adata,
-                    cluster_labels=cluster_labels,
                     counts_layer=counts_layer,
-                    min_cluster_size=min_cluster_size,
-                    logfc_space=logfc_space,
-                )
-        else:  # reweight
-            selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
-                _cell_reweight_select(
-                    adata,
-                    n_top_genes=n_top_request,
-                    resolution=resolution,
-                    min_cluster_size=min_cluster_size,
-                    cluster_mask=cluster_mask,
-                    progress=show,
-                    scale_clustering=scale_clustering,
-                    logfc_space=logfc_space,
-                    n_pcs=n_pcs,
-                    n_neighbors=n_neighbors,
                     random_state=random_state,
-                    balance_power=beta,
-                    global_rank=global_rank,
-                    batch_key=batch_key,
-                    diag_out=clustering_diag,
-                    **hvg_params,
+                    version="v7",
+                    k_min=int(n_top_min),
+                    k_max=min(int(n_top_max), int(adata.n_vars)),
+                    n_genes=int(adata.n_vars),
+                    # Multi-seed for stability; library default alone is n_seeds=1.
+                    n_seeds=PRODUCT_STRUCTURE_N_SEEDS,
+                    # Per-seed "n/N (%)" progress + a please-wait note (this loop is
+                    # the single longest-running, most opaque step in the auto path).
+                    progress=show,
+                    hvg_mode=hvg_mode if hvg_mode != "balanced" else "auto",
                 )
-            )
-            selection_tag = "cell_reweighted_global_hvg"
-            score_type = f"reweighted_{flavor}"
-
-        # --- Auto n_top: cut ranked list ---
-        if n_top_is_auto:
-            # Order by aggregated score when available, else selection order
-            if aggregated is not None:
-                gene_order = list(
-                    aggregated.reindex(selected)
-                    .fillna(-np.inf)
-                    .sort_values(ascending=False)
-                    .index.astype(str)
+                # Re-resolve mode with structure features (may promote to fine/compact).
+                mode_info = resolve_hvg_mode(
+                    adata,
+                    mode=str(mode),
+                    label_key=label_key,
+                    n_obs=int(adata.n_obs),
+                    n_density_pops=(structure_detail.get("features") or {}).get("n_density_pops"),
+                    rule_branch=structure_detail.get("rule_branch"),
                 )
-                # append any selected missing from aggregated
-                seen = set(gene_order)
-                for g in selected:
-                    gs = str(g)
-                    if gs not in seen:
-                        gene_order.append(gs)
-                scores_desc = aggregated.reindex(gene_order).fillna(0.0).to_numpy(dtype=float)
+                hvg_mode = str(mode_info["mode"])
+                # Mode may change append_budget (today all modes use 200; keep
+                # in sync so a future fine-specific budget is not silently stale).
+                if user_append_budget is None and mode_info.get("append_budget") is not None:
+                    append_budget = int(mode_info["append_budget"])
+                    append_budget_requested = int(append_budget)
+                if hvg_mode == "fine" and int(n_final) < 2000 and int(n_final) < int(adata.n_vars):
+                    # Respect user n_top_max (do not force 2000 past their ceiling).
+                    n_final = min(2000, int(adata.n_vars), int(n_top_max))
+                    structure_detail = dict(structure_detail)
+                    structure_detail["hvg_mode"] = hvg_mode
+                    structure_detail["n_top_selected"] = int(n_final)
+                    rb = str(structure_detail.get("rule_branch") or "")
+                    if "fine_mode_floor" not in rb:
+                        structure_detail["rule_branch"] = f"{rb}+fine_mode_floor:{n_final}"
+                    ks = str(structure_detail.get("k_source") or "structure")
+                    if "fine_mode_floor" not in ks:
+                        structure_detail["k_source"] = f"{ks}+fine_mode_floor:{n_final}"
+            except _RECOVERABLE_ERRORS as exc:
+                msg = (
+                    f"structure auto_n failed ({type(exc).__name__}: {exc}); "
+                    "falling back to ensemble path for n_top selection."
+                )
+                if strict:
+                    raise RuntimeError(
+                        "structure auto_n failed and strict=True; not falling back to ensemble. "
+                        f"Original error: {type(exc).__name__}: {exc}"
+                    ) from exc
+                warnings.warn(msg, UserWarning, stacklevel=2)
+                logger.warning(msg)
+                structure_hybrid_fast = False
+                auto_meta = {
+                    "structure_error": str(exc),
+                    "structure_error_type": type(exc).__name__,
+                    "fallback_reason": "structure_auto_n_failed→ensemble",
+                    "strategy": "ensemble",  # may be overwritten by ensemble path
+                }
             else:
-                gene_order = [str(g) for g in selected]
-                scores_desc = np.arange(len(gene_order), 0, -1, dtype=float)
+                n_final = int(n_final)
+                if method == "append":
+                    _cap = min(int(append_budget_requested), max(0, int(n_final)))
+                    if _cap != int(append_budget_requested):
+                        append_budget_capped = True
+                        warnings.warn(
+                            f"append_budget={append_budget_requested} exceeds auto "
+                            f"n_top={n_final}; capping secondary append at {_cap}.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    append_budget = _cap
+                    _progress(
+                        show,
+                        "structure auto_n → base k=%d; append +%d secondary HVG...",
+                        n_final,
+                        append_budget,
+                    )
+                    selected, append_meta = _hvg_base_plus_append(
+                        global_scores,
+                        n_base=n_final,
+                        n_append=append_budget,
+                    )
+                    aggregated = global_scores
+                    selection_tag = "hvg_base_plus_secondary_append"
+                    score_type = "global_variability_plus_append"
+                    auto_meta = {
+                        "strategy": "structure",
+                        "n_top_selected": n_final,
+                        "k_source": structure_detail.get("k_source"),
+                        "rule_branch": structure_detail.get("rule_branch"),
+                        "method_picks": {"structure": n_final},
+                        "structure": structure_detail,
+                        "pool_realign": "append_secondary_hvg",
+                        "n_top_after_realign": int(len(selected)),
+                        "structure_hybrid_fast": True,
+                        "append": append_meta,
+                    }
+                    n_top_base = int(n_final)
+                    # Filters/markers keep the full base+append list.
+                    n_top_for_markers = int(len(selected))
+                else:
+                    _progress(
+                        show,
+                        "structure auto_n → k=%d; running hybrid once at that k...",
+                        n_final,
+                    )
+                    selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
+                        _score_weighted_select(
+                            adata,
+                            n_top_genes=n_final,
+                            resolution=resolution,
+                            min_cluster_size=min_cluster_size,
+                            n_pcs=n_pcs,
+                            n_neighbors=n_neighbors,
+                            random_state=random_state,
+                            balance_power=beta,
+                            global_rank=global_rank,
+                            global_scores=global_scores,
+                            blend_global=blend_global,
+                            cluster_mask=cluster_mask,
+                            progress=show,
+                            scale_clustering=scale_clustering,
+                            logfc_space=logfc_space,
+                            hybrid=True,
+                            neighbor_contrast=neighbor_contrast,
+                            combine=combine,
+                            diag_out=clustering_diag,
+                            consensus_resolutions=consensus_resolutions,
+                            allocation_method=allocation_method,
+                            cap_ceiling=cap_ceiling,
+                            cap_merge_threshold=cap_merge_threshold,
+                            spec_on_legitimate_units=spec_on_legitimate_units,
+                            graph_cache=intermediate_cache,
+                            **hvg_params,
+                        )
+                    )
+                    selection_tag = "hybrid_global_anchor_specificity"
+                    score_type = f"hybrid_blend_global={blend_global}"
+                    auto_meta = {
+                        "strategy": "structure",
+                        "n_top_selected": n_final,
+                        "k_source": structure_detail.get("k_source"),
+                        "rule_branch": structure_detail.get("rule_branch"),
+                        "method_picks": {"structure": n_final},
+                        "structure": structure_detail,
+                        "pool_realign": "hybrid_2xk",
+                        "n_top_after_realign": int(len(selected)),
+                        "structure_hybrid_fast": True,
+                    }
+                    n_top_for_markers = n_final
 
-            # Map auto aliases
-            n_req: int | str = n_top_genes  # type: ignore[assignment]
-            if str(n_top_genes).lower() == "auto":
-                n_req = auto_n_method
-
-            # Silhouette is expensive and on PBMC alone picks k too small (hurts DC).
-            # Only run it when explicitly requested — not for default ensemble.
-            n_final, auto_meta = resolve_n_top_genes(
-                n_req,
-                scores_desc,
-                gene_order,
-                k_min=int(n_top_min),
-                k_max=min(int(n_top_max), len(gene_order)),
-                # adata: silhouette strategy + depth-aware ensemble knobs
-                adata=adata,
-                counts_layer=counts_layer,
-                cluster_gene_ranks=cluster_gene_ranks,
-                random_state=random_state,
-                depth_aware=True,
-            )
-            # Align gene set with fixed hybrid@k: re-rank inside global top 2×k
-            # pool (k-sweep: auto on a 5k pool then cut ≠ hybrid@k). Skip for
-            # score/reweight/none and for pure geometric strategies without hybrid.
-            # Intermediate graph/specificity reused via intermediate_cache when
-            # the clustering protocol is unchanged.
-            if method == "hybrid" and n_final >= 1:
+        if not structure_hybrid_fast:
+            if method == "none":
+                selected = _top_genes_from_rank(global_rank, n_top_request)
+                aggregated = global_scores
+            elif method == "append":
+                # Fixed k: freeze base + append immediately.
+                # Auto (non-structure): rank the full pool, cut k later, then
+                # re-apply append so final = k + m (not truncated to k).
+                aggregated = global_scores
+                selection_tag = "hvg_base_plus_secondary_append"
+                score_type = "global_variability_plus_append"
+                if n_top_is_auto:
+                    selected = [
+                        str(g)
+                        for g in global_scores.sort_values(ascending=False, kind="stable").index
+                    ]
+                else:
+                    selected, append_meta = _hvg_base_plus_append(
+                        global_scores,
+                        n_base=n_top_request,
+                        n_append=append_budget,
+                    )
+            elif method in ("score", "hybrid"):
                 selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
                     _score_weighted_select(
                         adata,
-                        n_top_genes=n_final,
+                        n_top_genes=n_top_request,
                         resolution=resolution,
                         min_cluster_size=min_cluster_size,
                         n_pcs=n_pcs,
@@ -931,12 +1263,12 @@ def highly_variable_genes(
                         balance_power=beta,
                         global_rank=global_rank,
                         global_scores=global_scores,
-                        blend_global=blend_global,
+                        blend_global=blend_global if method == "hybrid" else 0.0,
                         cluster_mask=cluster_mask,
                         progress=show,
                         scale_clustering=scale_clustering,
                         logfc_space=logfc_space,
-                        hybrid=True,
+                        hybrid=(method == "hybrid"),
                         neighbor_contrast=neighbor_contrast,
                         combine=combine,
                         diag_out=clustering_diag,
@@ -945,216 +1277,722 @@ def highly_variable_genes(
                         cap_ceiling=cap_ceiling,
                         cap_merge_threshold=cap_merge_threshold,
                         spec_on_legitimate_units=spec_on_legitimate_units,
-                        graph_cache=intermediate_cache,
+                        graph_cache=intermediate_cache if n_top_is_auto else None,
                         **hvg_params,
                     )
                 )
-                if auto_meta is not None:
-                    auto_meta = dict(auto_meta)
-                    auto_meta["pool_realign"] = "hybrid_2xk"
-                    auto_meta["n_top_after_realign"] = int(len(selected))
-                    if clustering_diag.get("intermediate_reused"):
-                        auto_meta["intermediate_reused"] = True
-                        auto_meta["intermediate_reuse"] = clustering_diag.get("intermediate_reuse")
+                if method == "hybrid":
+                    selection_tag = "hybrid_global_anchor_specificity"
+                    score_type = f"hybrid_blend_global={blend_global}"
+                else:
+                    selection_tag = "cluster_vs_rest_specificity"
+                    score_type = "weighted_one_sided_logfc"
+                # per-cluster ranks for coverage auto-n
+                if n_top_is_auto and cluster_labels is not None:
+                    cluster_gene_ranks = _build_cluster_gene_ranks(
+                        adata,
+                        cluster_labels=cluster_labels,
+                        counts_layer=counts_layer,
+                        min_cluster_size=min_cluster_size,
+                        logfc_space=logfc_space,
+                    )
+            else:  # reweight
+                selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
+                    _cell_reweight_select(
+                        adata,
+                        n_top_genes=n_top_request,
+                        resolution=resolution,
+                        min_cluster_size=min_cluster_size,
+                        cluster_mask=cluster_mask,
+                        progress=show,
+                        scale_clustering=scale_clustering,
+                        logfc_space=logfc_space,
+                        n_pcs=n_pcs,
+                        n_neighbors=n_neighbors,
+                        random_state=random_state,
+                        balance_power=beta,
+                        global_rank=global_rank,
+                        batch_key=batch_key,
+                        diag_out=clustering_diag,
+                        **hvg_params,
+                    )
+                )
+                selection_tag = "cell_reweighted_global_hvg"
+                score_type = f"reweighted_{flavor}"
+
+            # --- Auto n_top: cut ranked list ---
+            if n_top_is_auto:
+                # Order by aggregated score when available, else selection order
+                if aggregated is not None:
+                    gene_order = list(
+                        aggregated.reindex(selected)
+                        .fillna(-np.inf)
+                        .sort_values(ascending=False)
+                        .index.astype(str)
+                    )
+                    # append any selected missing from aggregated
+                    seen = set(gene_order)
+                    for g in selected:
+                        gs = str(g)
+                        if gs not in seen:
+                            gene_order.append(gs)
+                    scores_desc = aggregated.reindex(gene_order).fillna(0.0).to_numpy(dtype=float)
+                else:
+                    gene_order = [str(g) for g in selected]
+                    scores_desc = np.arange(len(gene_order), 0, -1, dtype=float)
+
+                # Map auto aliases
+                n_req: int | str = n_top_genes  # type: ignore[assignment]
+                if str(n_top_genes).lower() == "auto":
+                    n_req = auto_n_method
+
+                # Silhouette is expensive and on PBMC alone picks k too small (hurts DC).
+                # Only run it when explicitly requested — not for default ensemble.
+                n_final, auto_meta = resolve_n_top_genes(
+                    n_req,
+                    scores_desc,
+                    gene_order,
+                    k_min=int(n_top_min),
+                    k_max=min(int(n_top_max), len(gene_order)),
+                    # adata: silhouette strategy + depth-aware ensemble knobs
+                    adata=adata,
+                    counts_layer=counts_layer,
+                    cluster_gene_ranks=cluster_gene_ranks,
+                    random_state=random_state,
+                    depth_aware=True,
+                )
+                # Align gene set with fixed hybrid@k: re-rank inside global top 2×k
+                # pool (k-sweep: auto on a 5k pool then cut ≠ hybrid@k). Skip for
+                # score/reweight/none and for pure geometric strategies without hybrid.
+                # Intermediate graph/specificity reused via intermediate_cache when
+                # the clustering protocol is unchanged.
+                if method == "hybrid" and n_final >= 1:
+                    selected, cluster_labels, n_clusters_used, cluster_weights, aggregated = (
+                        _score_weighted_select(
+                            adata,
+                            n_top_genes=n_final,
+                            resolution=resolution,
+                            min_cluster_size=min_cluster_size,
+                            n_pcs=n_pcs,
+                            n_neighbors=n_neighbors,
+                            random_state=random_state,
+                            balance_power=beta,
+                            global_rank=global_rank,
+                            global_scores=global_scores,
+                            blend_global=blend_global,
+                            cluster_mask=cluster_mask,
+                            progress=show,
+                            scale_clustering=scale_clustering,
+                            logfc_space=logfc_space,
+                            hybrid=True,
+                            neighbor_contrast=neighbor_contrast,
+                            combine=combine,
+                            diag_out=clustering_diag,
+                            consensus_resolutions=consensus_resolutions,
+                            allocation_method=allocation_method,
+                            cap_ceiling=cap_ceiling,
+                            cap_merge_threshold=cap_merge_threshold,
+                            spec_on_legitimate_units=spec_on_legitimate_units,
+                            graph_cache=intermediate_cache,
+                            **hvg_params,
+                        )
+                    )
+                    if auto_meta is not None:
+                        auto_meta = dict(auto_meta)
+                        auto_meta["pool_realign"] = "hybrid_2xk"
+                        auto_meta["n_top_after_realign"] = int(len(selected))
+                        if clustering_diag.get("intermediate_reused"):
+                            auto_meta["intermediate_reused"] = True
+                            auto_meta["intermediate_reuse"] = clustering_diag.get(
+                                "intermediate_reuse"
+                            )
+                    n_top_for_markers = n_final
+                elif method == "append" and n_final >= 1:
+                    _cap = min(int(append_budget_requested), max(0, int(n_final)))
+                    if _cap != int(append_budget_requested):
+                        append_budget_capped = True
+                        warnings.warn(
+                            f"append_budget={append_budget_requested} exceeds auto "
+                            f"n_top={n_final}; capping secondary append at {_cap}.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    append_budget = _cap
+                    selected, append_meta = _hvg_base_plus_append(
+                        global_scores,
+                        n_base=n_final,
+                        n_append=append_budget,
+                    )
+                    if auto_meta is not None:
+                        auto_meta = dict(auto_meta)
+                        auto_meta["pool_realign"] = "append_secondary_hvg"
+                        auto_meta["n_top_after_realign"] = int(len(selected))
+                        auto_meta["append"] = append_meta
+                    n_top_base = int(n_final)
+                    # Keep full base+append for filters/markers (do not clip to k).
+                    n_top_for_markers = int(len(selected))
+                else:
+                    selected = gene_order[:n_final]
+                    n_top_for_markers = n_final
             else:
-                selected = gene_order[:n_final]
-            n_top_for_markers = n_final
-        else:
-            n_top_for_markers = n_top_request
-            selected = selected[:n_top_for_markers]
+                if method == "append":
+                    # selected already base+append; never truncate to n_top alone.
+                    n_top_base = int(n_top_request)
+                    n_top_for_markers = int(len(selected))
+                else:
+                    n_top_for_markers = n_top_request
+                    selected = selected[:n_top_for_markers]
 
-    # Diagnostic, captured before any marker handling touches the selection: how
-    # many of the supplied markers the algorithm chose on its own. This is the
-    # number that says whether injection is worth doing at all -- forcing in
-    # markers the algorithm already rejected is what can hurt cluster purity
-    # (see the marker_genes docstring warning). A high count means injection
-    # is redundant.
-    n_markers_already_selected = (
-        None
-        if marker_genes is None
-        else int(len({str(g) for g in marker_genes} & {str(g) for g in selected}))
-    )
+        # Diagnostic, captured before any marker handling touches the selection: how
+        # many of the supplied markers the algorithm chose on its own. This is the
+        # number that says whether injection is worth doing at all -- forcing in
+        # markers the algorithm already rejected is what can hurt cluster purity
+        # (see the marker_genes docstring warning). A high count means injection
+        # is redundant.
+        n_markers_already_selected = (
+            None
+            if marker_genes is None
+            else int(len({str(g) for g in marker_genes} & {str(g) for g in selected}))
+        )
 
-    selected = _apply_gene_filters(
-        selected,
-        adata.var_names,
-        filter_mito=filter_mito,
-        filter_ribo=filter_ribo,
-        marker_genes=marker_genes if marker_mode == "force" else None,
-        # A true all-gene rank. global_rank comes from scanpy's
-        # highly_variable_rank, which is +inf outside the top-n_top, so refilling
-        # from it picked replacement genes in var_names order rather than by
-        # variability — the same defect fixed in _hybrid_anchor_select.
-        fill_rank=global_scores.rank(ascending=False, method="first"),
-        n_top_genes=n_top_for_markers,
-    )
-    if marker_mode == "force":
-        selected = _merge_markers(
+        selected = _apply_gene_filters(
             selected,
-            marker_genes,
             adata.var_names,
-            n_top_for_markers,
-            extra=marker_extra,
+            filter_mito=filter_mito,
+            filter_ribo=filter_ribo,
+            marker_genes=marker_genes if marker_mode == "force" else None,
+            # A true all-gene rank. global_rank comes from scanpy's
+            # highly_variable_rank (NaN outside the top-n_top; internal helpers
+            # treat those as +inf), so refilling from it would pick replacement
+            # genes in var_names order rather than by variability — the same
+            # defect fixed in _hybrid_anchor_select.
+            fill_rank=global_scores.rank(ascending=False, method="first"),
+            n_top_genes=n_top_for_markers,
         )
+        if marker_mode == "force":
+            selected = _merge_markers(
+                selected,
+                marker_genes,
+                adata.var_names,
+                n_top_for_markers,
+                extra=marker_extra,
+            )
 
-    n_markers_present = (
-        0 if marker_genes is None else int(sum(g in adata.var_names for g in marker_genes))
-    )
-    meta: dict[str, Any] = {
-        "flavor": flavor,
-        "n_top_genes": n_top_genes,
-        "balance_method": method,
-        "balance_power": beta if method != "none" else None,
-        "blend_global": blend_global if method == "hybrid" else None,
-        "neighbor_contrast": neighbor_contrast if method in ("hybrid", "score") else None,
-        "combine": combine if method == "hybrid" else None,
-        "cluster_pool": cluster_pool if method != "none" else None,
-        "cluster_pool_source": cluster_pool_source if method != "none" else None,
-        "consensus_resolutions": (
-            list(consensus_resolutions)
-            if consensus_resolutions and method in ("hybrid", "score")
-            else None
-        ),
-        "scale_clustering": bool(scale_clustering) if method != "none" else None,
-        "logfc_space": logfc_space if method in ("hybrid", "score") else None,
-        "allocation_method": allocation_method if method == "hybrid" else None,
-        "spec_on_legitimate_units": (
-            bool(spec_on_legitimate_units) if method in ("hybrid", "score") else None
-        ),
-        "cap_allocation": bool(cap_allocation) if method == "hybrid" else None,
-        "cap_ceiling": float(cap_ceiling)
-        if method == "hybrid" and allocation_method == "cap"
-        else None,
-        "cap_merge_threshold": (
-            cap_merge_threshold
-            if method == "hybrid" and allocation_method in ("cap", "coverage")
-            else None
-        ),
-        "global_score": "injected" if global_score is not None else None,
-        # What the caller asked for, and what actually ran. With
-        # resolution="auto" these differ, and the second is the one a reader
-        # needs to reproduce the partition.
-        "resolution": resolution if method != "none" else None,
-        "resolution_used": (clustering_diag.get("resolution") if method != "none" else None),
-        "min_cluster_size": min_cluster_size if method != "none" else None,
-        "n_clusters_used": n_clusters_used,
-        "cluster_weights": cluster_weights,
-        "n_pcs": n_pcs if method != "none" else None,
-        "n_neighbors": n_neighbors if method != "none" else None,
-        # Full record of the intermediate clustering, which the balanced
-        # methods run and then discard. Exposed so a caller can reuse or
-        # audit it instead of re-deriving PCA/neighbour/resolution settings by
-        # hand -- see the `clustering` entry in the docstring.
-        "clustering": clustering_diag or None,
-        "counts_layer": counts_layer,
-        "filter_mito": filter_mito,
-        "filter_ribo": filter_ribo,
-        "marker_mode": marker_mode if marker_genes else None,
-        "marker_extra": marker_extra if marker_mode == "force" else None,
-        "n_marker_genes": n_markers_present,
-        "n_marker_genes_already_selected": n_markers_already_selected,
-        "n_highly_variable_final": len(selected),
-        "n_top_genes_request": n_top_genes if not n_top_is_auto else str(n_top_genes),
-        "n_top_genes_used": n_top_for_markers,
-        "auto_n": auto_meta,
-        "random_state": random_state,
-        "selection": selection_tag,
-        "score_type": score_type,
-    }
-    if diagnose:
-        auto_strat = None
-        if isinstance(auto_meta, dict):
-            auto_strat = auto_meta.get("strategy")
-        meta["diagnosis"] = diagnose_hvg_run(
-            balance_method=method,
-            n_top_genes_used=n_top_for_markers,
-            n_top_is_auto=n_top_is_auto,
-            auto_n_strategy=str(auto_strat) if auto_strat else None,
-            # the resolved number, not the request: with resolution="auto" the
-            # nc_low_resolution guard would otherwise never fire, since "auto"
-            # is not comparable to 0.75 at the parameter-only stage.
-            resolution=(
-                clustering_diag.get("resolution", resolution) if method != "none" else None
+        n_markers_present = (
+            0 if marker_genes is None else int(sum(g in adata.var_names for g in marker_genes))
+        )
+        # Full resolved research/secondary bag for reproducibility (batch_key,
+        # seurat mean/disp bounds, n_top_min/max, …). global_score is not
+        # serialisable as a Series — record presence only.
+        from dataclasses import asdict as _asdict
+
+        from .._version import __version__ as _scfair_version
+
+        _opt_rec = _asdict(opt)
+        if _opt_rec.get("global_score") is not None:
+            _opt_rec["global_score"] = "injected"
+        if _opt_rec.get("cluster_genes") is not None:
+            _opt_rec["cluster_genes"] = [str(g) for g in _opt_rec["cluster_genes"]]
+        if _opt_rec.get("consensus_resolutions") is not None:
+            _opt_rec["consensus_resolutions"] = [
+                float(r) for r in _opt_rec["consensus_resolutions"]
+            ]
+        if _opt_rec.get("max_disp") is not None and not np.isfinite(float(_opt_rec["max_disp"])):
+            _opt_rec["max_disp"] = "inf"
+
+        meta: dict[str, Any] = {
+            "scfair_version": _scfair_version,
+            "flavor": hvg_run_meta.get("flavor_used", flavor),
+            "flavor_requested": hvg_run_meta.get("flavor_requested", flavor),
+            "flavor_used": hvg_run_meta.get("flavor_used", flavor),
+            "fallback_reason": hvg_run_meta.get("fallback_reason"),
+            "strict": bool(strict),
+            "options": _opt_rec,
+            "n_top_min": int(n_top_min),
+            "n_top_max": int(n_top_max),
+            "auto_n_method": str(auto_n_method) if n_top_is_auto else None,
+            "batch_key": batch_key,
+            "n_top_genes": n_top_genes,
+            "balance_method": method,
+            "mode": hvg_mode,
+            "mode_info": {
+                k: mode_info.get(k)
+                for k in (
+                    "mode",
+                    "n_top_floor",
+                    "append_budget",
+                    "allow_short_soft_buffer",
+                    "cluster_resolution",
+                    "reasons",
+                    "auto",
+                    "note",
+                )
+                if k in mode_info
+            },
+            "downstream_clustering": {
+                "tier": "fine" if hvg_mode == "fine" else "coarse",
+                "resolution": float(mode_info.get("cluster_resolution") or 0.8),
+                "auto": True,
+                "from_hvg_mode": hvg_mode,
+            },
+            "balance_power": beta if method not in ("none", "append") else None,
+            "blend_global": blend_global if method == "hybrid" else None,
+            "neighbor_contrast": neighbor_contrast if method in ("hybrid", "score") else None,
+            "combine": combine if method == "hybrid" else None,
+            "append_budget": int(append_budget) if method == "append" else None,
+            "append_budget_requested": (
+                int(append_budget_requested) if method == "append" else None
             ),
-            neighbor_contrast=neighbor_contrast if method in ("hybrid", "score") else 0.0,
-            min_cluster_size=min_cluster_size if method != "none" else None,
-            clustering=clustering_diag or None,
-            n_clusters_used=n_clusters_used,
-            config_check=config_check,
-            log=True,
+            "append_budget_capped": bool(append_budget_capped) if method == "append" else None,
+            "append": append_meta if method == "append" else None,
+            "store_raw": effective_store_raw,
+            "counts_integer_like": counts_validate_info.get("counts_integer_like"),
+            "counts_warning": counts_validate_info.get("counts_warning"),
+            "cluster_pool": cluster_pool if method not in ("none", "append") else None,
+            "cluster_pool_source": (
+                cluster_pool_source if method not in ("none", "append") else None
+            ),
+            "consensus_resolutions": (
+                list(consensus_resolutions)
+                if consensus_resolutions and method in ("hybrid", "score")
+                else None
+            ),
+            "scale_clustering": (
+                bool(scale_clustering) if method not in ("none", "append") else None
+            ),
+            "logfc_space": logfc_space if method in ("hybrid", "score") else None,
+            # Requested allocation arm (hybrid only). Outcome status lives under
+            # clustering["{arm}_allocation_status"] — never a second
+            # allocation_method key there (request vs used was ambiguous).
+            "allocation_method": allocation_method if method == "hybrid" else None,
+            "allocation_status": (
+                clustering_diag.get(f"{allocation_method}_allocation_status")
+                if method == "hybrid"
+                and allocation_method in ("coverage", "starved_topup")
+                and clustering_diag
+                else None
+            ),
+            "spec_on_legitimate_units": (
+                bool(spec_on_legitimate_units) if method in ("hybrid", "score") else None
+            ),
+            "cap_allocation": False,  # removed 0.2.0; always off
+            "cap_ceiling": None,
+            "unit_merge_threshold": (
+                cap_merge_threshold
+                if method == "hybrid" and allocation_method in ("coverage", "starved_topup")
+                else None
+            ),
+            # alias for older readers / scripts
+            "cap_merge_threshold": (
+                cap_merge_threshold
+                if method == "hybrid" and allocation_method in ("coverage", "starved_topup")
+                else None
+            ),
+            "global_score": "injected" if global_score is not None else None,
+            # What the caller asked for, and what actually ran. With
+            # resolution="auto" these differ, and the second is the one a reader
+            # needs to reproduce the partition.
+            "resolution": resolution if method not in ("none", "append") else None,
+            "resolution_used": (
+                clustering_diag.get("resolution") if method not in ("none", "append") else None
+            ),
+            "min_cluster_size": (min_cluster_size if method not in ("none", "append") else None),
+            "n_clusters_used": n_clusters_used,
+            "cluster_weights": cluster_weights,
+            "n_pcs": n_pcs if method not in ("none", "append") else None,
+            "n_neighbors": n_neighbors if method not in ("none", "append") else None,
+            # Full record of the intermediate clustering, which the balanced
+            # methods run and then discard. Exposed so a caller can reuse or
+            # audit it instead of re-deriving PCA/neighbour/resolution settings by
+            # hand -- see the `clustering` entry in the docstring.
+            "clustering": clustering_diag or None,
+            "counts_layer": counts_layer,
+            "filter_mito": filter_mito,
+            "filter_ribo": filter_ribo,
+            "marker_mode": marker_mode if marker_genes else None,
+            "marker_extra": marker_extra if marker_mode == "force" else None,
+            "n_marker_genes": n_markers_present,
+            "n_marker_genes_already_selected": n_markers_already_selected,
+            "n_highly_variable_final": len(selected),
+            "n_top_genes_request": n_top_genes if not n_top_is_auto else str(n_top_genes),
+            # For append: report frozen base k (not base+budget). Final mask
+            # size is n_highly_variable_final / append.n_final.
+            "n_top_genes_used": (
+                int(n_top_base)
+                if method == "append" and n_top_base is not None
+                else n_top_for_markers
+            ),
+            "auto_n": auto_meta,
+            "random_state": random_state,
+            "selection": selection_tag,
+            "score_type": score_type,
+            "scfair_score_note": (
+                "For append: scfair_score is global variability (same ranking as "
+                "the base + secondary list). For hybrid: scfair_score is the "
+                "pool-normalized blend used for selection; genes outside the "
+                "global top-(2×k) pool are NaN."
+            ),
+        }
+        # Hybrid/score with zero usable clusters is pure global HVG. Rewrite
+        # selection so method-comparison scripts do not count it as a valid
+        # hybrid observation; always surface via warnings (not only diagnose).
+        if method in ("hybrid", "score") and int(n_clusters_used) == 0:
+            if method == "hybrid":
+                selection_tag = "hybrid_degenerated_to_global"
+                score_type = "global_variability_fallback"
+            else:
+                selection_tag = "score_degenerated_to_global"
+                score_type = "global_variability_fallback"
+            meta["selection"] = selection_tag
+            meta["score_type"] = score_type
+            meta["degenerated_to_global"] = True
+            warnings.warn(
+                f"balance_method={method!r} found no usable intermediate clusters "
+                f"(n_clusters_used=0; often min_cluster_size too high). "
+                "Cluster-vs-rest specificity has no signal → result ≈ scanpy "
+                f"global HVG. Recorded selection={selection_tag!r} so this is "
+                "not counted as a successful hybrid/score run. Lower "
+                "min_cluster_size, or use balance_method='none'/'append'.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Auto (or large fixed k) selecting nearly all genes is a no-op HVG step.
+        # Threshold 80%: structure rules that clip to n_vars on small matrices often
+        # land at 100% with no signal that the rule failed to discriminate.
+        # For append, judge on the frozen base k (not base+m which can fill a
+        # small test matrix without implying identity base selection).
+        _k_for_identity = (
+            int(n_top_for_markers) if isinstance(n_top_for_markers, (int, np.integer)) else None
         )
-    # Closing line on the same channel as the stage announcements. Without it
-    # `progress` reports three stages *starting* and never reports the call
-    # finishing or what it produced — so a user watching stderr cannot tell a
-    # completed run from one still inside the slow step. The equivalent summary
-    # existed only on the logger, i.e. invisible to anyone who has not
-    # configured logging.
-    if method == "none":
-        _progress(show, "done: %d genes (global HVG, no clustering).", len(selected))
+        if method == "append" and isinstance(append_meta, dict) and "n_base" in append_meta:
+            _k_for_identity = int(append_meta["n_base"])
+        if (
+            _k_for_identity is not None
+            and adata.n_vars >= 10
+            and _k_for_identity >= max(10, int(0.8 * adata.n_vars))
+        ):
+            warnings.warn(
+                f"n_top_genes resolved to {_k_for_identity} of {adata.n_vars} genes "
+                f"({100.0 * _k_for_identity / adata.n_vars:.0f}% of the matrix). "
+                "HVG selection is nearly identity — structure/auto rules may not have "
+                "discriminated on this matrix size. Pass a smaller integer n_top_genes "
+                "(default 2000) or lower n_top_max / options.n_top_max.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Final mask (base+append) covering >50% of genes on panels / CITE / spatial
+        # is effectively a soft no-op filter — surface explicitly.
+        n_sel_final = int(len(selected))
+        if (
+            method == "append"
+            and adata.n_vars >= 10
+            and n_sel_final > max(10, int(0.5 * adata.n_vars))
+        ):
+            warnings.warn(
+                f"append selection kept {n_sel_final}/{adata.n_vars} genes "
+                f"({100.0 * n_sel_final / adata.n_vars:.0f}% of the matrix). "
+                "On small gene sets (panels, CITE-seq, spatial) absolute "
+                "append_budget can dominate; use options=HVGOptions(append_budget=0) "
+                "or a smaller budget relative to n_top_genes.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if diagnose:
+            auto_strat = None
+            structure_meta = None
+            if isinstance(auto_meta, dict):
+                auto_strat = auto_meta.get("strategy")
+                # Nested detail from estimate_n_top_structure (rule_branch, features).
+                raw_st = auto_meta.get("structure")
+                if isinstance(raw_st, dict):
+                    structure_meta = raw_st
+            # Diagnose on base k for append (not base+budget), else tips claim
+            # "floored n_top=2200" when the resolved base was 2000 / 1000.
+            _diag_k = (
+                int(n_top_base)
+                if method == "append" and n_top_base is not None
+                else n_top_for_markers
+            )
+            meta["diagnosis"] = diagnose_hvg_run(
+                balance_method=method,
+                n_top_genes_used=_diag_k,
+                n_top_is_auto=n_top_is_auto,
+                auto_n_strategy=str(auto_strat) if auto_strat else None,
+                structure_meta=structure_meta,
+                # the resolved number, not the request: with resolution="auto" the
+                # nc_low_resolution guard would otherwise never fire, since "auto"
+                # is not comparable to 0.75 at the parameter-only stage.
+                resolution=(
+                    clustering_diag.get("resolution", resolution) if method != "none" else None
+                ),
+                neighbor_contrast=neighbor_contrast if method in ("hybrid", "score") else 0.0,
+                min_cluster_size=min_cluster_size if method != "none" else None,
+                clustering=clustering_diag or None,
+                n_clusters_used=n_clusters_used,
+                config_check=config_check,
+                log=True,
+            )
+        # Closing line on the same channel as the stage announcements. Without it
+        # `progress` reports three stages *starting* and never reports the call
+        # finishing or what it produced — so a user watching stderr cannot tell a
+        # completed run from one still inside the slow step. The equivalent summary
+        # existed only on the logger, i.e. invisible to anyone who has not
+        # configured logging.
+        if method == "none":
+            _progress(show, "done: %d genes (global HVG, no clustering).", len(selected))
+        elif method == "append":
+            n_base = (
+                int(append_meta["n_base"])
+                if isinstance(append_meta, dict) and "n_base" in append_meta
+                else max(0, len(selected) - int(append_budget))
+            )
+            n_extra = (
+                int(append_meta["n_append_used"])
+                if isinstance(append_meta, dict) and "n_append_used" in append_meta
+                else max(0, len(selected) - n_base)
+            )
+            _progress(
+                show,
+                "done: %d genes (global HVG base %d + %d secondary append; no clustering).",
+                len(selected),
+                n_base,
+                n_extra,
+            )
+        else:
+            res_used = clustering_diag.get("resolution")
+            src = clustering_diag.get("resolution_source")
+            kept = clustering_diag.get("n_clusters_kept")
+            # `n_clusters_used` (produced a specificity score) is lower than
+            # `n_clusters_kept` (passed min_cluster_size) whenever a kept cluster
+            # spans every cell, so there is no "rest" to contrast it against. Show
+            # both when they disagree — the gap is the thing worth noticing.
+            scored = (
+                f"{n_clusters_used} of {kept}"
+                if isinstance(kept, int) and kept != n_clusters_used
+                else f"{n_clusters_used}"
+            )
+            _progress(
+                show,
+                "done: %d genes, scored against %s intermediate clusters at resolution %s%s.",
+                len(selected),
+                scored,
+                f"{res_used:.3g}" if isinstance(res_used, float) else res_used,
+                {
+                    "density_field": " (chosen from the density field)",
+                    "fallback": " (density field unusable; fell back)",
+                }.get(str(src), ""),
+            )
+
+        # Tips were computed above (diagnose_hvg_run) but only reached the caller
+        # via adata.uns and Python's logging module -- invisible on this same
+        # stderr channel unless logging happens to be configured. Show them here
+        # too, right after the call reports done, so `progress=True` alone is
+        # enough to see them.
+        if diagnose and isinstance(meta.get("diagnosis"), dict):
+            for tip in meta["diagnosis"].get("tips") or []:
+                _progress(show, "tip: %s", tip)
+
+        result = _apply_selection(
+            adata,
+            selected=selected,
+            aggregated_score=aggregated,
+            global_scores=global_scores,
+            cluster_labels=cluster_labels,
+            meta=meta,
+            prior_scanpy_hvg=_prior_scanpy_hvg,
+        )
+
+        # Ephemeral internals: drop rather than leave matrices the size of .X
+        # on the caller's object (they would also be written by write_h5ad()).
+        adata.layers.pop("_scfair_log", None)
+        adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
+
+        if subset:
+            adata._inplace_subset_var(adata.var["highly_variable"].to_numpy())
+
+        if inplace:
+            return None
+        return result
+
+    except Exception as _hvg_exc:
+        _rollback_adata_after_failure(adata, _hvg_snap, _hvg_exc)
+        raise
+
+
+def _validate_counts_matrix(
+    adata: Any,
+    *,
+    counts_layer: str,
+    flavor: str | None = None,
+    span: float = 0.3,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Hard-fail on non-finite, negative, or degenerate counts used for HVG.
+
+    Also pre-empts seurat_v3 loess segfaults on tiny gene sets (n_vars too small
+    for span) and surfaces non-integer / log-normalized input via UserWarning
+    (or raise when ``strict=True``).
+
+    Returns a small diagnostic dict for ``uns['scfair']['hvg']`` (e.g.
+    ``counts_integer_like``).
+    """
+    info: dict[str, Any] = {
+        "counts_integer_like": None,
+        "counts_warning": None,
+        "n_vars": int(getattr(adata, "n_vars", 0) or 0),
+    }
+    if counts_layer in getattr(adata, "layers", {}):
+        X = adata.layers[counts_layer]
+        where = f"layers[{counts_layer!r}]"
     else:
-        res_used = clustering_diag.get("resolution")
-        src = clustering_diag.get("resolution_source")
-        kept = clustering_diag.get("n_clusters_kept")
-        # `n_clusters_used` (produced a specificity score) is lower than
-        # `n_clusters_kept` (passed min_cluster_size) whenever a kept cluster
-        # spans every cell, so there is no "rest" to contrast it against. Show
-        # both when they disagree — the gap is the thing worth noticing.
-        scored = (
-            f"{n_clusters_used} of {kept}"
-            if isinstance(kept, int) and kept != n_clusters_used
-            else f"{n_clusters_used}"
+        X = adata.X
+        where = ".X"
+    if X is None:
+        raise ValueError("counts matrix is missing (X and layers are empty).")
+
+    # --- finite / non-negative checks on stored values only (no full densify) ---
+    if sparse.issparse(X):
+        data = X.data
+        if data is None or data.size == 0:
+            raise ValueError(
+                f"counts matrix {where} is empty/all-zero (no stored non-zeros). "
+                "scFair cannot select HVGs from a degenerate counts matrix. "
+                "Check that layers['counts'] (or .X) holds real raw counts."
+            )
+        # Work on the CSR/CSC .data buffer — never materialise a dense copy.
+        if not np.isfinite(data).all():
+            n_bad = int(np.size(data) - np.isfinite(data).sum())
+            raise ValueError(
+                f"counts matrix contains {n_bad} non-finite value(s) (NaN/Inf). "
+                "scFair requires finite raw counts (or a finite counts layer)."
+            )
+        if np.any(data < 0):
+            n_neg = int(np.sum(data < 0))
+            raise ValueError(
+                f"counts matrix contains {n_neg} negative value(s). "
+                "flavor='seurat_v3' and related count HVG methods require non-negative "
+                "counts. Restore raw counts (e.g. layers['counts']) before calling."
+            )
+        row_sums = np.asarray(X.sum(axis=1)).ravel()
+        # getnnz avoids building a full boolean sparse matrix via (X != 0).
+        try:
+            col_nnz = np.asarray(X.getnnz(axis=0)).ravel()
+        except Exception:  # pragma: no cover — older scipy
+            col_nnz = np.asarray((X != 0).sum(axis=0)).ravel()
+    else:
+        # Dense: check finiteness / negativity without an extra full ravel copy
+        # when possible (views share memory with X).
+        arr = np.asarray(X)
+        if arr.size == 0:
+            raise ValueError(f"counts matrix {where} is empty.")
+        if arr.ndim != 2:
+            return info
+        if not np.isfinite(arr).all():
+            n_bad = int(arr.size - np.isfinite(arr).sum())
+            raise ValueError(
+                f"counts matrix contains {n_bad} non-finite value(s) (NaN/Inf). "
+                "scFair requires finite raw counts (or a finite counts layer)."
+            )
+        if np.any(arr < 0):
+            n_neg = int(np.sum(arr < 0))
+            raise ValueError(
+                f"counts matrix contains {n_neg} negative value(s). "
+                "flavor='seurat_v3' and related count HVG methods require non-negative "
+                "counts. Restore raw counts (e.g. layers['counts']) before calling."
+            )
+        if not np.any(arr):
+            raise ValueError(
+                f"counts matrix {where} is all zeros. "
+                "scFair cannot select HVGs from a degenerate counts matrix. "
+                "Check that layers['counts'] (or .X) holds real raw counts "
+                "(a placeholder zeros matrix will crash later in PCA/ARPACK)."
+            )
+        row_sums = arr.sum(axis=1)
+        col_nnz = np.count_nonzero(arr, axis=0)
+
+    n_empty_cells = int(np.sum(row_sums <= 0))
+    if n_empty_cells == int(X.shape[0]):
+        raise ValueError(
+            f"every cell has zero total counts in {where}. "
+            "Filter empty barcodes or restore a real counts matrix."
         )
-        _progress(
-            show,
-            "done: %d genes, scored against %s intermediate clusters at resolution %s%s.",
-            len(selected),
-            scored,
-            f"{res_used:.3g}" if isinstance(res_used, float) else res_used,
-            {
-                "density_field": " (chosen from the density field)",
-                "fallback": " (density field unusable; fell back)",
-            }.get(str(src), ""),
+    if n_empty_cells > 0 and n_empty_cells >= max(1, int(0.5 * X.shape[0])):
+        warnings.warn(
+            f"{n_empty_cells}/{X.shape[0]} cells have zero total counts in {where}; "
+            "PCA/neighbours may be unstable. Filter empty barcodes before HVG.",
+            UserWarning,
+            stacklevel=3,
+        )
+    n_dead_genes = int(np.sum(col_nnz == 0))
+    n_live = int(X.shape[1]) - n_dead_genes
+    if n_live < 2:
+        raise ValueError(
+            f"counts matrix {where} has fewer than 2 genes with any non-zero "
+            f"entry ({n_live} live / {X.shape[1]} total). Cannot run HVG/PCA."
         )
 
-    # Tips were computed above (diagnose_hvg_run) but only reached the caller
-    # via adata.uns and Python's logging module -- invisible on this same
-    # stderr channel unless logging happens to be configured. Show them here
-    # too, right after the call reports done, so `progress=True` alone is
-    # enough to see them.
-    if diagnose and isinstance(meta.get("diagnosis"), dict):
-        for tip in meta["diagnosis"].get("tips") or []:
-            _progress(show, "tip: %s", tip)
+    # Integer-like check (log-normalized .X snapshotted as "counts" is a
+    # common footgun). Surface as UserWarning + record; strict → raise.
+    is_int = bool(_is_integer_counts_like(X))
+    info["counts_integer_like"] = is_int
+    if not is_int:
+        msg = (
+            f"counts matrix {where} does not look like raw integer counts "
+            "(values are non-integer or fractional). seurat_v3 / "
+            "pearson_residuals expect UMI counts; log1p-normalized input "
+            "yields unreliable HVGs. Restore raw counts before calling, "
+            "or pass layer= pointing at a true counts matrix."
+        )
+        info["counts_warning"] = "non_integer_counts"
+        if strict:
+            raise ValueError(msg + " (strict=True)")
+        warnings.warn(msg, UserWarning, stacklevel=3)
+        logger.warning(msg)
 
-    result = _apply_selection(
-        adata,
-        selected=selected,
-        aggregated_score=aggregated,
-        global_scores=global_scores,
-        cluster_labels=cluster_labels,
-        meta=meta,
-    )
+    # seurat_v3 loess (skmisc) segfaults in C when n_vars is too small for
+    # span — not a catchable Python exception. Record here; _run_hvg falls
+    # back to seurat when strict=False, or raises when strict=True.
+    if flavor in ("seurat_v3", "seurat_v3_paper"):
+        span_f = float(span) if span and float(span) > 0 else 0.3
+        min_genes = max(10, int(np.ceil(2.0 / span_f)))
+        n_vars = int(X.shape[1])
+        if n_vars < min_genes:
+            msg = (
+                f"flavor={flavor!r} (loess span={span_f}) needs at least "
+                f"{min_genes} genes to fit safely; got n_vars={n_vars}. "
+                "Use more genes, or flavor='seurat' / a non-loess method."
+            )
+            info["counts_warning"] = "n_vars_too_small_for_loess"
+            info["loess_min_genes"] = min_genes
+            if strict:
+                raise ValueError(msg + " (strict=True)")
+            # Non-strict: _run_hvg will fall back to seurat before calling loess.
+            warnings.warn(
+                msg + " Will fall back to flavor='seurat' if HVG proceeds.",
+                UserWarning,
+                stacklevel=3,
+            )
 
-    # The log-flavor path materialises a full-size "_scfair_log" layer on the
-    # caller's object. It is an internal intermediate, so drop it rather than
-    # leaving an undocumented matrix the size of .X behind (it would also be
-    # silently written out by a later adata.write_h5ad()).
-    adata.layers.pop("_scfair_log", None)
-
-    if subset:
-        adata._inplace_subset_var(adata.var["highly_variable"].to_numpy())
-
-    if inplace:
-        return None
-    return result
+    return info
 
 
 def _resolve_balance_power(balance_method: str | None, balance_power: float | None) -> float:
+    """Size weight exponent: ``w_c ∝ n_c^β`` (normalized).
+
+    ``β > 0`` up-weights large clusters; ``β = 0`` is equal weight; ``β < 0``
+    up-weights small clusters (true inverse-size). Allowed range ``[-2, 2]``.
+    """
     if balance_power is not None:
-        if balance_power < 0:
-            raise ValueError("balance_power (β) must be >= 0.")
-        return float(balance_power)
+        p = float(balance_power)
+        if p < -2.0 or p > 2.0:
+            raise ValueError(
+                f"balance_power (β) must be in [-2, 2], got {p}. "
+                "β>0 up-weights large clusters; β=0 equal weight; β<0 up-weights small."
+            )
+        return p
     if balance_method == "inverse_size":
-        return 0.0
+        # True inverse size-weighting (small clusters get higher mass).
+        return -1.0
     return 0.5
 
 
@@ -1171,8 +2009,55 @@ def _run_hvg(
     min_disp: float,
     max_disp: float,
     batch_key: str | None,
-) -> None:
-    """Run HVG in place; fall back seurat_v3* → seurat on numerical failure."""
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Run HVG in place; optionally fall back seurat_v3* → seurat.
+
+    Returns
+    -------
+    dict
+        ``flavor_requested``, ``flavor_used``, ``fallback_reason`` (or None).
+    """
+    meta = {
+        "flavor_requested": str(flavor),
+        "flavor_used": str(flavor),
+        "fallback_reason": None,
+    }
+    # Drop leftover score columns before any flavor run (G3).
+    _clear_scanpy_hvg_var_columns(adata)
+    # Pre-empt loess C segfault: n_vars too small for span is not catchable.
+    if flavor in ("seurat_v3", "seurat_v3_paper"):
+        span_f = float(span) if span and float(span) > 0 else 0.3
+        min_genes = max(10, int(np.ceil(2.0 / span_f)))
+        if int(adata.n_vars) < min_genes:
+            reason = (
+                f"flavor={flavor!r} (loess span={span_f}) needs ≥{min_genes} genes; "
+                f"got n_vars={adata.n_vars}; falling back to flavor='seurat'."
+            )
+            if strict:
+                raise ValueError(
+                    f"flavor={flavor!r} (loess span={span_f}) needs ≥{min_genes} genes; "
+                    f"got n_vars={adata.n_vars}. (strict=True)"
+                )
+            warnings.warn(reason, UserWarning, stacklevel=3)
+            logger.warning(reason)
+            _clear_scanpy_hvg_var_columns(adata)
+            _run_hvg_once(
+                adata,
+                n_top_genes=n_top_genes,
+                flavor="seurat",
+                counts_layer=counts_layer,
+                span=span,
+                n_bins=n_bins,
+                min_mean=min_mean,
+                max_mean=max_mean,
+                min_disp=min_disp,
+                max_disp=max_disp,
+                batch_key=batch_key,
+            )
+            meta["flavor_used"] = "seurat"
+            meta["fallback_reason"] = f"n_vars_too_small_for_loess:{adata.n_vars}<{min_genes}"
+            return meta
     try:
         _run_hvg_once(
             adata,
@@ -1187,15 +2072,21 @@ def _run_hvg(
             max_disp=max_disp,
             batch_key=batch_key,
         )
-    except Exception as exc:
+        return meta
+    except _RECOVERABLE_ERRORS as exc:
         if flavor not in ("seurat_v3", "seurat_v3_paper"):
             raise
-        logger.warning(
-            "HVG flavor=%r failed (%s: %s); falling back to flavor='seurat' on log-normalized counts.",
-            flavor,
-            type(exc).__name__,
-            exc,
+        reason = (
+            f"flavor={flavor!r} failed ({type(exc).__name__}: {exc}); "
+            "falling back to flavor='seurat' on log-normalized counts."
         )
+        if strict:
+            raise RuntimeError(
+                f"{reason} (strict=True; set strict=False to allow fallback.)"
+            ) from exc
+        warnings.warn(reason, UserWarning, stacklevel=3)
+        logger.warning(reason)
+        _clear_scanpy_hvg_var_columns(adata)
         _run_hvg_once(
             adata,
             n_top_genes=n_top_genes,
@@ -1209,6 +2100,21 @@ def _run_hvg(
             max_disp=max_disp,
             batch_key=batch_key,
         )
+        meta["flavor_used"] = "seurat"
+        meta["fallback_reason"] = f"{type(exc).__name__}: {exc}"
+        return meta
+
+
+def _clear_scanpy_hvg_var_columns(adata: Any) -> None:
+    """Drop scanpy HVG score / mask columns left by a previous flavor run.
+
+    Without this, a second call with a different flavor can leave e.g.
+    ``variances_norm`` in place while writing ``residual_variances``;
+    score readers then silently reuse the *previous* flavor's column.
+    """
+    drop = [c for c in _SCANPY_HVG_VAR_COLS if c in adata.var.columns]
+    if drop:
+        adata.var.drop(columns=drop, inplace=True, errors="ignore")
 
 
 def _run_hvg_once(
@@ -1296,7 +2202,38 @@ def _materialize_flavor_matrix(adata: Any, *, flavor: str, counts_layer: str) ->
     return None
 
 
-def _variability_raw_scores(adata: Any) -> pd.Series:
+def _variability_raw_scores(
+    adata: Any,
+    *,
+    flavor: str | None = None,
+    flavor_used: str | None = None,
+) -> pd.Series:
+    """All-gene variability scores for ranking / append / hybrid pool.
+
+    When ``flavor`` / ``flavor_used`` is set, only that flavor's scanpy score
+    column is read (no priority walk across leftover columns from a prior
+    call). Prefer ``flavor_used`` when seurat_v3 fell back to seurat.
+    """
+    use_flavor = flavor_used or flavor
+    if use_flavor is not None:
+        cols = _FLAVOR_SCORE_COLS.get(str(use_flavor))
+        if cols is None:
+            # Unknown / injected — fall through to generic probe below.
+            cols = ()
+        for col in cols:
+            if col in adata.var.columns:
+                s = pd.to_numeric(adata.var[col], errors="coerce")
+                s = s.reindex(adata.var_names)
+                fill = float(np.nanmin(s.to_numpy())) if s.notna().any() else 0.0
+                return s.fillna(fill)
+        if cols:
+            raise ValueError(
+                f"flavor={use_flavor!r} finished without writing score column(s) "
+                f"{list(cols)} on adata.var. Cannot build global variability "
+                "scores. Re-run highly_variable_genes or check the flavor path."
+            )
+
+    # Legacy / no-flavor probe (e.g. injected global_score path helpers).
     for col in (
         "variances_norm",
         "dispersions_norm",
@@ -1322,11 +2259,11 @@ def _unit_rank_scores(raw: pd.Series) -> pd.Series:
     return (r - 1.0) / denom
 
 
-def _gene_rank_series(adata: Any) -> pd.Series:
+def _gene_rank_series(adata: Any, *, flavor: str | None = None) -> pd.Series:
     if "highly_variable_rank" in adata.var.columns:
         rank = pd.to_numeric(adata.var["highly_variable_rank"], errors="coerce")
     else:
-        scores = _variability_raw_scores(adata)
+        scores = _variability_raw_scores(adata, flavor=flavor)
         rank = scores.rank(ascending=False, method="average")
     return rank.reindex(adata.var_names).fillna(np.inf)
 
@@ -1339,14 +2276,54 @@ def _top_genes_from_scores(scores: pd.Series, n_top: int) -> list[str]:
     return list(scores.sort_values(ascending=False).index[:n_top])
 
 
+def _hvg_base_plus_append(
+    scores: pd.Series,
+    *,
+    n_base: int,
+    n_append: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Freeze global top-``n_base``, append the next ``n_append`` by the same score.
+
+    No intermediate clustering, no re-ranking inside a 2× pool. Base genes are
+    never dropped for append slots (zero-sum displacement avoided).
+    """
+    n_base = max(0, int(n_base))
+    n_append = max(0, int(n_append))
+    order = [str(g) for g in scores.sort_values(ascending=False, kind="stable").index]
+    if n_base <= 0:
+        base: list[str] = []
+    else:
+        base = order[: min(n_base, len(order))]
+    base_set = set(base)
+    extra = [g for g in order[len(base) :] if g not in base_set][:n_append]
+    selected = base + extra
+    meta = {
+        "n_base": len(base),
+        "n_append_requested": n_append,
+        "n_append_used": len(extra),
+        "n_final": len(selected),
+        "append_source": "secondary_global_hvg",
+    }
+    return selected, meta
+
+
 def _cluster_size_weights(sizes: pd.Series, power: float) -> pd.Series:
-    """``w_c ∝ n_c^{power}``, normalized to sum 1."""
+    """``w_c ∝ n_c^{power}``, normalized to sum 1.
+
+    ``power > 0``: large clusters weigh more; ``0``: equal; ``< 0``: small
+    clusters weigh more (inverse size).
+    """
     n = sizes.to_numpy(dtype=float)
+    n = np.maximum(n, 1.0)  # guard for empty / zero sizes
     if power == 0:
         w = np.ones_like(n, dtype=float)
     else:
-        w = np.power(n, power)
-    w = w / w.sum()
+        w = np.power(n, float(power))
+    s = float(w.sum())
+    if not np.isfinite(s) or s <= 0:
+        w = np.ones_like(n, dtype=float)
+        s = float(w.sum())
+    w = w / s
     return pd.Series(w, index=sizes.index)
 
 
@@ -1518,7 +2495,7 @@ def _cluster_on_hvgs(
     n_pcs: int,
     n_neighbors: int,
     random_state: int,
-    scale_clustering: bool = False,
+    scale_clustering: bool = True,
     diag_out: dict[str, Any] | None = None,
     resolutions: Sequence[float] | None = None,
     progress: bool = False,
@@ -1547,9 +2524,9 @@ def _cluster_on_hvgs(
     sc.pp.log1p(ad_hvg)
 
     if scale_clustering:
-        # Experimental. Zero-centring before PCA is what a standard scanpy
-        # workflow does; omitting it here lets highly expressed genes dominate
-        # the intermediate populations.
+        # Default True: zero-centre before PCA (standard scanpy). Without this,
+        # high-expression genes dominate intermediate structure and multi-type
+        # partitions often collapse to 2 communities.
         sc.pp.scale(ad_hvg, max_value=10)
 
     n_pcs_use = min(n_pcs, ad_hvg.n_vars - 1, ad_hvg.n_obs - 1)
@@ -1668,7 +2645,7 @@ def _prepare_clusters(
     n_top_genes: int,
     cluster_mask: np.ndarray | None = None,
     progress: bool = False,
-    scale_clustering: bool = False,
+    scale_clustering: bool = True,
     logfc_space: str = "log1p",
     diag_out: dict[str, Any] | None = None,
     resolutions: Sequence[float] | None = None,
@@ -1702,7 +2679,7 @@ def _prepare_clusters(
         hvg_mask = adata.var["highly_variable"].to_numpy()
     if int(hvg_mask.sum()) < 2:
         logger.warning("Global HVG selected <2 genes; cannot cluster.")
-        return None, None, {}
+        return None, None, {}, None
 
     graph_proto = {
         "mask_sig": _hvg_mask_signature(hvg_mask),
@@ -1847,6 +2824,9 @@ def _prepare_clusters(
         # The totals matter for the same reason: a run with 15 Leiden communities
         # of which 6 fall under min_cluster_size scores on 9, and the dropped ones
         # are exactly the rare populations the balancing is meant to protect.
+        n_cells = int(sizes.sum()) if len(sizes) else 0
+        min_size = int(sizes.min()) if len(sizes) else 0
+        min_frac = float(min_size / n_cells) if n_cells > 0 else None
         diag_out.update(
             {
                 "min_cluster_size": int(min_cluster_size),
@@ -1854,6 +2834,11 @@ def _prepare_clusters(
                 "n_clusters_kept": int(len(valid)),
                 "cluster_sizes": {str(k): int(v) for k, v in sizes.items()},
                 "clusters_dropped": [str(k) for k, v in sizes.items() if v < min_cluster_size],
+                # Smallest community share in the intermediate partition. A
+                # coarse partition (few large blobs) often has min_frac ≫ true
+                # rare type frequency — rare cells were absorbed, not dropped.
+                "min_cluster_frac": min_frac,
+                "min_cluster_n": min_size if len(sizes) else None,
             }
         )
         if reused:
@@ -1924,11 +2909,11 @@ def _mean_axis0(X: Any, row_mask: np.ndarray) -> np.ndarray:
 
 _LOGFC_SPACES = ("log1p", "linear", "linear_regularised")
 
-# Pseudocounts per space. log1p keeps the shipped 1e-2. "linear" reproduces
-# scanpy rank_genes_groups (1e-9), which barely regularises a near-zero
-# denominator. "linear_regularised" uses 1.0 — one count per 10k, the same order
-# as the +1 that log1p itself adds — so that "log vs linear" can be told apart
-# from "pseudocount strength".
+# Pseudocounts per space. log1p keeps the shipped 1e-2.
+# "linear" reproduces scanpy rank_genes_groups (1e-9) on normalize_total(1e4)
+# scale — essentially unregularised; retained as **benchmark-only** (emits
+# UserWarning at entry). Prefer "linear_regularised" (pseudo=1.0, one count
+# per 10k) for any non-benchmark linear-space experiment.
 _LOGFC_PSEUDO = {"log1p": 1e-2, "linear": 1e-9, "linear_regularised": 1.0}
 
 
@@ -2181,14 +3166,14 @@ def _build_cluster_gene_ranks(
             logfc = _cluster_vs_rest_logfc(X_log, mask, pseudo=_pseudo, one_sided=True)
             order = np.argsort(-logfc)
             out[str(cl)] = list(adata.var_names[order].astype(str))
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             continue
     return out
 
 
 # ---------------------------------------------------------------------------
-# cap_allocation: trim over-represented clusters, backfill from the global
-# blend.
+# Equal-share ceiling trim (formerly allocation_method='cap') — implementation
+# kept private for research scripts; public API no longer exposes it.
 # ---------------------------------------------------------------------------
 
 # Tirosh et al. 2016 S/G2M gene sets (via Regev lab list, the same one
@@ -2536,7 +3521,7 @@ def _build_legitimate_units(
     nn_space: Any = X_pca if X_pca is not None else X_log
     try:
         nn = _nearest_cluster_map(nn_space, masks)
-    except Exception:
+    except _RECOVERABLE_ERRORS:
         return labels, merges
     if not nn:
         return labels, merges
@@ -2639,6 +3624,7 @@ def _coverage_floor_allocate(
         "n_added": 0,
         "n_removed": 0,
         "budget": 0,
+        "allocation_status": "not_run",
     }
     if not ranks or n_top_genes < 1 or not selected:
         return selected, empty
@@ -2647,8 +3633,29 @@ def _coverage_floor_allocate(
     floor_n = max(1, int(round(float(coverage_floor) * m)))
     budget = max(0, int(round(float(budget_frac) * int(n_top_genes))))
     n_units = len(ranks)
+    # With ≤2 units, equal-share / coverage floors cannot see rare types that
+    # the structure layer already merged away — n_starved=0 would look "fair".
+    if n_units < 3:
+        msg = (
+            f"allocation_method='coverage' skipped: structure resolved only "
+            f"{n_units} unit(s) (need ≥3). n_starved=0 means nothing to check, "
+            "not that the selection is fair. Raise resolution or inspect "
+            "clustering.n_clusters_total."
+        )
+        warnings.warn(msg, UserWarning, stacklevel=3)
+        logger.warning(msg)
+        return selected, {
+            **empty,
+            "n_units": n_units,
+            "allocation_status": "skipped_structure_too_coarse",
+            "skipped_reason": f"n_units={n_units}<3",
+        }
     if budget == 0:
-        return selected, {**empty, "n_units": n_units}
+        return selected, {
+            **empty,
+            "n_units": n_units,
+            "allocation_status": "budget_zero",
+        }
 
     pool_set = {str(g) for g in candidate_pool} if candidate_pool is not None else None
     current = {str(g) for g in selected}
@@ -2681,6 +3688,7 @@ def _coverage_floor_allocate(
             "n_added": 0,
             "n_removed": 0,
             "budget": budget,
+            "allocation_status": "checked_no_starved",
             "unit_coverage_before": {k: round(v, 3) for k, v in unit_cov.items()},
         }
 
@@ -2712,6 +3720,7 @@ def _coverage_floor_allocate(
             "n_added": 0,
             "n_removed": 0,
             "budget": budget,
+            "allocation_status": "starved_but_no_candidates",
             "unit_coverage_before": {k: round(v, 3) for k, v in unit_cov.items()},
         }
 
@@ -2730,6 +3739,7 @@ def _coverage_floor_allocate(
             "n_added": 0,
             "n_removed": 0,
             "budget": budget,
+            "allocation_status": "starved_but_unfunded",
             "unit_coverage_before": {k: round(v, 3) for k, v in unit_cov.items()},
             "note": "no unprotected genes to fund top-up",
         }
@@ -2747,6 +3757,7 @@ def _coverage_floor_allocate(
         "n_removed": len(removed),
         "added_for": added_for,
         "budget": budget,
+        "allocation_status": "applied" if added else "checked_no_change",
         "unit_coverage_before": {k: round(v, 3) for k, v in unit_cov.items()},
     }
 
@@ -2791,13 +3802,29 @@ def _starved_topup_allocate(
         "n_removed": 0,
         "budget": 0,
         "equal_share": 0.0,
+        "allocation_status": "not_run",
     }
     if not ranks or n_top_genes < 1 or not selected:
         return selected, empty
 
     n_units = len(ranks)
-    if n_units < 2:
-        return selected, {**empty, "n_units": n_units}
+    # ≤2 units: equal-share is near parity by construction even when true
+    # rare types were absorbed into majority Leiden communities.
+    if n_units < 3:
+        msg = (
+            f"allocation_method='starved_topup' skipped: structure resolved only "
+            f"{n_units} unit(s) (need ≥3). n_starved=0 means nothing to check, "
+            "not that the selection is fair. Raise resolution or inspect "
+            "clustering.n_clusters_total."
+        )
+        warnings.warn(msg, UserWarning, stacklevel=3)
+        logger.warning(msg)
+        return selected, {
+            **empty,
+            "n_units": n_units,
+            "allocation_status": "skipped_structure_too_coarse",
+            "skipped_reason": f"n_units={n_units}<3",
+        }
 
     equal_share = float(n_top_genes) / float(n_units)
     trigger_n = float(trigger_frac) * equal_share
@@ -2849,7 +3876,19 @@ def _starved_topup_allocate(
         max_frac=float(budget_frac),
     )
 
-    if not requests or budget <= 0:
+    if not requests:
+        return selected, {
+            "n_units": n_units,
+            "n_starved": 0,
+            "n_added": 0,
+            "n_removed": 0,
+            "budget": budget,
+            "equal_share": round(equal_share, 3),
+            "share_before": {k: round(v, 3) for k, v in share_before.items()},
+            "allocation_status": "checked_no_starved",
+            **bud_meta,
+        }
+    if budget <= 0:
         return selected, {
             "n_units": n_units,
             "n_starved": len(requests),
@@ -2858,6 +3897,7 @@ def _starved_topup_allocate(
             "budget": budget,
             "equal_share": round(equal_share, 3),
             "share_before": {k: round(v, 3) for k, v in share_before.items()},
+            "allocation_status": "budget_zero",
             **bud_meta,
         }
 
@@ -2892,6 +3932,7 @@ def _starved_topup_allocate(
             "budget": budget,
             "equal_share": round(equal_share, 3),
             "share_before": {k: round(v, 3) for k, v in share_before.items()},
+            "allocation_status": "starved_but_no_candidates",
             "note": "no pool candidates for starved units",
             **bud_meta,
         }
@@ -2913,6 +3954,7 @@ def _starved_topup_allocate(
             "budget": budget,
             "equal_share": round(equal_share, 3),
             "share_before": {k: round(v, 3) for k, v in share_before.items()},
+            "allocation_status": "starved_but_unfunded",
             "note": "no unprotected genes to fund starved top-up",
             **bud_meta,
         }
@@ -2935,6 +3977,7 @@ def _starved_topup_allocate(
         "target_frac": float(target_frac),
         "budget_frac": float(budget_frac),
         "share_before": {k: round(v, 3) for k, v in share_before.items()},
+        "allocation_status": "applied" if added else "checked_no_change",
         **bud_meta,
     }
 
@@ -2967,7 +4010,7 @@ def _score_weighted_select(
     combine: str = "blend",
     cluster_mask: np.ndarray | None = None,
     progress: bool = False,
-    scale_clustering: bool = False,
+    scale_clustering: bool = True,
     logfc_space: str = "log1p",
     diag_out: dict[str, Any] | None = None,
     consensus_resolutions: Sequence[float] | None = None,
@@ -3065,7 +4108,7 @@ def _score_weighted_select(
             # Allocation may still need ad_full / X_log — run only when requested.
             alloc_diag: dict[str, Any] = {}
             alloc_note = ""
-            if allocation_method in ("cap", "coverage", "starved_topup") and n_scored >= 2:
+            if allocation_method in ("coverage", "starved_topup") and n_scored >= 2:
                 ad_full = _restore_raw_counts(adata, layer=counts_layer, full_genes=True)
                 if counts_layer not in ad_full.layers:
                     ad_full.layers[counts_layer] = ad_full.X.copy()
@@ -3073,44 +4116,7 @@ def _score_weighted_select(
                 X_log, _pseudo = _logfc_inputs(
                     _lognorm_matrix_from_counts(ad_full, counts_layer), logfc_space
                 )
-                if allocation_method == "cap":
-                    cap_labels = cluster_labels
-                    if cap_merge_threshold is not None and X_pca is not None:
-                        cap_labels, cap_merges = _merge_unstable_clusters(
-                            X_pca,
-                            cluster_labels,
-                            min_cluster_size=min_cluster_size,
-                            threshold=cap_merge_threshold,
-                            random_state=random_state,
-                        )
-                        if cap_merges and diag_out is not None:
-                            diag_out["cap_merges"] = [
-                                {"a": a, "b": b, "stability": round(s, 3)} for a, b, s in cap_merges
-                            ]
-                    cap_ranks = _build_cluster_gene_ranks(
-                        ad_full,
-                        cluster_labels=cap_labels,
-                        counts_layer=counts_layer,
-                        min_cluster_size=min_cluster_size,
-                        logfc_space=logfc_space,
-                    )
-                    if cap_ranks:
-                        selected, alloc_diag = _cap_over_represented(
-                            selected,
-                            cap_ranks,
-                            S_out,
-                            n_top_genes,
-                            ceiling=cap_ceiling,
-                            candidate_pool=hybrid_pool,
-                        )
-                    if diag_out is not None and alloc_diag:
-                        diag_out.update({f"cap_{k}": v for k, v in alloc_diag.items()})
-                    if alloc_diag.get("n_over"):
-                        alloc_note = (
-                            f"; cap trimmed {alloc_diag['n_over']} over-represented "
-                            f"cluster(s), swapped {alloc_diag['n_added']} gene(s)"
-                        )
-                elif allocation_method == "coverage":
+                if allocation_method == "coverage":
                     unit_labels, unit_merges = _build_legitimate_units(
                         X_pca,
                         X_log,
@@ -3139,8 +4145,9 @@ def _score_weighted_select(
                             candidate_pool=hybrid_pool,
                         )
                     if diag_out is not None and alloc_diag:
+                        # Keys are coverage_*; do not also set allocation_method
+                        # here — that lives only on uns["scfair"]["hvg"] (request).
                         diag_out.update({f"coverage_{k}": v for k, v in alloc_diag.items()})
-                        diag_out["allocation_method"] = "coverage"
                     if alloc_diag.get("n_added"):
                         alloc_note = (
                             f"; coverage topped up {alloc_diag.get('n_starved', 0)} "
@@ -3176,7 +4183,6 @@ def _score_weighted_select(
                         )
                     if diag_out is not None and alloc_diag:
                         diag_out.update({f"starved_topup_{k}": v for k, v in alloc_diag.items()})
-                        diag_out["allocation_method"] = "starved_topup"
                     if alloc_diag.get("n_added"):
                         alloc_note = (
                             f"; starved_topup filled {alloc_diag.get('n_starved', 0)} "
@@ -3294,7 +4300,7 @@ def _score_weighted_select(
                 S_max_ = np.maximum(S_max_, logfc)
                 masks_[str(cl)] = mask
                 n_ += 1
-            except Exception as exc:
+            except _RECOVERABLE_ERRORS as exc:
                 logger.warning("Cluster-vs-rest scoring failed for cluster %s (%s); skip.", cl, exc)
         return S_, S_max_, masks_, n_
 
@@ -3325,7 +4331,7 @@ def _score_weighted_select(
                 )
                 S_nn = np.maximum(S_nn, logfc_nn)
                 n_nn += 1
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             logger.warning("Nearest-neighbour contrast failed (%s); skipping.", exc)
             S_nn = np.zeros(ad_full.n_vars, dtype=float)
             n_nn = 0
@@ -3427,52 +4433,12 @@ def _score_weighted_select(
             pool_factor=2.0,
         )
 
-        # Post-hybrid allocation. Needs >=2 scored clusters (same guard as
-        # specificity). All paths stay inside hybrid_pool.
+        # Post-hybrid allocation. Needs ≥2 scored clusters for units to form;
+        # allocate functions themselves require ≥3 units or they skip with a
+        # clear status (skipped_structure_too_coarse ≠ checked_no_starved).
         alloc_diag: dict[str, Any] = {}
         alloc_note = ""
-        if allocation_method == "cap" and n_scored >= 2:
-            # Equal-share ceiling + neutral backfill. Optional
-            # stability-only merge before computing share.
-            cap_labels = cluster_labels
-            if cap_merge_threshold is not None and X_pca is not None:
-                cap_labels, cap_merges = _merge_unstable_clusters(
-                    X_pca,
-                    cluster_labels,
-                    min_cluster_size=min_cluster_size,
-                    threshold=cap_merge_threshold,
-                    random_state=random_state,
-                )
-                if cap_merges and diag_out is not None:
-                    diag_out["cap_merges"] = [
-                        {"a": a, "b": b, "stability": round(s, 3)} for a, b, s in cap_merges
-                    ]
-            cap_ranks = _build_cluster_gene_ranks(
-                ad_full,
-                cluster_labels=cap_labels,
-                counts_layer=counts_layer,
-                min_cluster_size=min_cluster_size,
-                logfc_space=logfc_space,
-            )
-            if cap_ranks:
-                selected, alloc_diag = _cap_over_represented(
-                    selected,
-                    cap_ranks,
-                    S_out,
-                    n_top_genes,
-                    ceiling=cap_ceiling,
-                    candidate_pool=hybrid_pool,
-                )
-            if diag_out is not None and alloc_diag:
-                diag_out.update({f"cap_{k}": v for k, v in alloc_diag.items()})
-            if alloc_diag.get("n_over"):
-                alloc_note = (
-                    f"; cap trimmed {alloc_diag['n_over']} over-represented "
-                    f"cluster(s), swapped {alloc_diag['n_added']} gene(s)"
-                )
-        elif allocation_method == "coverage" and n_scored >= 2:
-            # Legitimate units (stability ∧ DE) + coverage-floor top-up.
-            # No equal-share trim, no cell-cycle gene list.
+        if allocation_method == "coverage" and n_scored >= 2:
             unit_labels, unit_merges = _build_legitimate_units(
                 X_pca,
                 X_log,
@@ -3502,15 +4468,12 @@ def _score_weighted_select(
                 )
             if diag_out is not None and alloc_diag:
                 diag_out.update({f"coverage_{k}": v for k, v in alloc_diag.items()})
-                diag_out["allocation_method"] = "coverage"
             if alloc_diag.get("n_added"):
                 alloc_note = (
                     f"; coverage topped up {alloc_diag.get('n_starved', 0)} "
                     f"unit(s), swapped {alloc_diag['n_added']} gene(s)"
                 )
         elif allocation_method == "starved_topup" and n_scored >= 2:
-            # Legitimate units + equal-share starvation top-up.
-            # Small default budget (5%); does not trim over-represented units.
             unit_labels, unit_merges = _build_legitimate_units(
                 X_pca,
                 X_log,
@@ -3540,7 +4503,6 @@ def _score_weighted_select(
                 )
             if diag_out is not None and alloc_diag:
                 diag_out.update({f"starved_topup_{k}": v for k, v in alloc_diag.items()})
-                diag_out["allocation_method"] = "starved_topup"
             if alloc_diag.get("n_added"):
                 alloc_note = (
                     f"; starved_topup filled {alloc_diag.get('n_starved', 0)} "
@@ -3644,14 +4606,11 @@ def _hybrid_anchor_select(
         S_pool = blend_global * g_norm + (1.0 - blend_global) * s_norm
     selected = list(S_pool.sort_values(ascending=False).index[:n_top_genes])
 
-    # Full-length score vector for adata.var reporting
-    g_full = global_scores.reindex(spec_scores.index).fillna(0.0)
-    if combine == "best_rank":
-        S_out = _best_rank_score(g_full, spec_scores)
-    else:
-        S_out = blend_global * _minmax_norm(g_full) + (1.0 - blend_global) * _minmax_norm(
-            spec_scores
-        )
+    # Report the *same* scores used for selection: pool-normalized blend, NaN
+    # outside the candidate pool. Re-normalizing on the full genome made
+    # ``scfair_score`` disagree with ``highly_variable`` (different min-max).
+    S_out = pd.Series(np.nan, index=spec_scores.index, dtype=float)
+    S_out.loc[S_pool.index] = S_pool.to_numpy(dtype=float)
     return selected, S_out, pool
 
 
@@ -3710,7 +4669,7 @@ def _cell_reweight_select(
     batch_key: str | None,
     cluster_mask: np.ndarray | None = None,
     progress: bool = False,
-    scale_clustering: bool = False,
+    scale_clustering: bool = True,
     logfc_space: str = "log1p",
     diag_out: dict[str, Any] | None = None,
     span: float,
@@ -3765,9 +4724,17 @@ def _cell_reweight_select(
 
     rng = np.random.default_rng(random_state)
     idx = rng.choice(ad_full.n_obs, size=ad_full.n_obs, replace=True, p=cell_w)
-    ad_rs = ad_full[idx].copy()
-    # Resampling with replacement duplicates barcodes; give unique ids.
+    # Resampling with replacement duplicates barcodes. Assign unique names
+    # before .copy() would still warn on the view; set immediately after copy.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Observation names are not unique",
+            category=UserWarning,
+        )
+        ad_rs = ad_full[idx].copy()
     ad_rs.obs_names = pd.Index([f"scfair_rs_{i}" for i in range(ad_rs.n_obs)])
+    ad_rs.obs_names_make_unique()
     # ensure counts layer present for flavor
     if counts_layer not in ad_rs.layers:
         ad_rs.layers[counts_layer] = ad_rs.X.copy()
@@ -3793,7 +4760,7 @@ def _cell_reweight_select(
         batch_key=bk,
     )
 
-    scores_rs = _variability_raw_scores(ad_rs)
+    scores_rs = _variability_raw_scores(ad_rs, flavor=flavor, flavor_used=flavor)
     # align to parent genes
     S_aligned = scores_rs.reindex(adata.var_names).fillna(
         float(scores_rs.min()) if len(scores_rs) else 0.0
@@ -3883,13 +4850,18 @@ def _apply_selection(
     global_scores: pd.Series,
     cluster_labels: pd.Series | None,
     meta: dict[str, Any],
+    prior_scanpy_hvg: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     hv = adata.var_names.astype(str).isin(selected)
     adata.var["highly_variable"] = hv
 
+    # Match scanpy: finite rank only for selected genes (0-based in selection
+    # order); non-HVG genes are NaN — not +inf. Downstream code uses
+    # ``rank.notna()`` / ``dropna(subset=['highly_variable_rank'])``; inf made
+    # those filters no-ops and broke ``astype(int)``.
     rank_map = {g: float(i) for i, g in enumerate(selected)}
     ranks = np.array(
-        [rank_map.get(str(g), np.inf) for g in adata.var_names],
+        [rank_map.get(str(g), np.nan) for g in adata.var_names],
         dtype=float,
     )
     adata.var["highly_variable_rank"] = ranks
@@ -3907,7 +4879,26 @@ def _apply_selection(
     if cluster_labels is not None:
         adata.obs["scfair_hvg_clusters"] = cluster_labels.astype("category")
 
-    adata.uns["hvg"] = {"flavor": meta.get("flavor")}
+    # scFair owns ``uns["scfair"]``. Do not replace scanpy's ``uns["hvg"]`` with
+    # a one-key stub. Prefer the caller's pre-call dict (scanpy's internal HVG
+    # may have overwritten it mid-run); fall back to whatever is there now.
+    flavor_used = meta.get("flavor_used", meta.get("flavor"))
+    flavor_requested = meta.get("flavor_requested", meta.get("flavor"))
+    base = prior_scanpy_hvg
+    if base is None and isinstance(adata.uns.get("hvg"), dict):
+        base = dict(adata.uns["hvg"])
+    if base is not None:
+        merged = dict(base)
+        merged["flavor"] = flavor_used
+        if flavor_requested is not None and flavor_requested != flavor_used:
+            merged["flavor_requested"] = flavor_requested
+            merged["scfair_flavor_note"] = (
+                "flavor is the method that actually ran; flavor_requested may differ "
+                "after seurat_v3 fallback"
+            )
+        adata.uns["hvg"] = merged
+    # else: leave uns["hvg"] unset — full metadata is under uns["scfair"]["hvg"]
+
     if UNS_KEY not in adata.uns:
         adata.uns[UNS_KEY] = {}
     adata.uns[UNS_KEY]["hvg"] = {
