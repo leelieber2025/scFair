@@ -6,11 +6,17 @@ import numpy as np
 import pytest
 
 from scfair.pp._auto_n import (
+    APPEND_BUDGET_FLOOR,
+    APPEND_BUDGET_HI,
+    APPEND_BUDGET_OFFSET,
+    APPEND_BUDGET_PER_NEED,
     depth_aware_auto_knobs,
     effective_k_ceiling,
     effective_k_floor,
     estimate_n_top_structure,
     explain_structure_rule,
+    plain_auto_n_message,
+    product_append_budget,
     resolve_n_top_genes,
     select_n_top_coverage,
     select_n_top_cumfrac,
@@ -26,6 +32,71 @@ def _fake_scores(n: int = 5000, decay: float = 0.001) -> np.ndarray:
     # smoothly decreasing positive scores
     x = np.arange(n, dtype=float)
     return np.exp(-decay * x) * 10.0 + 0.01
+
+
+def test_product_append_budget_tight_density():
+    """Floor 200; raise only when n_need > OFFSET=12; cap at 300."""
+    assert APPEND_BUDGET_FLOOR == 200
+    assert APPEND_BUDGET_HI == 300
+    assert APPEND_BUDGET_OFFSET == 12
+    assert APPEND_BUDGET_PER_NEED == 12
+
+    m0, info0 = product_append_budget(None)
+    assert m0 == 200
+    assert info0["n_need"] == 0
+    assert info0["append_budget_raised"] is False
+    assert info0["append_budget_rule"] == "tight_density_v1"
+
+    m_low, info_low = product_append_budget(12)
+    assert m_low == 200
+    assert info_low["n_need"] == 12
+    assert info_low["append_budget_raised"] is False
+
+    # n_need=13 → extra = (13-12)*12 = 12 → m = 212
+    m13, info13 = product_append_budget(13)
+    assert m13 == 212
+    assert info13["n_need"] == 13
+    assert info13["append_budget_raised"] is True
+
+    # n_need=20 → extra = 8*12 = 96 → m = 296
+    m20, _ = product_append_budget(20)
+    assert m20 == 296
+
+    # n_need=21 → extra = 9*12 = 108 → m = min(300, 308) = 300
+    m21, info21 = product_append_budget(21)
+    assert m21 == 300
+    assert info21["append_budget_raised"] is True
+
+    # float n_density_pops is rounded
+    m_f, info_f = product_append_budget(12.6)
+    assert info_f["n_need"] == 13
+    assert m_f == 212
+
+    m_nan, _ = product_append_budget(float("nan"))
+    assert m_nan == 200
+
+
+def test_plain_auto_n_message_low_conf_and_sizes():
+    """One-line user-facing text for common structure branches."""
+    msg = plain_auto_n_message(k=2000, rule_branch="…low_conf_floor…")
+    assert "2000" in msg
+    assert "confidence" in msg.lower() or "safer" in msg.lower()
+
+    msg_short = plain_auto_n_message(k=500, rule_branch="no_buffer:short")
+    assert "500" in msg_short
+    assert "short" in msg_short.lower()
+
+    msg_block = plain_auto_n_message(k=1000, short_blocked=True)
+    assert "1000" in msg_block
+    assert "not trusted" in msg_block.lower() or "short" in msg_block.lower()
+
+    msg_long = plain_auto_n_message(k=3500)
+    assert "3500" in msg_long
+    assert "long" in msg_long.lower()
+
+    msg_mid = plain_auto_n_message(k=2000, rule_branch="density_mid")
+    assert "2000" in msg_mid
+    assert "override" in msg_mid.lower() or "structure" in msg_mid.lower()
 
 
 @pytest.mark.parametrize("fn", [select_n_top_elbow, select_n_top_knee])
@@ -101,12 +172,7 @@ def test_structure_auto_n_pancreas_like_short():
 
 
 def test_structure_false_short_floors_after_buffer():
-    """Zheng-like short_hard + large n + low conf + nd≤8 → floor 2000.
-
-    Soft buffer alone would leave k=1000 and formerly skipped residual
-    anti-SHORT (which only checked k≤500). False-SHORT must fire after buffer.
-    Covers both the original nd=6 calibration and retest nd=7 Zheng-20k.
-    """
+    """short_hard + large n + low conf + nd≤FALSE_SHORT_ND_MAX → floor 2000."""
     from scfair.pp._auto_n import explain_structure_rule
 
     for nd in (6, 7, 8):
@@ -129,7 +195,7 @@ def test_structure_false_short_floors_after_buffer():
     k = select_n_top_from_structure(
         valley_median=0.83,
         frac_shallow=0.1,
-        n_density_pops=7,  # GOLD-15 retest Zheng landed here
+        n_density_pops=7,
         mean_stability=0.7,
         min_stability=0.1,
         n_obs=20_000,
@@ -140,23 +206,40 @@ def test_structure_false_short_floors_after_buffer():
 
 
 def test_structure_soft_buffer_when_not_false_short():
-    """short_hard with nd just above false-SHORT max still soft-buffers 500→1000."""
+    """nd just above false-SHORT max: soft buffer; low conf then floors to 2000."""
     from scfair.pp._auto_n import explain_structure_rule
+
+    d_hi = explain_structure_rule(
+        valley_median=0.83,
+        frac_shallow=0.1,
+        n_density_pops=9,
+        mean_stability=0.7,
+        min_stability=0.1,
+        n_obs=20_000,
+        n_leiden=10,
+        density_confidence="high",
+    )
+    assert d_hi["short_blocked"] is False
+    assert d_hi["n_top"] == 1000
+    assert d_hi["k_buffer_raw"] == 500
+    assert "k_buffer:500→1000" in d_hi["rule_branch"]
+    assert "low_conf_floor" not in d_hi["rule_branch"]
 
     d = explain_structure_rule(
         valley_median=0.83,
         frac_shallow=0.1,
-        n_density_pops=9,  # FALSE_SHORT_ND_MAX=8 → not false SHORT
+        n_density_pops=9,
         mean_stability=0.7,
         min_stability=0.1,
         n_obs=20_000,
         n_leiden=10,
         density_confidence="low",
     )
-    assert d["short_blocked"] is False
-    assert d["n_top"] == 1000
-    assert d["k_buffer_raw"] == 500
+    assert d["short_blocked"] is True
+    assert d["n_top"] == 2000
+    assert d["short_block_reason"] == "density_confidence_low"
     assert "k_buffer:500→1000" in d["rule_branch"]
+    assert "low_conf_floor:1000→2000" in d["rule_branch"]
     assert "antishort:false_short" not in d["rule_branch"]
 
 
@@ -164,7 +247,6 @@ def test_structure_true_short_skips_buffer_with_n_types():
     """Multi-core short_hard + n_types≥5: keep k=500 (no soft buffer)."""
     from scfair.pp._auto_n import explain_structure_rule
 
-    # SLN-like: high nd, multi-type labels
     d = explain_structure_rule(
         valley_median=0.92,
         frac_shallow=0.1,
@@ -180,7 +262,8 @@ def test_structure_true_short_skips_buffer_with_n_types():
     assert d["no_buffer"] is True
     assert "no_buffer:nd12_ntypes9" in d["rule_branch"]
     assert d["k_buffer_raw"] is None
-    # Without n_types: soft buffer remains (protect 2-way boards)
+    assert "low_conf_floor" not in d["rule_branch"]
+    # Without n_types: soft buffer then low-conf floor → 2000
     d2 = explain_structure_rule(
         valley_median=0.92,
         frac_shallow=0.1,
@@ -191,9 +274,10 @@ def test_structure_true_short_skips_buffer_with_n_types():
         n_leiden=14,
         density_confidence="low",
     )
-    assert d2["n_top"] == 1000
+    assert d2["n_top"] == 2000
     assert "k_buffer:500→1000" in d2["rule_branch"]
-    # n_types=2 (TM brain-like): still buffer
+    assert "low_conf_floor" in d2["rule_branch"]
+    # n_types=2: still buffer, then low-conf floor → 2000
     d3 = explain_structure_rule(
         valley_median=0.79,
         frac_shallow=0.1,
@@ -205,15 +289,15 @@ def test_structure_true_short_skips_buffer_with_n_types():
         density_confidence="low",
         n_types=2,
     )
-    assert d3["n_top"] == 1000
+    assert d3["n_top"] == 2000
     assert "k_buffer" in d3["rule_branch"]
+    assert "low_conf_floor" in d3["rule_branch"]
 
 
 def test_structure_anti_short_residual_and_false_short_post_combine():
-    """Post-combine floor: false_short on buffered 1000; residual on raw 500."""
+    """Post-combine floors: false_short and low_conf; high-nd 500 exempt."""
     from scfair.pp._auto_n import _apply_short_floor_if_needed
 
-    # Buffered false-SHORT (k=1000, nd=7 Zheng-like, large n, low conf) → 2000
     k1, src1, tag1 = _apply_short_floor_if_needed(
         k=1000,
         k_source="unanimous_seed_vote",
@@ -228,7 +312,6 @@ def test_structure_anti_short_residual_and_false_short_post_combine():
     assert k1 == 2000
     assert tag1 is not None and "false_short" in tag1
 
-    # Raw 500 under false-SHORT geometry → same 2000 floor (via false_short path)
     k2, src2, tag2 = _apply_short_floor_if_needed(
         k=500,
         k_source="unanimous_seed_vote",
@@ -243,8 +326,7 @@ def test_structure_anti_short_residual_and_false_short_post_combine():
     assert k2 == 2000
     assert tag2 is not None and "false_short" in tag2
 
-    # nd=9 is above FALSE_SHORT_ND_MAX=8 → no post-combine floor
-    k2b, _, tag2b = _apply_short_floor_if_needed(
+    k2b, src2b, tag2b = _apply_short_floor_if_needed(
         k=1000,
         k_source="unanimous_seed_vote",
         n_obs=20_000,
@@ -255,10 +337,10 @@ def test_structure_anti_short_residual_and_false_short_post_combine():
         k_max=5000,
         n_genes=20_000,
     )
-    assert k2b == 1000
-    assert tag2b is None
+    assert k2b == 2000
+    assert tag2b is not None and "low_conf_floor" in tag2b
+    assert "low_conf_floor" in src2b
 
-    # High-nd raw 500: conf alone must not floor (true multi-core SHORT)
     k3, src3, tag3 = _apply_short_floor_if_needed(
         k=500,
         k_source="unanimous_seed_vote",
@@ -504,16 +586,6 @@ def test_resolve_structure_without_adata_falls_back():
     assert 500 <= k <= 5000
     # fallback path is ensemble
     assert meta["strategy"] == "ensemble"
-
-
-def test_structure_stability_n_boot_default_lighter_than_cap_merge():
-    """Structure pair-stability uses n_boot=5; cap-merge keeps 15."""
-    from scfair.pp._auto_n import STRUCTURE_STABILITY_N_BOOT
-    from scfair.pp._highly_variable_genes import _MERGE_N_BOOT
-
-    assert STRUCTURE_STABILITY_N_BOOT == 5
-    assert _MERGE_N_BOOT == 15
-    assert STRUCTURE_STABILITY_N_BOOT < _MERGE_N_BOOT
 
 
 def test_product_structure_uses_n_seeds_3_not_library_default():
@@ -785,102 +857,75 @@ def test_depth_aware_knobs_tiers():
     assert deep["anchor"] <= 1500
 
 
-def test_hvg_auto_runs(adata_for_hvg=None):
+def test_hvg_auto_runs():
+    """Product auto (structure) runs and records auto_message."""
     import anndata as ad
 
     import scfair as scf
+    from scfair.pp import HVGOptions
 
     rng = np.random.default_rng(0)
-    X = rng.poisson(1.5, size=(120, 80)).astype(float)
-    # plant structure
-    X[:40, 0] += 20
-    X[40:80, 1] += 20
-    X[80:, 2] += 20
+    X = rng.poisson(1.2, size=(120, 80)).astype(np.float32)
     a = ad.AnnData(X)
-    a.obs_names = [f"c{i}" for i in range(120)]
     a.var_names = [f"g{i}" for i in range(80)]
+    a.obs_names = [f"c{i}" for i in range(120)]
     scf.pp.highly_variable_genes(
         a,
         n_top_genes="auto",
-        n_top_min=20,
-        n_top_max=60,
-        auto_n_method="elbow",
-        balance_method="none",
-        flavor="seurat_v3",
+        balance_method="append",
+        options=HVGOptions(n_top_min=10, n_top_max=40, structure_n_seeds=1, append_budget=3),
+        diagnose=False,
+        progress=False,
     )
-    n = int(a.var["highly_variable"].sum())
-    assert 20 <= n <= 60
-    assert a.uns["scfair"]["hvg"]["auto_n"] is not None
-    assert a.uns["scfair"]["hvg"]["n_top_genes_used"] == n
+    h = a.uns["scfair"]["hvg"]
+    assert h["auto_n"]["strategy"] == "structure"
+    assert isinstance(h.get("auto_message"), str)
+    assert int(a.var["highly_variable"].sum()) >= 10
 
 
 def test_hvg_auto_structure_default():
-    """Package default auto_n_method=structure picks k and hybrid-realigns."""
+    """Default auto path is structure + append."""
     import anndata as ad
 
     import scfair as scf
+    from scfair.pp import HVGOptions
 
     rng = np.random.default_rng(1)
-    X = rng.poisson(2.0, size=(200, 200)).astype(float)
-    for i, start in enumerate((0, 50, 100, 150)):
-        X[start : start + 50, i] += 25
+    X = rng.poisson(1.2, size=(120, 80)).astype(np.float32)
     a = ad.AnnData(X)
-    a.obs_names = [f"c{i}" for i in range(200)]
-    a.var_names = [f"g{i}" for i in range(200)]
-    scf.pp.highly_variable_genes(
-        a,
-        n_top_genes="auto",  # default path; method defaults to structure
-        n_top_min=30,
-        n_top_max=120,
-        balance_method="hybrid",
-        flavor="seurat_v3",
-        min_cluster_size=20,
-    )
-    n = int(a.uns["scfair"]["hvg"]["n_top_genes_used"])
-    assert 30 <= n <= 120
-    auto = a.uns["scfair"]["hvg"]["auto_n"]
-    assert auto["strategy"] == "structure"
-    assert auto.get("structure") is not None
-    # hybrid auto should realign to 2×k pool after k pick
-    assert auto.get("pool_realign") == "hybrid_2xk"
-
-
-def test_hvg_auto_ensemble_opt_in():
-    """Previous ensemble default still available via auto_n_method."""
-    import anndata as ad
-
-    import scfair as scf
-
-    rng = np.random.default_rng(1)
-    X = rng.poisson(2.0, size=(200, 200)).astype(float)
-    for i, start in enumerate((0, 50, 100, 150)):
-        X[start : start + 50, i] += 25
-    a = ad.AnnData(X)
-    a.obs_names = [f"c{i}" for i in range(200)]
-    a.var_names = [f"g{i}" for i in range(200)]
+    a.var_names = [f"g{i}" for i in range(80)]
+    a.obs_names = [f"c{i}" for i in range(120)]
     scf.pp.highly_variable_genes(
         a,
         n_top_genes="auto",
-        auto_n_method="ensemble",
-        n_top_min=30,
-        n_top_max=120,
-        balance_method="hybrid",
-        flavor="seurat_v3",
-        min_cluster_size=20,
+        options=HVGOptions(n_top_min=10, n_top_max=40, structure_n_seeds=1, append_budget=3),
+        diagnose=False,
+        progress=False,
     )
-    n = int(a.uns["scfair"]["hvg"]["n_top_genes_used"])
-    assert 30 <= n <= 120
-    ens = a.uns["scfair"]["hvg"]["auto_n"].get("ensemble")
-    assert ens is not None
-    assert ens["version"] == "ensemble_v2.2"
-    depth = a.uns["scfair"]["hvg"]["auto_n"].get("depth")
-    assert depth is not None
-    assert "depth_tier" in depth
+    assert a.uns["scfair"]["hvg"]["auto_n"]["strategy"] == "structure"
+    assert a.uns["scfair"]["hvg"]["balance_method"] == "append"
 
 
-# ---------------------------------------------------------------------------
-# rule_branch labels + holdout feature-level regressions
-# ---------------------------------------------------------------------------
+def test_hvg_auto_ensemble_rejected():
+    """Ensemble auto_n_method is no longer a product option."""
+    import anndata as ad
+
+    import scfair as scf
+    from scfair.pp import HVGOptions
+
+    rng = np.random.default_rng(2)
+    X = rng.poisson(1.2, size=(80, 50)).astype(np.float32)
+    a = ad.AnnData(X)
+    a.var_names = [f"g{i}" for i in range(50)]
+    a.obs_names = [f"c{i}" for i in range(80)]
+    with pytest.raises(ValueError, match="structure"):
+        scf.pp.highly_variable_genes(
+            a,
+            n_top_genes="auto",
+            options=HVGOptions(auto_n_method="ensemble", n_top_min=10, n_top_max=30),
+            diagnose=False,
+            progress=False,
+        )
 
 
 def test_structure_k_buffer_ladder():

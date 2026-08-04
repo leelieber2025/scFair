@@ -7,16 +7,42 @@
 
 ## What scFair does
 
-Highly variable gene (HVG) selection ranks genes by how much they vary across
-cells. On a dataset with one or two dominant cell types, that ranking is driven
-almost entirely by what separates the large populations. Genes that mark a
-rare population can miss the cutoff even though they are exactly what you need
-later for clustering or annotation.
+scFair is HVG selection with two problems in mind — both common in real
+analysis, both easy to get wrong if you only call
+`scanpy.pp.highly_variable_genes` with a copied `n_top_genes=2000`.
 
-scFair keeps a standard global ranking as the backbone and, by default, appends
-a small extension of near-miss genes from the same ranking. The default path is
-a strict superset of a plain global HVG list: nothing is pushed *out* of the
-base top-`k`.
+### 1. How many genes (`n`)?
+
+Most pipelines pick a fixed length (often 2000) by habit. That number is
+rarely tuned to the dataset: too short can under-represent structure; too long
+adds noise and cost. **`n_top_genes="auto"`** (the default) estimates a base
+size from cell density structure.
+
+We do **not** claim auto is always the best `n` for every experiment. Its job
+is to be a **data-informed default and a safety net** — so users who are not
+ready to sweep `k` still get a reasoned list size instead of an arbitrary
+cutoff. When density confidence is low, auto prefers classical 2000 over a
+risky short list. Pass `n_top_genes=2000` (or any int) for papers and fixed
+protocols.
+
+### 2. Unfair HVG allocation
+
+Global HVG ranking is driven by the largest populations. Markers for smaller
+or rare types often land just below the cutoff even when they matter for later
+clustering and annotation. That is an **allocation** problem, not a missing
+variance formula.
+
+scFair keeps a standard global ranking as the backbone. By default
+(`balance_method="append"`) it **freezes** the base top-`k` and **appends** a
+small extension of near-miss genes from the **same** ranking. Nothing is
+pushed *out* of the base list. Use `balance_method="none"` for a scanpy-like
+exact top-`k` with no extension.
+
+### Default in one line
+
+```text
+auto n  →  global top-k  →  append near-miss genes
+```
 
 ## Where to go
 
@@ -41,8 +67,9 @@ base top-`k`.
 ```python
 import scfair as scf
 
-scf.pp.highly_variable_genes(adata)  # raw counts in .X or layers["counts"]
-adata = adata[:, adata.var["highly_variable"]].copy()
+# raw counts in .X or layers["counts"]; default: auto k + append
+scf.pp.highly_variable_genes(adata)
+# marks HVGs in adata.var; do not subset the matrix (scanpy PCA uses the mask)
 ```
 
 ## Author

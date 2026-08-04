@@ -180,30 +180,14 @@ def check_config(
 ) -> dict[str, Any]:
     """Parameter-only checks, resolvable **before** any data is touched.
 
-    These are the findings a caller can act on while it is still cheap to act:
-    the balanced methods spend ~90% of their runtime on the intermediate
-    PCA -> neighbours -> Leiden, so a warning that arrives after it has run has
-    already cost the user the thing it is warning about.
+    Product surface is ``append`` / ``none`` only. Extra keyword arguments
+    (``neighbor_contrast``, ``blend_global``, …) are accepted for call-site
+    compatibility but ignored.
 
-    Everything here is a function of the arguments alone. Findings that need the
-    clustering (how many clusters survived, how skewed they are) necessarily
-    come later, from :func:`diagnose_hvg_run`.
-
-    Returns ``{"flags": [...], "tips": [...]}``. ``diagnose_hvg_run`` folds the
-    same flags into its record but does not re-log them, so each finding is
-    emitted once, at the earliest point it is known.
+    Returns ``{"flags": [...], "tips": [...]}``.
     """
+    del neighbor_contrast, resolution, blend_global  # removed research knobs
     method = str(balance_method or "none")
-    # Normalize aliases so hybrid_rerank / inverse_size match the right checks.
-    _method_alias = {
-        "hybrid_rerank": "hybrid",
-        "rerank": "hybrid",
-        "weighted_score": "score",
-        "size_power": "score",
-        "inverse_size": "score",
-        "cell_reweight": "reweight",
-    }
-    method = _method_alias.get(method, method)
     flags: list[str] = []
     tips: list[str] = []
 
@@ -211,50 +195,11 @@ def check_config(
         flags.append("balance_method_none")
         tips.append("balance_method='none': global HVG only (same idea as scanpy).")
     elif method == "append":
-        # Product default: silent on success; no intermediate clustering cost.
         pass
-
-    k = None
-    if isinstance(n_top_genes, (int, np.integer)):
-        k = int(n_top_genes)
-    if k is not None and k >= _K_NO_GAIN and method in ("hybrid", "score", "reweight"):
-        flags.append("k_ge_3000")
+    else:
+        flags.append("unknown_balance_method")
         tips.append(
-            f"n_top_genes={k} is large; scFair often matches plain HVG here. "
-            "Try n_top_genes=2000 for a standard list."
-        )
-
-    if (
-        neighbor_contrast > 0
-        # resolution="auto" is resolved from the density field after the
-        # neighbour graph exists, so its value is not knowable here -- this
-        # check stays a parameter-only check and simply skips that case.
-        and isinstance(resolution, (int, float, np.number))
-        and not isinstance(resolution, bool)
-        and float(resolution) < 0.75
-        and method in ("hybrid", "score")
-    ):
-        flags.append("nc_low_resolution")
-        tips.append(
-            f"neighbor_contrast with resolution={float(resolution):.2f} "
-            "often cancels out. Use resolution≥1.0, or set neighbor_contrast=0."
-        )
-
-    # blend_global is a re-rank strength knob, not a fairness lever: lowering
-    # it increases equal-share "starved" clusters on panels that show
-    # deprivation, the opposite of the "more specificity fixes allocation"
-    # intuition.
-    if method == "hybrid" and blend_global is not None and float(blend_global) < 0.95:
-        flags.append("blend_global_low_vs_deprivation")
-        tips.append(
-            f"blend_global={float(blend_global):.2f} < 0.95: measured equal-share "
-            "deprivation (n_starved / min_share) gets *worse* as α falls — "
-            "un-normalised specificity is dominated by strong clusters, so more "
-            "weight on it amplifies them rather than rescuing starved ones. "
-            "Keep blend_global near 0.95; do not lower it to 'fix "
-            "fairness'. Allocation fairness belongs in post-hoc "
-            "allocation_method research ('starved_topup' / 'coverage'), "
-            "off by default; 'cap' was removed."
+            f"balance_method={method!r} is not a product method. Use 'append' (default) or 'none'."
         )
 
     if log:

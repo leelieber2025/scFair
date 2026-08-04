@@ -1,15 +1,15 @@
 """Private raw-count snapshot helpers used by ``highly_variable_genes``.
 
 Not part of the public API. Users should only call
-:func:`scfair.pp.highly_variable_genes`, which stores / restores counts
-internally when the fair HVG pipeline subsets genes and needs the full
-universe again.
+:func:`scfair.pp.highly_variable_genes`.
 
 Design (package-private):
 
-- Axis-aligned copy in ``adata.layers[layer]`` (default ``"counts"``).
-- Label-indexed sidecar in ``adata.uns['scfair']['raw_snapshot']`` that
-  survives HVG gene subsetting and cell subsetting.
+- Axis-aligned copy in ``adata.layers[layer]`` (default ``"counts"``) for the
+  HVG call — this is the normal product path.
+- Optional label-indexed sidecar in ``adata.uns['scfair']['raw_snapshot']``
+  only when ``store_raw=True`` / ``"ondisk"``. Default HVG discards any
+  ephemeral uns snapshot at the end of the call.
 """
 
 from __future__ import annotations
@@ -129,6 +129,24 @@ def _store_raw_snapshot(
     )
 
 
+def _discard_raw_snapshot(adata: Any, *, store_raw: bool | str = False) -> None:
+    """Drop ``uns['scfair']`` raw-count sidecar unless the user opted to keep it.
+
+    Product default: HVG only needs ``layers['counts']`` for the call; a second
+    full matrix in ``uns`` (~3× h5ad bloat) is useless for most downstream steps.
+    Keep the sidecar only when ``store_raw=True`` or ``store_raw="ondisk"``.
+    """
+    if store_raw is True or store_raw == "ondisk":
+        return
+    meta = adata.uns.get(UNS_KEY)
+    if not isinstance(meta, dict):
+        return
+    meta.pop("raw_snapshot", None)
+    meta.pop("raw_gene_list", None)
+    meta.pop("raw_gene_list_full", None)
+    meta.pop("store_raw_counts_n_genes", None)
+
+
 def _sidecar_mode(sidecar: bool | str) -> tuple[bool, bool]:
     if isinstance(sidecar, str):
         if sidecar == "ondisk":
@@ -160,7 +178,7 @@ def _store_raw_counts(
                 ondisk=ondisk,
                 snapshot_path=snapshot_path,
             )
-        _record_raw_counts_metadata(adata, overwrite=overwrite)
+            _record_raw_counts_metadata(adata, overwrite=overwrite)
 
     if mode == "auto":
         if (
@@ -430,7 +448,7 @@ def _prepare_counts_layer(
             if isinstance(meta.get("raw_snapshot"), dict):
                 meta["raw_snapshot"] = dict(meta["raw_snapshot"])
                 meta["raw_snapshot"]["source_layer"] = str(layer)
-        _record_raw_counts_metadata(adata)
+            _record_raw_counts_metadata(adata)
         # Use the explicit layer for this call only — never copy into
         # layers['counts'] (G1: permanent hijack of subsequent default calls).
         return layer
@@ -472,7 +490,7 @@ def _prepare_counts_layer(
                 if isinstance(snap, dict):
                     adata.uns[UNS_KEY]["raw_snapshot"] = dict(snap)
                     adata.uns[UNS_KEY]["raw_snapshot"]["source_layer"] = INTERNAL_COUNTS_LAYER
-            _record_raw_counts_metadata(adata)
+                _record_raw_counts_metadata(adata)
             return INTERNAL_COUNTS_LAYER
         _store_raw_counts(
             adata,

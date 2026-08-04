@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scfair"
 dynamic = ["version"]
-description = "Fair highly variable gene selection for single-cell RNA-seq"
+description = "HVG selection for scRNA-seq: auto list size (n) plus fairer allocation for small populations"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}

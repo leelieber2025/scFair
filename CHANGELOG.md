@@ -2,44 +2,91 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versions follow [Semantic Versioning](https://semver.org/). While the package
-is in the `0.x` series, defaults may still change in a minor release when new
-evidence warrants it.
+
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-08-02
+## [0.7.0] - 2026-08-04
 
-Structure auto-`k` v1.1, clearer product diagnostics, and a full GOLD-15
-product retest (append + auto vs HVG@2000).
+### Removed
 
-### Fixed
-
-- Structure auto_n **false SHORT** (Zheng-like): `short_hard` + large `n_obs` +
-  low density confidence + `n_density_pops ≤ 8` floors to 2000 **after** the
-  soft buffer (was stuck at 1000 because residual anti-SHORT only checked
-  `k ≤ 500`). Threshold was `nd ≤ 6` in an earlier draft; GOLD Zheng-20k
-  retest measured `nd=7`, so the cap is now 8.
-- Structure auto_n **true SHORT** (SLN-like): with labels (`n_types ≥ 5`) and
-  multi-core geometry (`n_density_pops ≥ 10`), skip the 500→1000 soft buffer so
-  k stays 500. Two-type boards (`n_types < 5`) still buffer (TM brain safety).
-- Product `n_top_genes="auto"` passes `label_key` / `n_types` into structure
-  estimation when available (`options=HVGOptions(label_key=...)`). Branch tags:
-  `+no_buffer:nd…_ntypes…`, `+antishort:false_short_nd_low`.
+- Cluster-aware `balance_method` values **`hybrid`**, **`score`**, and
+  **`reweight`** (and aliases). Product surface is **`append`** (default) and
+  **`none`** only.
+- Related knobs: `blend_global`, `neighbor_contrast`, `combine`,
+  `cluster_pool` / `cluster_genes`, `allocation_method`,
+  `spec_on_legitimate_units`, intermediate `resolution` /
+  `min_cluster_size` on the HVG call, and ensemble auto strategies
+  (`elbow` / `knee` / `cumfrac` / … as `n_top_genes` or `auto_n_method`).
+  Product auto is **structure only**.
 
 ### Changed
 
-- Progress / diagnosis tips are short and user-facing (no internal feature dumps
-  such as `nd=` / `branch=` / research dataset names on stderr). Soft-buffer
-  outcomes stay silent; at most two tips per call.
-- Product `append_budget` default remains the absolute **200** (calibrated near
-  base≈2000); not scaled with base. Override with `HVGOptions(append_budget=…)`.
+- HVG implementation and tests slimmed to the product path (global ranking +
+  append / none + structure auto + MT/ribo filters).
+- Structure auto keeps pair-stability helpers used by density rules; if
+  structure still fails, fall back to base `2000` with an explicit
+  `auto_message` (not a silent “from data structure” line).
+- **Default append budget (tight density rule):** floor **200** (never
+  reduced). When `n_top_genes="auto"` and `append_budget` is left `None`,
+  budget may rise with structure `n_density_pops`:
+  `m = max(200, min(300, 200 + max(0, n_need − 12) × 12))`. Fixed-k calls
+  without a user budget stay at 200. Override with
+  `options=HVGOptions(append_budget=N)`.
+- **Default `n_top_genes="auto"`** — structure-aware base list size, then
+  default `append`. Pass `n_top_genes=2000` for a fixed budget; use
+  `n_top_genes=2000, balance_method="none"` to match a single global scanpy
+  HVG pass.
+- Structure auto: when density confidence is low, prefer a classical base of
+  **2000** over short lists (except multi-core short geometry with enough
+  labeled types, which may keep a shorter base).
+- Do not leave an inline `uns["scfair"]["raw_snapshot"]` matrix after HVG
+  unless `options=HVGOptions(store_raw=True)` (or `"ondisk"`).
+- Document `batch_key` on `HVGOptions` (forwarded to scanpy on the global HVG
+  pass only).
+- **Default `filter_mito=False` and `filter_ribo=False`** on `HVGOptions`:
+  keep the global HVG ranking as-is. Opt in with
+  `options=HVGOptions(filter_mito=True, filter_ribo=True)` to drop MT /
+  ribosomal structural-protein symbols and refill (markers kept;
+  auto-detects human/mouse naming via `gene_nomenclature`).
+- Progress is on by default for auto on medium-size data (≥3k cells) as well as
+  large fixed-k runs. After auto, stderr and
+  `uns["scfair"]["hvg"]["auto_message"]` carry one plain-language line for the
+  chosen base size.
+- Optional faster auto pass: `options=HVGOptions(structure_n_seeds=1)` (product
+  default remains multi-seed).
 
 ### Documentation
 
-- GOLD-15 product retest tables (pred n / used n / best n + ΔARI) and development
-  log §5.49 archive of the v1.1 decision record.
+- User guide, README, quickstart, and FAQ emphasize two product goals: choosing
+  a sensible gene budget (`n`), and fairer allocation of HVG slots for smaller
+  populations. Auto is described as a safe default, not a claim of global
+  optimality.
+- Quickstart and README show a full downstream scanpy path without subsetting
+  the gene matrix.
+
+## [0.6.0] - 2026-08-02
+
+### Fixed
+
+- Structure auto: large datasets with few density cores and low density
+  confidence floor short base lists to 2000 after the soft size buffer.
+- Structure auto: with labels (`n_types ≥ 5`) and multi-core short geometry,
+  keep base k=500 (skip the 500→1000 soft buffer). Boards with fewer labeled
+  types still use the soft buffer.
+- `n_top_genes="auto"` passes `label_key` / `n_types` into structure estimation
+  when provided via `HVGOptions`.
+
+### Changed
+
+- Progress and diagnosis tips stay short and user-facing (no internal feature
+  dumps on stderr). At most two tips per call.
+- Default `append_budget` is **200** (absolute, not scaled with base). Override
+  with `HVGOptions(append_budget=…)`.
+
+### Documentation
+
+- Product tables for auto base size and append vs HVG@2000 (see docs).
 
 ## [0.5.0] - 2026-08-02
 
@@ -75,9 +122,9 @@ First public release prepared for PyPI and Read the Docs.
   list size is `n_top_genes + append_budget`, capped at `n_vars`.
 - Intermediate clustering (when used) scales genes before PCA by default
   (`HVGOptions.scale_clustering=True`).
-- Structure auto-`k` applies a soft buffer and an anti-SHORT floor when density
-  confidence is low, so under-powered short lists are less common on large,
-  multi-type PBMCs.
+- Structure auto-`k` applies a soft buffer and floors short lists when density
+  confidence is low, so under-powered short lists are less common on large
+  multi-type datasets.
 - Non-selected genes use `NaN` in `var["highly_variable_rank"]` (scanpy
   seurat_v3 convention).
 
@@ -98,8 +145,8 @@ First public release prepared for PyPI and Read the Docs.
 ### Documentation
 
 - README oriented for PyPI / GitHub (install, first run, status).
-- User-facing docs in American English; research notes and paper tables stay
-  local and are not part of the published documentation tree.
+- User-facing docs in American English; research notes stay out of the
+  published documentation tree.
 
 ## [0.3.0] - 2026-08-01
 

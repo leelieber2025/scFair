@@ -24,7 +24,7 @@ Every successful call writes a structured record, including:
 h = adata.uns["scfair"]["hvg"]
 h["n_top_genes_used"]
 h.get("diagnosis")
-h.get("auto_n")  # present when n_top_genes="auto"
+h.get("auto_n")  # present for the default auto path (and any auto call)
 ```
 
 If a call fails after partial writes, scFair rolls back HVG columns when it can
@@ -38,6 +38,14 @@ For count-based flavors, scFair ensures a usable raw counts matrix (typically
 layer disagrees with integer `.X`; staging uses an internal layer that is
 removed after the call. Prefer an explicit `layer=` when you already know where
 raw counts live.
+
+## No raw-count matrix left in `uns` (default)
+
+By default the call does **not** keep a second full counts table under
+`adata.uns["scfair"]["raw_snapshot"]`. That sidecar is opt-in via
+`options=HVGOptions(store_raw=True)` (or `"ondisk"`) for the rare case where you
+need the pre-subset gene universe after `subset=True` or for external tooling.
+Most analyses only need `layers["counts"]` plus the HVG mask.
 
 ## Planning helpers
 
