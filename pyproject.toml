@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scfair"
 dynamic = ["version"]
-description = "HVG selection for scRNA-seq: structure-aware auto list size (n), optional same-ranking list buffer, and diagnostics"
+description = "HVG selection for scRNA-seq: structure-aware auto list size (n) plus same-rank append at the cutoff, with diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}

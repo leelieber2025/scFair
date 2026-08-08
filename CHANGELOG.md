@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- Restore **Problem B** framing: unfair HVG allocation **at the cutoff**
+  (large types fill top-`k`; small-type markers often sit just below). Product
+  `append` is documented as a **conservative same-rank response** to that
+  unfairness (`top-(k+m)`), without reviving cluster-conditional reallocation
+  claims.
+
 ## [0.8.0] - 2026-08-08
 
 ### Changed

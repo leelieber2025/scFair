@@ -7,8 +7,8 @@
 
 ## What scFair does
 
-scFair is HVG selection focused on **list size**, with a small optional buffer
-and diagnostics. Easy to get wrong if you only call
+scFair is HVG selection for two problems that show up in almost every
+scRNA-seq pipeline — easy to get wrong if you only call
 `scanpy.pp.highly_variable_genes` with a copied `n_top_genes=2000`.
 
 ### 1. How many genes (`n`)?
@@ -24,22 +24,32 @@ worth more than a sub-second HVG pass.** We do **not** claim auto is always
 optimal — only that it is a safer default than an unexamined fixed length.
 Pass a fixed int when a paper or locked protocol already requires one.
 
-### 2. How many populations (no resolution sweep)?
+### 2. Unfair HVG allocation at the cutoff
+
+Global ranking measures variability across **all** cells. Large populations
+fill the top of the list; markers for smaller types often land **just below**
+a fixed top-`k` cutoff. They are not uninformative — they lose the vote count
+to bulk variation. That is unfair **allocation of slots** in a fixed-length
+list.
+
+**What scFair does:** keep a standard global ranking as the backbone, then by
+default (`balance_method="append"`) **freeze** the base top-`k` and **append**
+a short same-rank tail of near-miss genes so they are not discarded. The
+selected set equals **`top-(k+m)`**. This is a **conservative response to
+cutoff unfairness** — not cluster-conditional reallocation (per-cluster
+quota / hybrid methods were removed). Use `balance_method="none"` for exact
+top-`k`.
+
+### 3. How many populations (optional)
 
 {func}`scfair.pp.estimate_n_populations` reads a 3D density field after
-`sc.pp.neighbors`. It is advisory (does not change genes) and works best on
+`sc.pp.neighbors`. Advisory only (does not change genes); works best on
 well-separated data up to ~20 populations.
-
-### 3. Optional list buffer (`append`)
-
-Default `balance_method="append"` extends the **same** global ranking by
-`append_budget` genes → **`top-(k+m)`**, not population-aware reallocation.
-Use `balance_method="none"` for exact top-`k`.
 
 ### Default HVG in one line
 
 ```text
-auto n (default)  →  global top-k  →  optional same-ranking buffer
+auto n (default)  →  global top-k  →  same-rank append (cutoff buffer)
 ```
 
 ## Where to go

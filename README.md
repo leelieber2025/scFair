@@ -6,14 +6,17 @@
 [![CI](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml/badge.svg)](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**scFair** is drop-in HVG selection for single-cell RNA-seq, plus a density
-population count that does not need a Leiden resolution sweep:
+**scFair** is drop-in HVG selection for single-cell RNA-seq aimed at two
+problems every pipeline hits — plus an optional density population count:
 
 | Problem | What goes wrong | What scFair does |
 |---------|-----------------|------------------|
-| **How many genes (`n`)?** | Nobody knows a priori what length is safe. Copying `2000` is a silent gamble. | **`n_top_genes="auto"`** (**default**) estimates a base size from density structure. That multi-seed cost is intentional: **avoiding a wrong `n` is worth the compute** when you cannot predict a reasonable length. Pass a fixed int only when the protocol is already locked. |
-| **How many populations?** | Users sweep Leiden resolution by hand. | **`estimate_n_populations`** reads a 3D density field (needs `sc.pp.neighbors` first). Strong on well-separated data up to ~20 populations. |
-| **List length near the cutoff** | Near-miss genes just below a hard top-`k` cutoff are discarded. | Default **`append`** extends the **same** global ranking by `append_budget` genes → mathematically **`top-(k+m)`**, not population-aware reallocation. Use `balance_method="none"` for pure top-`k`. |
+| **How many genes (`n`)?** | Nobody knows a priori what length is safe. Copying `2000` is a silent gamble. | **`n_top_genes="auto"`** (**default**) estimates a base size from density structure. That multi-seed cost is intentional: **avoiding a wrong `n` is worth the compute**. Pass a fixed int only when the protocol is already locked. |
+| **Unfair HVG allocation at the cutoff** | Global ranking is driven by large populations. Markers for smaller types often sit **just below** a hard top-`k` cut and are discarded — not because they are uninformative, but because bulk variation fills the list first. | Default **`append`** freezes the global top-`k` backbone and adds a short **same-rank** tail (`append_budget`) so near-miss genes are not thrown away. The set equals **`top-(k+m)`**. This is a **conservative response to cutoff unfairness**, not cluster-conditional reallocation (those methods were removed). Use `balance_method="none"` for pure top-`k`. |
+
+Optional: **`estimate_n_populations`** reads a 3D density field after
+`sc.pp.neighbors` (how many populations, without sweeping Leiden resolution;
+works best up to ~20 well-separated populations).
 
 Docs: [Read the Docs](https://scfair.readthedocs.io/en/latest/).
 
@@ -47,7 +50,7 @@ sc.pp.neighbors(adata)
 sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False)
 ```
 
-Default path: structure auto-`n` + same-ranking list buffer (`append`). Auto
+Default path: structure auto-`n` + same-rank **append** (cutoff buffer). Auto
 runs extra multi-seed graph builds and is slower than a fixed `k` — that is
 by design. **A silent wrong list length is more expensive than the compute.**
 Read `adata.uns["scfair"]["hvg"]["auto_message"]` for a one-line summary of the

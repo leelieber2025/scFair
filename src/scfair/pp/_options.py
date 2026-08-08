@@ -89,8 +89,8 @@ class HVGOptions:
     marker_extra: bool = True
 
     # Extra genes beyond base ``n_top_genes`` / auto-``k`` from the **same**
-    # global ranking (ranks ``k+1 … k+m``). The final set is mathematically
-    # ``top-(k+m)`` — a list-length buffer, not population-aware reallocation.
+    # global ranking (ranks ``k+1 … k+m``). Softens unfair hard cutoffs
+    # (near-miss genes kept); set equals ``top-(k+m)``, not cluster quotas.
     # None → product default floor 200; on ``n_top_genes="auto"`` may rise with
     # structure density cores. Explicit ``0``/``N`` is never overridden.
     append_budget: int | None = None
@@ -173,7 +173,7 @@ def resolve_hvg_options(
             f"removed option(s): {removed_hit}. Cluster-aware balance methods "
             "(hybrid/score/reweight), auto_n_method, and related knobs were "
             "deleted. Product auto is structure-only; use balance_method="
-            "'append' (list buffer) or 'none' (top-k only)."
+            "'append' (same-rank cutoff tail) or 'none' (top-k only)."
         )
 
     field_names = {f.name for f in fields(HVGOptions)}

@@ -1,12 +1,13 @@
 # How selection works
 
-scFair is built around **list size** and a small optional buffer. Everything
-else (flavors, diagnostics) is secondary. Cluster-aware reallocation methods
-were removed from the product.
+scFair is built around **two** problems. Everything else (flavors,
+diagnostics) is secondary. Cluster-aware reallocation methods were removed
+from the product; the shipped path still addresses cutoff unfairness with a
+conservative same-rank append.
 
-## What the product actually does
+## Two problems
 
-### 1 — How many genes (`n`)?
+### Problem A — How many genes (`n`)?
 
 Pipelines almost always need a gene budget. **There is no a priori correct
 length** — copying 2000 from a tutorial is simple and easy to get wrong
@@ -23,38 +24,54 @@ cannot predict a reasonable length. When density confidence is low, it still
 prefers classical **2000** over a risky short list. Pass a fixed int only for
 papers and locked protocols.
 
-### 2 — List-length buffer (`append`)
+### Problem B — Unfair HVG allocation at the cutoff
 
-Default **`balance_method="append"`** extends the **same** global ranking by
-`append_budget` genes (ranks `k+1 … k+m`). The selected set is mathematically
-**`top-(k+m)`** — equivalent to `balance_method="none"` with
-`n_top_genes=k+m`. It is a **conservative list buffer**, not
-population-aware reallocation of HVG slots.
+Global HVG ranking measures variability across all cells. When a few cell types
+dominate, the top of the list is filled by genes that separate those large
+groups. Markers for smaller populations often sit **just below** a fixed
+cutoff. They are not uninformative — they lose the **vote count** to bulk
+variation. That is unfair **allocation of slots** in a fixed-length list, not
+a failure of “finding variable genes” in the abstract.
+
+**What scFair does:** keep a standard global ranking as the backbone, then by
+default **`append`** a short extension of near-miss genes from the **same**
+ranking so genes that barely missed the base cut are not discarded. The base
+top-`k` is **frozen** — nothing is pushed out. The selected set equals
+**`top-(k+m)`** (same genes as `balance_method="none"` with
+`n_top_genes=k+m`).
+
+**What we claim:** append is a **conservative response to cutoff unfairness**
+— a same-rank tail that softens a hard truncation. It is **not**
+cluster-conditional reallocation (no per-cluster quotas, no intermediate
+Leiden for gene identity). Those product methods were removed; do not read
+`append` as a restored hybrid.
 
 Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
 
-## Default path: auto `n` + list buffer
+## Default path: auto `n` + append
 
 1. Rank all genes with a standard global method (`flavor="seurat_v3"` by default).
-2. Choose base size **`k`** with structure-aware auto (default). Low density
-   confidence floors soft short lists to classical **2000** (except labeled
-   true-SHORT paths). Pass `n_top_genes=2000` to skip auto.
-3. If append is on: take the next `append_budget` genes from the same ranking.
-   Product default floor **200**; when `n_top_genes="auto"`, budget may rise
-   with structure `n_density_pops` as
+2. **Problem A:** choose base size **`k`** with structure-aware auto (default).
+   Low density confidence floors soft short lists to classical **2000**
+   (except labeled true-SHORT paths). Pass `n_top_genes=2000` to skip auto.
+3. Freeze the top `k` genes (familiar HVG backbone).
+4. **Problem B:** append the next `append_budget` genes from the same ranking
+   (ranks `k+1 … k+m`). Product default floor **200**; when
+   `n_top_genes="auto"`, budget may rise with structure `n_density_pops` as
    `m = max(200, min(300, 200 + max(0, n_need − 12) × 12))`. Explicit
    `HVGOptions(append_budget=N)` always wins.
 
 Properties that matter in practice:
 
 - No intermediate clustering for gene selection.
+- Nothing is removed from the base top-`k` (allocation is “base + tail”).
 - Final size is `k + append_budget` (capped at `n_vars`) when append is on.
 - Auto is multi-seed and slower than a fixed `k`. That cost buys a
   data-informed list length when you would otherwise guess.
 
 **Not GiniClust / CellSIUS.** Those methods score **rare** genes (normalized
 Gini, cluster-wise tests, evidence communities). Product `append` only adds
-near-miss genes from the **global** HVG list — slot fairness at a fixed
+near-miss genes from the **global** HVG list — slot handling at a fixed
 cutoff, not rare-subtype discovery. For a known missing type, force-include
 markers (`marker_mode="force"`) rather than expecting auto rare compensation.
 

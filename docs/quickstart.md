@@ -2,15 +2,17 @@
 
 Install the package, run one HVG selection, and read the main outputs.
 
-scFair is aimed at problems you already face in every scRNA-seq workflow:
+scFair is aimed at two things you already face in every scRNA-seq workflow:
 
 1. **How many HVGs (`n`)?** — nobody knows a safe length a priori. Default
    `"auto"` estimates a base size from the data so you do not ship a silent
    wrong `n` by copying `2000`. The extra compute is intentional. Use a fixed
    int only when a paper or protocol is already locked.
-2. **List buffer near the cutoff** — default `"append"` extends the **same**
-   global ranking by a short tail (`top-(k+m)`), not population-aware
-   reallocation.
+2. **Unfair allocation at the cutoff** — large populations dominate a plain
+   top-`k` list; smaller-type markers often sit just below the cut. Default
+   `"append"` freezes that ranking and adds a short same-rank tail
+   (`top-(k+m)`) so near-miss genes are not discarded. Conservative cutoff
+   handling, not cluster-conditional reallocation.
 
 ## 1. Install
 

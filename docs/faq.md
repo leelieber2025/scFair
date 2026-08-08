@@ -21,10 +21,14 @@ estimates a base size from density structure so users who would otherwise copy
 always optimal — we claim the **default should not force you to guess**.
 Override with a fixed int only when the protocol is already locked.
 
-**2. Optional list buffer (`append`)**  
-Default `append` extends the **same** global ranking by `append_budget` genes.
-The set equals `top-(k+m)` — **not** population-aware reallocation. Use
-`balance_method="none"` for pure top-`k`. Cluster-aware methods were removed.
+**2. Unfair HVG allocation at the cutoff?**  
+A plain top-`k` global ranking is dominated by large populations; markers for
+smaller types often miss the cut. Default `append` keeps that ranking as a
+frozen backbone and adds a short **same-rank** tail of near-miss genes so the
+base top-`k` is never displaced. That is a **conservative response to cutoff
+unfairness** — not a new variance model and not cluster-conditional
+reallocation (those methods were removed). Use `balance_method="none"` for
+pure top-`k`.
 
 See {doc}`user_guide/method` for the full story.
 
@@ -32,9 +36,10 @@ See {doc}`user_guide/method` for the full story.
 
 **No, for the gene set.**  
 `balance_method="append"` with base `k` and budget `m` selects the same genes
-as `balance_method="none"` with `n_top_genes=k+m`. The buffer is a convenience
-default (and a place to record `n_base` vs tail in metadata), not a fairness
-algorithm.
+as `balance_method="none"` with `n_top_genes=k+m`. The difference is product
+semantics: auto chooses `k` (problem A), then append adds a fixed-style tail
+for cutoff near-misses (problem B), and metadata records base vs tail. It is
+not a per-population quota algorithm.
 
 ## How do I restore counts after `store_raw=True`?
 

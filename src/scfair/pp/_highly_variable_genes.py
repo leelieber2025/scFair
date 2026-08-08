@@ -1,16 +1,18 @@
-"""Highly variable gene selection with structure-aware auto list size.
+"""Highly variable gene selection: structure-aware auto-``n`` + cutoff append.
 
 Public entry point: :func:`highly_variable_genes`.
 
 Product path:
 
 1. **How many genes (``n``)?** Default ``n_top_genes="auto"`` estimates a base
-   size ``k`` from density structure (not proven optimal — a safe prompt).
-2. **List buffer (optional).** Default ``balance_method="append"`` extends the
-   same global ranking by ``append_budget`` genes. The selected set is
-   mathematically ``top-(k+m)`` from that ranking — **not** population-aware
-   reallocation. Pass ``balance_method="none"`` (or ``append_budget=0``) for
-   pure top-``k``.
+   size ``k`` from density structure (safer than guessing; not proven optimal).
+2. **Unfair allocation at the cutoff.** Global HVG ranking is dominated by large
+   populations; genes useful for smaller types often sit just below top-``k``.
+   Default ``balance_method="append"`` freezes the global backbone and adds a
+   short **same-rank** tail (``append_budget``). The set is
+   ``top-(k+m)`` — a conservative response to cutoff unfairness, **not**
+   cluster-conditional reallocation. Pass ``balance_method="none"`` (or
+   ``append_budget=0``) for pure top-``k``.
 
 Cluster-aware reallocation methods (``hybrid`` / ``score`` / ``reweight``)
 were removed.
@@ -134,7 +136,7 @@ def highly_variable_genes(
     options: HVGOptions | None = None,
     **legacy_kwargs: Any,
 ) -> pd.DataFrame | None:
-    """Select highly variable genes (product: structure auto-``n`` + list buffer).
+    """Select highly variable genes (product: structure auto-``n`` + cutoff append).
 
     Parameters
     ----------
@@ -153,11 +155,11 @@ def highly_variable_genes(
         counts: ``seurat_v3``, ``seurat_v3_paper``, ``pearson_residuals``;
         log: ``seurat``, ``cell_ranger``.
     balance_method
-        ``"append"`` (default): select global top-``k`` plus the next
-        ``append_budget`` genes from the **same** ranking. Mathematically
-        equivalent to ``balance_method="none"`` with
-        ``n_top_genes=k+append_budget`` — a conservative list-length buffer,
-        **not** fairer per-population allocation.
+        ``"append"`` (default): freeze global top-``k``, then add the next
+        ``append_budget`` genes from the **same** ranking so near-miss genes
+        (often relevant to less dominant structure) are not discarded by a
+        hard cut. The set equals ``top-(k+m)`` — a conservative response to
+        **cutoff unfairness**, not cluster-conditional reallocation.
         ``"none"``: top-``k`` only (scanpy-like fixed list size).
     mode
         ``"auto"`` / ``"compact"`` / ``"balanced"`` / ``"fine"`` — steers
@@ -282,7 +284,7 @@ def highly_variable_genes(
     if balance_method not in _BALANCE_ALIASES:
         raise ValueError(
             f"Unknown balance_method={balance_method!r}. "
-            "Use 'append' (default list buffer) or 'none' (top-k only). "
+            "Use 'append' (default same-rank cutoff tail) or 'none' (top-k only). "
             "Cluster-aware methods (hybrid/score/reweight) were removed."
         )
     method = _BALANCE_ALIASES[balance_method]
