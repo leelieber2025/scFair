@@ -18,7 +18,6 @@ HVG_OPTION_FIELD_NAMES: frozenset[str] = frozenset(
     {
         "n_top_min",
         "n_top_max",
-        "auto_n_method",
         "structure_n_seeds",
         "marker_extra",
         "global_score",
@@ -39,9 +38,10 @@ HVG_OPTION_FIELD_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# Names removed with the cluster-aware balance methods — give a clear error.
+# Names removed with the cluster-aware balance methods / dead auto strategies.
 _REMOVED_OPTION_NAMES: frozenset[str] = frozenset(
     {
+        "auto_n_method",
         "balance_power",
         "neighbor_contrast",
         "combine",
@@ -78,9 +78,6 @@ class HVGOptions:
     # auto bounds / structure seeds
     n_top_min: int = 500
     n_top_max: int = 5000
-    # Product auto is structure-only. Kept for clarity / future; non-structure
-    # values raise in highly_variable_genes.
-    auto_n_method: str = "structure"
     # Structure auto multi-seed count. None → product default (3). Use 1 for
     # a faster exploratory pass (less stable k).
     structure_n_seeds: int | None = None
@@ -91,14 +88,15 @@ class HVGOptions:
     # markers
     marker_extra: bool = True
 
-    # balance_method="append": extra genes beyond the frozen global top-k base
-    # from the same global ranking (ranks k+1 … k+m).
-    # None → product default: floor 200; on n_top_genes="auto", may rise with
-    # structure density cores (tight rule). Explicit 0/N is never overridden.
+    # Extra genes beyond base ``n_top_genes`` / auto-``k`` from the **same**
+    # global ranking (ranks ``k+1 … k+m``). The final set is mathematically
+    # ``top-(k+m)`` — a list-length buffer, not population-aware reallocation.
+    # None → product default floor 200; on ``n_top_genes="auto"`` may rise with
+    # structure density cores. Explicit ``0``/``N`` is never overridden.
     append_budget: int | None = None
 
-    # Opt-in: keep a full raw-count sidecar in uns['scfair']['raw_snapshot']
-    # after HVG. Default False.
+    # Opt-in: keep a full raw-count sidecar in ``uns['scfair']['raw_snapshot']``
+    # after HVG. Restore with :func:`~scfair.pp.restore_raw_counts`. Default False.
     store_raw: bool | str = False
     snapshot_path: str | None = None
 
@@ -111,7 +109,9 @@ class HVGOptions:
     max_mean: float = 3.0
     min_disp: float = 0.5
     max_disp: float = float("inf")
-    # obs column for scanpy per-batch HVG merge on the global ranking only.
+    # obs column for scanpy per-batch HVG merge. Selection then follows
+    # scanpy's ``highly_variable_rank`` (nbatches + median rank), not the
+    # mean of per-batch score columns.
     batch_key: str | None = None
     # Drop MT / ribosomal structural-protein symbols from the final HVG set
     # (refill from global rank). Markers are never filtered.
@@ -123,11 +123,13 @@ class HVGOptions:
     gene_nomenclature: str | None = None
 
     def merged(self, **overrides: Any) -> HVGOptions:
-        """Return a copy with non-None overrides applied."""
+        """Return a copy with non-None overrides applied (``None`` skips)."""
         data = asdict(self)
         for k, v in overrides.items():
             if k not in data:
                 raise TypeError(f"unknown HVGOptions field: {k!r}")
+            if v is None:
+                continue
             data[k] = v
         return HVGOptions(**data)
 
@@ -139,8 +141,9 @@ def resolve_hvg_options(
     """Merge explicit ``options`` with deprecated top-level kwargs.
 
     ``options`` must be ``None`` or an :class:`HVGOptions` instance (not a bare
-    dict). When both ``options=`` and a legacy top-level kwarg set the same
-    field, raise ``ValueError``.
+    dict). ``options=`` and legacy top-level kwargs must not be mixed: if both
+    are present, raise ``ValueError`` (dataclass fields have no "was set"
+    sentinel, so per-field conflict detection is not possible).
     """
     if options is None:
         base = HVGOptions()
@@ -168,8 +171,9 @@ def resolve_hvg_options(
     if removed_hit:
         raise TypeError(
             f"removed option(s): {removed_hit}. Cluster-aware balance methods "
-            "(hybrid/score/reweight) and their knobs were deleted. "
-            "Use balance_method='append' or 'none'."
+            "(hybrid/score/reweight), auto_n_method, and related knobs were "
+            "deleted. Product auto is structure-only; use balance_method="
+            "'append' (list buffer) or 'none' (top-k only)."
         )
 
     field_names = {f.name for f in fields(HVGOptions)}
@@ -184,9 +188,9 @@ def resolve_hvg_options(
         conflict = sorted(k for k in overrides if k in field_names)
         if conflict:
             raise ValueError(
-                "Conflicting knobs: pass each field either via "
-                f"options=HVGOptions(...) or as a deprecated top-level kwarg, "
-                f"not both. Conflicting: {conflict}."
+                "Do not mix options=HVGOptions(...) with deprecated top-level "
+                f"kwargs. Put every secondary knob on the HVGOptions instance, "
+                f"or pass only legacy kwargs (not both). Got legacy: {conflict}."
             )
 
     return base.merged(**overrides)

@@ -2,14 +2,15 @@
 
 Install the package, run one HVG selection, and read the main outputs.
 
-scFair is aimed at two things you already face in every scRNA-seq workflow:
+scFair is aimed at problems you already face in every scRNA-seq workflow:
 
-1. **How many HVGs (`n`)?** — default `"auto"` suggests a base size from the
-   data. It is a **safe starting point**, not a claim that this `n` is always
-   best. Use a fixed `n_top_genes=2000` for papers.
-2. **Unfair gene allocation** — large populations dominate a plain top-`k`
-   list. Default `"append"` keeps that ranking but adds a short tail of
-   near-miss genes so smaller types are less likely to lose every slot.
+1. **How many HVGs (`n`)?** — nobody knows a safe length a priori. Default
+   `"auto"` estimates a base size from the data so you do not ship a silent
+   wrong `n` by copying `2000`. The extra compute is intentional. Use a fixed
+   int only when a paper or protocol is already locked.
+2. **List buffer near the cutoff** — default `"append"` extends the **same**
+   global ranking by a short tail (`top-(k+m)`), not population-aware
+   reallocation.
 
 ## 1. Install
 
@@ -58,7 +59,8 @@ By default this is:
 
 Final list size is `k + append_budget`, capped at `n_vars`. The default append
 path does not re-rank genes with intermediate clustering. Auto needs extra
-graph builds, so large datasets take longer than a fixed `k`.
+graph builds and is slower than a fixed `k` — that is the price of not guessing
+`n`.
 
 See what auto picked:
 
@@ -71,16 +73,22 @@ print(h.get("auto_n", {}).get("rule_branch"))  # optional diagnostics
 print(h.get("auto_n", {}).get("append_budget_info"))  # density rule detail
 ```
 
-### Fixed size (faster / paper protocol)
+### Fixed size (locked paper / protocol only)
 
 ```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000)
 ```
 
-### Match scanpy exactly (no append)
+### Match scanpy gene set (no append)
 
 ```python
+# same flavor + n_top_genes + batch_key (if any) → same selected genes as scanpy
 scf.pp.highly_variable_genes(adata, n_top_genes=2000, balance_method="none")
+# multi-batch:
+# scf.pp.highly_variable_genes(
+#     adata, n_top_genes=2000, balance_method="none",
+#     options=scf.pp.HVGOptions(batch_key="batch"),
+# )
 ```
 
 ## 3. Downstream (keep the full matrix)
@@ -97,7 +105,7 @@ sc.pp.log1p(adata)
 sc.pp.scale(adata, max_value=10)
 sc.tl.pca(adata)                       # uses highly_variable by default
 sc.pp.neighbors(adata)
-sc.tl.leiden(adata)
+sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False)
 # sc.tl.umap(adata)                    # optional
 ```
 
@@ -128,7 +136,8 @@ which genes are selected.
 scf.pp.diagnose_from_labels(adata.obs["cell_type"])
 
 # Label-free: how many populations the density field supports
-# (expects neighbors already computed, or computes them as needed)
+# needs sc.pp.neighbors(adata) run first (or pass embedding=...);
+# without a graph it returns n_populations=None, confidence="none"
 est = scf.pp.estimate_n_populations(adata)
 print(est.n_populations, est.confidence)
 ```

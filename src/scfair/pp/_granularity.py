@@ -345,9 +345,12 @@ def _embedding_3d(
 
     key = neighbors_key or "neighbors"
     if key not in adata.uns and "connectivities" not in adata.obsp:
-        logger.warning(
+        warnings.warn(
             "estimate_n_populations needs a neighbour graph; run "
-            "sc.pp.neighbors(adata) first (or pass embedding=...)."
+            "sc.pp.neighbors(adata) first (or pass embedding=...). "
+            "Returning n_populations=None.",
+            UserWarning,
+            stacklevel=3,
         )
         return None
 
@@ -389,21 +392,24 @@ def estimate_n_populations(
 ) -> GranularityEstimate:
     """Report how many populations this dataset's density field supports.
 
-    **Advisory. This does not run or change gene selection**, and nothing in
-    :func:`~scfair.pp.highly_variable_genes` consults it. It answers the
-    question a resolution parameter is usually a proxy for — *how many
-    populations are actually there* — by reading the density field of a 3D
-    embedding rather than by asking the caller to guess a number.
+    **This is the label-free alternative to sweeping Leiden resolution** for
+    the question *how many populations are there?* — not which cell belongs
+    where. On well-separated synthetic blobs it recovers the true count with
+    high confidence up to roughly **~20 populations**; with many tiny groups
+    (e.g. 30 types × ~80 cells) it can under-count. Always run
+    ``sc.pp.neighbors`` first (or pass ``embedding=``).
 
-    The count, the bandwidth it used and the merge threshold are written to
-    ``adata.uns['scfair'][key_added]``, so a partition can be reproduced from
-    the record rather than from the defaults in force at the time.
+    **Advisory.** Nothing here changes gene selection, and nothing in
+    :func:`~scfair.pp.highly_variable_genes` consults it. The count, bandwidth
+    and merge threshold are written to ``adata.uns['scfair'][key_added]``.
 
     Parameters
     ----------
     adata
-        AnnData with a neighbour graph (``sc.pp.neighbors``). Its existing
-        ``obsm['X_umap']`` is preserved.
+        AnnData. Without ``embedding=``, **requires** a neighbour graph from
+        ``sc.pp.neighbors(adata)`` (``uns['neighbors']`` or
+        ``obsp['connectivities']``). Missing graph → ``UserWarning`` and
+        ``n_populations=None``. Existing ``obsm['X_umap']`` is preserved.
     embedding
         Use this ``(n_obs, d)`` array instead of computing a UMAP.
     n_components

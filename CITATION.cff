@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "scFair: Fair highly variable gene selection for single-cell RNA-seq"
+title: "scFair: structure-aware highly variable gene selection for single-cell RNA-seq"
 message: >-
   If you use this software, please cite it using the metadata below.
 type: software
@@ -9,13 +9,16 @@ authors:
     given-names: "Zhao (李钊)"
     email: "leelieber@gmail.com"
 repository-code: "https://github.com/leelieber2025/scFair"
-url: "https://github.com/leelieber2025/scFair"
+url: "https://scfair.readthedocs.io"
 license: Apache-2.0
-version: 0.7.0
+version: 0.8.0
+date-released: "2026-08-08"
+# Add when a Zenodo archive exists, e.g.:
+# doi: 10.5281/zenodo.XXXXXXX
 keywords:
   - single-cell
   - RNA-seq
   - HVG
   - highly variable genes
-  - fairness
+  - structure
   - bioinformatics

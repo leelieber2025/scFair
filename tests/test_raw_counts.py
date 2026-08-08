@@ -130,8 +130,8 @@ def test_is_integer_counts_like_uses_atol_only():
 def test_is_integer_counts_like_catches_trailing_fractional_sparse():
     """Isolated non-integer at the end of a large sparse .data must not pass.
 
-    Strided sampling with max_check≪nnz could miss a single tail value; full
-    check up to 1e7 nnz closes that hole.
+    Full check covers typical sizes; above the threshold, pinned endpoints
+    still catch a fractional last entry.
     """
     n = 200_000
     data = np.ones(n, dtype=np.float64)
@@ -145,6 +145,22 @@ def test_is_integer_counts_like_catches_trailing_fractional_sparse():
     data2 = np.ones(n, dtype=np.float64)
     X2 = sp.csr_matrix((data2, indices, indptr), shape=(n, 1))
     assert _is_integer_counts_like(X2)
+
+
+def test_is_integer_counts_like_pins_endpoints_when_subsampled():
+    """Above full_check_upto, first/mid/last pins catch local pollution."""
+    n = 50_000
+    data = np.ones(n, dtype=np.float64)
+    data[-1] = 0.5
+    indptr = np.arange(0, n + 1, dtype=np.int32)
+    indices = np.zeros(n, dtype=np.int32)
+    X = sp.csr_matrix((data, indices, indptr), shape=(n, 1))
+    # Force subsample path with a tiny full_check threshold.
+    assert not _is_integer_counts_like(X, full_check_upto=1000, max_check=500)
+    data[0] = -1.0
+    data[-1] = 1.0
+    Xneg = sp.csr_matrix((data, indices, indptr), shape=(n, 1))
+    assert not _is_integer_counts_like(Xneg, full_check_upto=1000, max_check=500)
 
 
 def test_sparse_roundtrip(adata_counts_sparse):
@@ -217,17 +233,23 @@ def test_resolve_aligned_from_raw_after_gene_subset(adata_counts):
     assert np.allclose(np.asarray(mat, dtype=float), X_full[:, :5])
 
 
-def test_public_api_does_not_export_store_restore():
+def test_public_api_exports_restore_not_store():
     import scfair as scf
     import scfair.pp as pp
 
+    # store remains private (via HVGOptions.store_raw); restore is public.
     assert not hasattr(scf, "store_raw_counts")
-    assert not hasattr(scf, "restore_raw_counts")
     assert not hasattr(pp, "store_raw_counts")
-    assert not hasattr(pp, "restore_raw_counts")
     assert "store_raw_counts" not in scf.__all__
+    assert hasattr(scf, "restore_raw_counts")
+    assert hasattr(pp, "restore_raw_counts")
+    assert "restore_raw_counts" in scf.__all__
+    assert "restore_raw_counts" in pp.__all__
     assert "highly_variable_genes" in scf.__all__
     assert "highly_variable_genes" in pp.__all__
+    # Implementation details not exported
+    assert "recommend_cluster_resolution" not in pp.__all__
+    assert "estimate_n_top_structure" not in pp.__all__
 
 
 def test_explicit_layer_refreshes_a_stale_snapshot():
@@ -289,6 +311,33 @@ def test_matrix_fingerprint_uses_column_sums():
     assert int(np.count_nonzero(a)) == int(np.count_nonzero(b))
     assert _matrix_fingerprint(a) != _matrix_fingerprint(b)
     assert _matrix_fingerprint(a) == _matrix_fingerprint(a.copy())
+
+
+def test_matrix_fingerprint_ignores_storage_format():
+    """Dense vs CSR of the same counts must fingerprint equal (no false mismatch)."""
+    import scipy.sparse as sp
+
+    from scfair.pp._raw_counts import (
+        INTERNAL_COUNTS_LAYER,
+        _matrix_fingerprint,
+        _prepare_counts_layer,
+    )
+
+    rng = np.random.default_rng(7)
+    dense = rng.poisson(2.0, size=(50, 30)).astype(np.float32)
+    sparse = sp.csr_matrix(dense)
+    assert _matrix_fingerprint(dense) == _matrix_fingerprint(sparse)
+
+    # End-to-end: mixed format with identical content must keep layers['counts'].
+    import anndata as ad
+
+    adata = ad.AnnData(X=sparse.copy())
+    adata.obs_names = [f"c{i}" for i in range(50)]
+    adata.var_names = [f"g{i}" for i in range(30)]
+    adata.layers["counts"] = dense.copy()  # same values, dense storage
+    used = _prepare_counts_layer(adata)
+    assert used == "counts"
+    assert INTERNAL_COUNTS_LAYER not in adata.layers
 
 
 def test_explicit_layer_does_not_materialize_into_counts():
@@ -387,3 +436,27 @@ def test_log_normalized_X_keeps_counts_layer():
 
     assert _prepare_counts_layer(adata) == "counts"
     assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(X))
+
+
+def test_log_X_without_counts_uses_internal_layer():
+    """Log .X and no counts layer must not invent layers['counts'] from log data."""
+    import anndata as ad
+    import numpy as np
+    import pytest
+    import scanpy as sc
+
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER, _prepare_counts_layer
+
+    rng = np.random.default_rng(6)
+    X = rng.poisson(2.0, size=(40, 15)).astype(np.float32)
+    adata = ad.AnnData(X=X.copy())
+    adata.obs_names = [f"c{i}" for i in range(40)]
+    adata.var_names = [f"g{i}" for i in range(15)]
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    with pytest.warns(UserWarning, match="internal layer|not writing"):
+        used = _prepare_counts_layer(adata)
+    assert used == INTERNAL_COUNTS_LAYER
+    assert "counts" not in adata.layers
+    assert INTERNAL_COUNTS_LAYER in adata.layers

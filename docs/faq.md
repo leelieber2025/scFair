@@ -6,28 +6,44 @@ First analysis: {doc}`quickstart`. Method detail: {doc}`user_guide/method`.
 
 | Goal | Function |
 |------|----------|
-| Everyday HVG selection | {func}`scfair.pp.highly_variable_genes` (default: auto + append) |
-| Fixed classical list | Same function with `n_top_genes=2000` |
-| Match scanpy with no extension | `n_top_genes=2000, balance_method="none"` |
+| Everyday HVG selection | {func}`scfair.pp.highly_variable_genes` (default: **auto** + append) |
+| Locked paper / fixed protocol | Same function with `n_top_genes=2000` |
+| Match scanpy gene set (no buffer) | `n_top_genes=2000, balance_method="none"` (+ same `batch_key` if any) |
+| How many populations (no res sweep) | {func}`scfair.pp.estimate_n_populations` after `sc.pp.neighbors` |
 | Pre-call imbalance tips from labels | {func}`scfair.pp.diagnose_from_labels` |
-| Label-free population count estimate | {func}`scfair.pp.estimate_n_populations` |
 
-## What two problems does scFair actually solve?
+## What does scFair actually do?
 
 **1. How many genes (`n`)?**  
-Default `n_top_genes="auto"` suggests a base list size from the data. We do
-**not** claim this is always the optimal `n`. It is a **safe default and a
-prompt** so users who will not run a `k`-sweep are less likely to pick a
-silent bad length. Override with any integer when you have a protocol.
+There is no a priori correct list length. Default `n_top_genes="auto"`
+estimates a base size from density structure so users who would otherwise copy
+`2000` are less likely to ship a silent wrong `n`. We do **not** claim auto is
+always optimal — we claim the **default should not force you to guess**.
+Override with a fixed int only when the protocol is already locked.
 
-**2. Unfair HVG allocation?**  
-A plain top-`k` global ranking is dominated by large populations; markers for
-smaller types often miss the cut. Default `append` keeps that ranking but adds
-a short tail of near-miss genes so the base top-`k` is never displaced. That
-is allocation fairness on top of a standard HVG backbone — not a new variance
-model.
+**2. Optional list buffer (`append`)**  
+Default `append` extends the **same** global ranking by `append_budget` genes.
+The set equals `top-(k+m)` — **not** population-aware reallocation. Use
+`balance_method="none"` for pure top-`k`. Cluster-aware methods were removed.
 
 See {doc}`user_guide/method` for the full story.
+
+## Is `append` different from just taking a larger `k`?
+
+**No, for the gene set.**  
+`balance_method="append"` with base `k` and budget `m` selects the same genes
+as `balance_method="none"` with `n_top_genes=k+m`. The buffer is a convenience
+default (and a place to record `n_base` vs tail in metadata), not a fairness
+algorithm.
+
+## How do I restore counts after `store_raw=True`?
+
+```python
+scf.pp.highly_variable_genes(adata, options=scf.pp.HVGOptions(store_raw=True), subset=True)
+full = scf.pp.restore_raw_counts(adata, full_genes=True)  # new object, full gene axis
+# or put counts back into .X for current genes:
+scf.pp.restore_raw_counts(adata, inplace=True)
+```
 
 ## Do I need to cluster first?
 
@@ -80,6 +96,56 @@ scf.pp.highly_variable_genes(
 )
 ```
 
+## How do I add my own genes to the HVG list?
+
+Pass `marker_genes=[...]`. With markers given, `marker_mode` defaults to
+`"force"`: those genes are guaranteed present in the final output regardless
+of where they rank in the global HVG pass.
+
+```python
+import scfair as scf
+
+scf.pp.highly_variable_genes(adata, marker_genes=["CD3D", "CD8A"])
+adata.var.loc[["CD3D", "CD8A"], "highly_variable"]   # both True
+```
+
+Check first, without forcing anything, by passing `marker_mode="none"`
+explicitly — the call records how many of your candidates were *already*
+selected, and the gene list is unaffected:
+
+```python
+scf.pp.highly_variable_genes(
+    adata,
+    marker_genes=["CD3D", "CD8A", "MS4A1"],
+    marker_mode="none",
+)
+h = adata.uns["scfair"]["hvg"]
+h["n_marker_genes"], h["n_marker_genes_already_selected"]   # e.g. 3, 1
+```
+
+## Does `marker_genes` always add on top of `n_top_genes`, or can it replace genes?
+
+**Adds on top, by default.** `HVGOptions.marker_extra` defaults to `True`, so
+forced `marker_genes` (`marker_mode="force"`) are added *in addition to* the
+`n_top_genes` selection — nothing is displaced. This is what you want for the
+common workflow of noticing a cell type didn't resolve well, adding its known
+markers, and re-clustering. If you explicitly set
+`options=HVGOptions(marker_extra=False)`, the behavior silently flips: markers
+are folded *into* the `n_top_genes` budget instead, potentially displacing the
+lowest-ranked algorithm-selected genes. Not a bug — just easy to miss if
+you copy an example that sets it.
+
+```python
+from scfair.pp import HVGOptions
+
+# markers fold into the n_top_genes budget instead of extending it
+scf.pp.highly_variable_genes(
+    adata,
+    marker_genes=["CD3D", "CD8A"],
+    options=HVGOptions(marker_extra=False),
+)
+```
+
 ## What counts matrix do I need?
 
 Raw **integer** counts in `.X` or a counts layer. Log-normalized matrices are
@@ -125,20 +191,19 @@ scf.pp.highly_variable_genes(
 )
 ```
 
-That value is forwarded to `scanpy.pp.highly_variable_genes` on the **global**
-HVG pass (and on the second global pass inside `balance_method="reweight"`).
-Scanpy then selects HVGs within each batch and merges them — a lightweight way
-to down-weight batch-private genes. See the scanpy docs for flavor-specific
-merge rules (`seurat_v3` vs `seurat_v3_paper` differ only when `batch_key` is
-set).
+That value is forwarded to `scanpy.pp.highly_variable_genes` on the global HVG
+pass. Scanpy selects HVGs within each batch and merges them
+(`highly_variable_nbatches` + rank / dispersion). scFair **reuses that merge
+order** for the final list (including default `"append"`), so with
+`balance_method="none"` the selected gene set matches scanpy for the same
+flavor and `batch_key`. See the scanpy docs for flavor-specific merge rules
+(`seurat_v3` vs `seurat_v3_paper` differ only when `batch_key` is set).
 
 **What this is not**
 
 - Not full batch correction (no Harmony / scVI / BBKNN-style integration).
-- Intermediate Leiden used by opt-in `"hybrid"` / `"score"` still builds a
-  **mixed-batch** graph; only the global ranking uses `batch_key`.
-- Default `"append"` benefits automatically: the base top-`k` and the append
-  extension share the same batch-aware ranking.
+- Default `"append"` uses the same batch-aware ranking for base top-`k` and the
+  tail (`top-(k+m)`).
 
 Leave `batch_key=None` (default) when there is no meaningful batch column.
 
@@ -156,10 +221,42 @@ On small matrices, structure-based auto-`k` can hit the ceiling. Prefer a fixed
 
 ## Why is the default slower than scanpy?
 
-`n_top_genes="auto"` builds a few extra neighbor graphs to estimate list size.
-That is intentional and slower than one scanpy HVG pass. For interactive work
-or benchmarks, pass `n_top_genes=2000` (append still applies unless you set
-`balance_method="none"`).
+Because the default is **`n_top_genes="auto"`**, not a copied `2000`.
+
+Auto builds multi-seed HVG→PCA→neighbors→density graphs to estimate list size.
+That is **much slower** than one scanpy HVG pass (often ~10–150×). **That cost
+is intentional:** there is no reliable a priori `n`, and a silent wrong list
+length is usually more expensive than waiting for structure estimation.
+Progress messages print on stderr once `n_obs >= 1000` under auto.
+
+Pass a fixed int only when a paper or protocol is already locked (append still
+applies unless you set `balance_method="none"`).
+
+## How many populations without sweeping Leiden?
+
+```python
+sc.pp.neighbors(adata)
+est = scf.pp.estimate_n_populations(adata)
+# est.n_populations, est.confidence
+```
+
+Requires a neighbour graph (or pass `embedding=`). On well-separated data it
+tracks the true count well up to roughly **~20 populations**; with many tiny
+groups (e.g. 30 types × tens of cells each) it can under-count. It answers
+*how many*, not *which cell goes where*.
+
+## How does this differ from GiniClust or CellSIUS?
+
+**Different problem.** GiniClust / CellSIUS hunt **rare-subpopulation markers**
+(Gini or per-cluster tests, usually after a coarse partition). scFair product
+path does **not**: default **`append`** only extends the **same global HVG
+ranking** by a short tail (`k+1 … k+m`). No Gini LOESS pool, no cluster-wise
+FDR, no co-expression communities in the shipped default.
+
+**Rare types still poorly resolved?** Prefer known markers with
+`marker_genes=…`, `marker_mode="force"` (additive when `marker_extra=True`,
+the default) and re-cluster — domain knowledge, not automatic rare-gene
+compensation.
 
 ## Is scFair the same as mixHVG?
 
@@ -175,7 +272,7 @@ import scfair as scf
 print(scf.__version__)
 ```
 
-Pin the version in analysis code and manuscripts, for example `scfair==0.7.0`.
+Pin the version in analysis code and manuscripts, for example `scfair==0.8.0`.
 
 ## Is auto always better than 2000?
 

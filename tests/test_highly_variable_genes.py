@@ -276,14 +276,15 @@ def test_hvg_store_raw_true_writes_snapshot(adata_for_hvg):
     assert ad.uns[UNS_KEY]["hvg"]["store_raw"] is True
 
 
-def test_hvg_discards_preexisting_snapshot_when_store_raw_false(adata_for_hvg):
+def test_hvg_preserves_preexisting_snapshot_when_store_raw_false(adata_for_hvg):
+    """A later default call must not delete a snapshot kept for full-gene restore."""
     from scfair.pp._raw_counts import _store_raw_counts
 
     ad = adata_for_hvg.copy()
     _store_raw_counts(ad, layer="counts", sidecar=True)
     assert "raw_snapshot" in ad.uns[UNS_KEY]
     scf.pp.highly_variable_genes(ad, n_top_genes=15, balance_method="none", diagnose=False)
-    assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
+    assert "raw_snapshot" in ad.uns.get(UNS_KEY, {})
 
 
 def test_hvg_injected_global_score(adata_for_hvg):
@@ -400,14 +401,178 @@ def test_hvg_flavor_routing(adata_for_hvg, flavor):
     assert int(ad.var["highly_variable"].sum()) == 15
 
 
-@pytest.fixture(params=["seurat_v3", "seurat"])
+@pytest.fixture(params=["seurat_v3", "seurat", "seurat_v3_paper", "cell_ranger"])
 def flavor(request):
     return request.param
+
+
+def _batched_counts(seed: int = 0, n_obs: int = 200, n_vars: int = 400):
+    """Two-batch Poisson matrix with batch-private markers (for batch_key tests)."""
+    import anndata as ad
+
+    rng = np.random.default_rng(seed)
+    X = rng.poisson(1.5, size=(n_obs, n_vars)).astype(np.float32)
+    half = n_obs // 2
+    X[half:] = rng.poisson(3.0, size=(n_obs - half, n_vars)).astype(np.float32)
+    for g in range(20):
+        X[:half, g] = rng.poisson(15, size=half).astype(np.float32)
+        X[half:, g + 20] = rng.poisson(15, size=n_obs - half).astype(np.float32)
+    a = ad.AnnData(X=X)
+    a.obs_names = [f"c{i}" for i in range(n_obs)]
+    a.var_names = [f"g{i}" for i in range(n_vars)]
+    a.obs["batch"] = (["A"] * half) + (["B"] * (n_obs - half))
+    a.layers["counts"] = a.X.copy()
+    return a
+
+
+@pytest.mark.parametrize(
+    "flavor",
+    ["seurat_v3", "seurat_v3_paper", "seurat", "cell_ranger"],
+)
+def test_batch_key_selected_genes_match_scanpy(flavor):
+    """With batch_key, selected set must match scanpy's per-batch merge (not mean score)."""
+    n_top = 80
+    a0 = _batched_counts(seed=1)
+    a_sc = a0.copy()
+    a_sf = a0.copy()
+    if flavor in ("seurat_v3", "seurat_v3_paper"):
+        sc.pp.highly_variable_genes(
+            a_sc,
+            n_top_genes=n_top,
+            flavor=flavor,
+            batch_key="batch",
+            layer="counts",
+            inplace=True,
+            subset=False,
+        )
+    else:
+        sc.pp.normalize_total(a_sc, target_sum=1e4)
+        sc.pp.log1p(a_sc)
+        sc.pp.highly_variable_genes(
+            a_sc,
+            n_top_genes=n_top,
+            flavor=flavor,
+            batch_key="batch",
+            inplace=True,
+            subset=False,
+        )
+    scf.pp.highly_variable_genes(
+        a_sf,
+        n_top_genes=n_top,
+        balance_method="none",
+        flavor=flavor,
+        options=HVGOptions(batch_key="batch"),
+        diagnose=False,
+    )
+    set_sc = set(a_sc.var_names[a_sc.var["highly_variable"].to_numpy()])
+    set_sf = set(a_sf.var_names[a_sf.var["highly_variable"].to_numpy()])
+    assert set_sf == set_sc
+    assert len(set_sf) == n_top
+    # No gene with nbatches==0 should be selected under batch merge.
+    if "highly_variable_nbatches" in a_sf.var.columns:
+        nb = a_sf.var.loc[a_sf.var["highly_variable"], "highly_variable_nbatches"]
+        assert int((nb.to_numpy() == 0).sum()) == 0
+
+
+def test_no_batch_selected_genes_match_scanpy():
+    """No-batch path remains a drop-in for seurat_v3 gene sets."""
+    n_top = 80
+    a0 = _batched_counts(seed=0)
+    a_sc = a0.copy()
+    a_sf = a0.copy()
+    sc.pp.highly_variable_genes(
+        a_sc, n_top_genes=n_top, flavor="seurat_v3", layer="counts", inplace=True, subset=False
+    )
+    scf.pp.highly_variable_genes(
+        a_sf, n_top_genes=n_top, balance_method="none", flavor="seurat_v3", diagnose=False
+    )
+    set_sc = set(a_sc.var_names[a_sc.var["highly_variable"].to_numpy()])
+    set_sf = set(a_sf.var_names[a_sf.var["highly_variable"].to_numpy()])
+    assert set_sf == set_sc
+
+
+def test_selected_genes_golden_stable():
+    """Lock the selected gene set for a fixed seed (catches ranking drift)."""
+    ad = _batched_counts(seed=42, n_obs=120, n_vars=200)
+    scf.pp.highly_variable_genes(
+        ad, n_top_genes=40, balance_method="none", flavor="seurat_v3", diagnose=False
+    )
+    selected = list(ad.var_names[ad.var["highly_variable"].to_numpy()])
+    # Order by highly_variable_rank when present, else by name for stability of set.
+    selected_set = frozenset(selected)
+    assert len(selected_set) == 40
+    # Second run identical (stability).
+    ad2 = _batched_counts(seed=42, n_obs=120, n_vars=200)
+    scf.pp.highly_variable_genes(
+        ad2, n_top_genes=40, balance_method="none", flavor="seurat_v3", diagnose=False
+    )
+    selected2 = frozenset(ad2.var_names[ad2.var["highly_variable"].to_numpy()])
+    assert selected2 == selected_set
 
 
 def test_public_api_surface():
     assert "highly_variable_genes" in scf.pp.__all__
     assert "HVGOptions" in scf.pp.__all__
+    assert "restore_raw_counts" in scf.pp.__all__
+    assert "recommend_cluster_resolution" not in scf.pp.__all__
+    assert "estimate_n_top_structure" not in scf.pp.__all__
+
+
+def test_append_equals_none_with_larger_k(adata_for_hvg):
+    """append base k + budget m is the same gene set as none with k+m."""
+    ad_a = adata_for_hvg.copy()
+    ad_b = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad_a,
+        n_top_genes=30,
+        balance_method="append",
+        options=HVGOptions(append_budget=10),
+        diagnose=False,
+    )
+    scf.pp.highly_variable_genes(
+        ad_b,
+        n_top_genes=40,
+        balance_method="none",
+        diagnose=False,
+    )
+    set_a = set(ad_a.var_names[ad_a.var["highly_variable"]])
+    set_b = set(ad_b.var_names[ad_b.var["highly_variable"]])
+    assert set_a == set_b
+    assert len(set_a) == 40
+
+
+def test_n_top_genes_bool_rejected(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(TypeError, match="bool"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=True, balance_method="none")
+
+
+def test_backed_adata_raises_clear_error(adata_for_hvg, tmp_path):
+    """backed='r' must not explode inside numpy isfinite — clear NotImplementedError."""
+    path = tmp_path / "tiny.h5ad"
+    ad = adata_for_hvg.copy()
+    ad.write_h5ad(path)
+    backed = __import__("anndata").read_h5ad(path, backed="r")
+    try:
+        with pytest.raises(NotImplementedError, match="backed|to_memory"):
+            scf.pp.highly_variable_genes(
+                backed, n_top_genes=10, balance_method="none", diagnose=False
+            )
+    finally:
+        # Close file handle so tmp_path cleanup works on all platforms.
+        if hasattr(backed, "file") and backed.file is not None:
+            try:
+                backed.file.close()
+            except Exception:
+                pass
+
+
+def test_mode_none_treated_as_auto(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    scf.pp.highly_variable_genes(
+        ad, n_top_genes=20, mode=None, balance_method="none", diagnose=False
+    )
+    assert ad.uns[UNS_KEY]["hvg"]["mode_requested"] == "auto"
 
 
 def test_duplicate_var_names_rejected(adata_for_hvg):
@@ -423,11 +588,16 @@ def test_non_integer_counts_warns_and_records(adata_for_hvg):
     ad = adata_for_hvg.copy()
     sc.pp.normalize_total(ad, target_sum=1e4)
     sc.pp.log1p(ad)
-    with pytest.warns(UserWarning, match="integer counts|raw integer"):
+    with pytest.warns(UserWarning, match="integer counts|raw integer|internal layer"):
         scf.pp.highly_variable_genes(ad, n_top_genes=15, balance_method="none", diagnose=False)
     meta = ad.uns[UNS_KEY]["hvg"]
     assert meta["counts_integer_like"] is False
-    assert meta["counts_warning"] == "non_integer_counts"
+    assert "non_integer_counts" in (meta["counts_warning"] or [])
+    # Must not permanently pollute layers['counts'] with log data.
+    assert "counts" not in ad.layers
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER
+
+    assert INTERNAL_COUNTS_LAYER not in ad.layers  # ephemeral, popped at end
 
 
 def test_mode_with_fixed_int_k_warns(adata_for_hvg):

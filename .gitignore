@@ -6,6 +6,9 @@ __pycache__/
 .eggs/
 dist/
 build/
+# setuptools egg_info noise if generated in the repo root
+PKG-INFO
+setup.cfg
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

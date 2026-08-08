@@ -1,63 +1,62 @@
 # How selection works
 
-scFair is built around **two** problems. Everything else (flavors, research
-knobs, cluster-aware modes) is secondary.
+scFair is built around **list size** and a small optional buffer. Everything
+else (flavors, diagnostics) is secondary. Cluster-aware reallocation methods
+were removed from the product.
 
-## Two problems
+## What the product actually does
 
-### Problem A — How many genes (`n`)?
+### 1 — How many genes (`n`)?
 
-Pipelines almost always need a gene budget. The usual answer is a fixed
-integer (often 2000) copied from a tutorial. That is simple, but it is also
-where unfamiliar users make silent mistakes: a short list can erase fine
-structure; a long list adds cost and noise with little gain.
+Pipelines almost always need a gene budget. **There is no a priori correct
+length** — copying 2000 from a tutorial is simple and easy to get wrong
+silently (too short erases structure; too long adds noise and cost).
 
 **What scFair does:** default **`n_top_genes="auto"`** estimates a base size
-from the data’s density structure (multi-seed). 
+`k` from the data’s density structure (multi-seed). That is the product
+default **on purpose**: the first job is to **avoid a wrong `n`**, not to win
+a wall-clock race against a fixed-int HVG call.
 
-**What we claim:** auto is a **sensible default and a prompt**, not a proof of
-global optimality. It reduces the chance of shipping an arbitrary bad `n` when
-you have not run a `k`-sweep. When density confidence is low, it prefers
-classical **2000** over a risky short list. For papers and locked protocols,
-pass an integer (e.g. `n_top_genes=2000`).
+**What we claim:** auto is a **safer default than guessing**, not a proof of
+global optimality. The extra compute is intentional and worth it when you
+cannot predict a reasonable length. When density confidence is low, it still
+prefers classical **2000** over a risky short list. Pass a fixed int only for
+papers and locked protocols.
 
-### Problem B — Unfair HVG allocation
+### 2 — List-length buffer (`append`)
 
-Global HVG ranking measures variability across all cells. When a few cell types
-dominate, the top of the list is filled by genes that separate those large
-groups. Markers for smaller populations often sit just below a fixed cutoff.
-They are not uninformative — they lose the **vote count** to bulk variation.
-That is unfair **allocation of slots** in a fixed-length list, not a failure of
-“finding variable genes” in the abstract.
+Default **`balance_method="append"`** extends the **same** global ranking by
+`append_budget` genes (ranks `k+1 … k+m`). The selected set is mathematically
+**`top-(k+m)`** — equivalent to `balance_method="none"` with
+`n_top_genes=k+m`. It is a **conservative list buffer**, not
+population-aware reallocation of HVG slots.
 
-**What scFair does:** keep a standard global ranking as the backbone, then by
-default **`append`** a small extension of near-miss genes from the **same**
-ranking so genes that barely missed the base cut are not discarded. The base
-top-`k` is **frozen** — nothing is pushed out. The only other product method is
-`"none"` (scanpy-like global HVG with no extension).
+Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
 
-## Default path: auto `n` + fairer allocation (`append`)
+## Default path: auto `n` + list buffer
 
 1. Rank all genes with a standard global method (`flavor="seurat_v3"` by default).
-2. **Problem A:** choose base size **`k`** with structure-aware auto (default).
-   Low density confidence floors soft short lists to classical **2000**
-   (except labeled true-SHORT paths). Pass `n_top_genes=2000` to skip auto.
-3. Freeze the top `k` genes (familiar HVG backbone).
-4. **Problem B:** append the next `append_budget` genes from the **same**
-   ranking (ranks `k+1 … k+m`). Product default is **tight density**: floor
-   **200** (never reduced for short/mid base `k`); when
-   `n_top_genes="auto"`, budget may rise with structure
-   `n_density_pops` as
+2. Choose base size **`k`** with structure-aware auto (default). Low density
+   confidence floors soft short lists to classical **2000** (except labeled
+   true-SHORT paths). Pass `n_top_genes=2000` to skip auto.
+3. If append is on: take the next `append_budget` genes from the same ranking.
+   Product default floor **200**; when `n_top_genes="auto"`, budget may rise
+   with structure `n_density_pops` as
    `m = max(200, min(300, 200 + max(0, n_need − 12) × 12))`. Explicit
    `HVGOptions(append_budget=N)` always wins.
 
 Properties that matter in practice:
 
-- No intermediate clustering and no re-ranking inside a pool (append path).
-- Nothing is removed from the base top-`k` (allocation is “base + tail”).
-- Final size is `k + append_budget` (capped at `n_vars`).
-- Auto is multi-seed and slower than a fixed `k`; fixed `2000` is closer to
-  one `scanpy.pp.highly_variable_genes` call.
+- No intermediate clustering for gene selection.
+- Final size is `k + append_budget` (capped at `n_vars`) when append is on.
+- Auto is multi-seed and slower than a fixed `k`. That cost buys a
+  data-informed list length when you would otherwise guess.
+
+**Not GiniClust / CellSIUS.** Those methods score **rare** genes (normalized
+Gini, cluster-wise tests, evidence communities). Product `append` only adds
+near-miss genes from the **global** HVG list — slot fairness at a fixed
+cutoff, not rare-subtype discovery. For a known missing type, force-include
+markers (`marker_mode="force"`) rather than expecting auto rare compensation.
 
 ```python
 import scfair as scf

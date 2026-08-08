@@ -80,6 +80,25 @@ Effects and limits:
 
 If you do not have a batch column, leave the default (`None`).
 
+### Add your own genes: `marker_genes`
+
+To guarantee a specific gene set survives selection regardless of its rank
+(a known lineage marker, a fixed panel), pass `marker_genes`. With
+`marker_genes` set, `marker_mode` defaults to `"force"`:
+
+```python
+import scfair as scf
+
+scf.pp.highly_variable_genes(adata, marker_genes=["CD3D", "CD8A"])
+adata.var.loc[["CD3D", "CD8A"], "highly_variable"]  # both True
+```
+
+Forced markers are added **on top of** `n_top_genes` by default
+(`HVGOptions.marker_extra=True`) — nothing algorithm-selected is displaced.
+To check candidates without forcing anything, pass `marker_mode="none"` and
+read `adata.uns["scfair"]["hvg"]["n_marker_genes_already_selected"]`. See
+{doc}`../faq` for the full `marker_extra` / `marker_mode` semantics.
+
 ## Typical recipes
 
 **Everyday preprocessing** (auto size + append)
@@ -116,4 +135,10 @@ scf.pp.highly_variable_genes(
     adata,
     options=HVGOptions(batch_key="batch"),
 )
+```
+
+**Guarantee known genes are in the output**
+
+```python
+scf.pp.highly_variable_genes(adata, marker_genes=["CD3D", "CD8A"])
 ```

@@ -1,17 +1,19 @@
-"""Fair / balanced highly variable gene selection.
+"""Highly variable gene selection with structure-aware auto list size.
 
 Public entry point: :func:`highly_variable_genes`.
 
-Product strategies:
+Product path:
 
-**append** (default) — freeze global HVG top-``k``, then append the next ``m``
-  genes from the **same** global ranking (ranks ``k+1 … k+m``). No intermediate
-  clustering. Final size is ``k + append_budget`` (capped at ``n_vars``).
+1. **How many genes (``n``)?** Default ``n_top_genes="auto"`` estimates a base
+   size ``k`` from density structure (not proven optimal — a safe prompt).
+2. **List buffer (optional).** Default ``balance_method="append"`` extends the
+   same global ranking by ``append_budget`` genes. The selected set is
+   mathematically ``top-(k+m)`` from that ranking — **not** population-aware
+   reallocation. Pass ``balance_method="none"`` (or ``append_budget=0``) for
+   pure top-``k``.
 
-**none** — a single global HVG pass (scanpy-like), size exactly ``k``.
-
-Cluster-aware methods (``hybrid`` / ``score`` / ``reweight``) were removed.
-Use ``append`` or ``none``.
+Cluster-aware reallocation methods (``hybrid`` / ``score`` / ``reweight``)
+were removed.
 """
 
 from __future__ import annotations
@@ -132,7 +134,7 @@ def highly_variable_genes(
     options: HVGOptions | None = None,
     **legacy_kwargs: Any,
 ) -> pd.DataFrame | None:
-    """Select highly variable genes (product: auto ``n`` + append).
+    """Select highly variable genes (product: structure auto-``n`` + list buffer).
 
     Parameters
     ----------
@@ -140,19 +142,27 @@ def highly_variable_genes(
         AnnData with raw counts in ``.X`` or ``layers['counts']`` (or pass
         ``layer=``).
     n_top_genes
-        ``"auto"`` / ``"structure"`` (default auto): structure-aware base size.
-        int: fixed base size (e.g. ``2000``).
+        ``"auto"`` / ``"structure"`` (**default**): structure-aware base size
+        from multi-seed density features. **Default is auto on purpose:** no
+        fixed ``n`` is known to be safe a priori; paying for structure
+        estimation is meant to reduce silent wrong list lengths. Pass a fixed
+        int (e.g. ``2000``) only when the protocol is locked. Booleans are
+        rejected.
     flavor
         Scanpy HVG method for the global ranking:
         counts: ``seurat_v3``, ``seurat_v3_paper``, ``pearson_residuals``;
         log: ``seurat``, ``cell_ranger``.
     balance_method
-        ``"append"`` (default): freeze global top-``k``, append next
-        ``append_budget`` genes from the same ranking.
-        ``"none"``: single global HVG of size ``k``.
+        ``"append"`` (default): select global top-``k`` plus the next
+        ``append_budget`` genes from the **same** ranking. Mathematically
+        equivalent to ``balance_method="none"`` with
+        ``n_top_genes=k+append_budget`` — a conservative list-length buffer,
+        **not** fairer per-population allocation.
+        ``"none"``: top-``k`` only (scanpy-like fixed list size).
     mode
         ``"auto"`` / ``"compact"`` / ``"balanced"`` / ``"fine"`` — steers
         auto-``k`` floors and default append budget when not set explicitly.
+        ``None`` is treated as ``"auto"``.
     marker_genes, marker_mode
         Optional forced markers. Default mode is ``"force"`` when markers
         are given, else ``"none"``.
@@ -161,11 +171,21 @@ def highly_variable_genes(
     strict
         If True, do not fall back when seurat_v3 or structure auto fails.
     progress
-        Stage messages on stderr. ``None`` enables for large / auto runs.
+        Stage messages on stderr. ``None`` enables for large matrices and for
+        auto-``n`` once ``n_obs >= 1000`` (so mid-size auto runs are not silent).
     options
         :class:`~scfair.pp.HVGOptions` for secondary knobs (bounds, filters,
-        append_budget, store_raw, batch_key, …).
+        append_budget, store_raw, batch_key, …). Do not mix with legacy
+        top-level kwargs for the same call. With ``store_raw=True``, restore
+        via :func:`~scfair.pp.restore_raw_counts`.
     """
+    if getattr(adata, "isbacked", False):
+        raise NotImplementedError(
+            "backed AnnData is not supported by scfair.pp.highly_variable_genes "
+            "(the pipeline needs repeated full-matrix access). "
+            "Call adata = adata.to_memory() first, then re-run."
+        )
+
     if legacy_kwargs:
         from ._options import _REMOVED_OPTION_NAMES
 
@@ -195,7 +215,6 @@ def highly_variable_genes(
 
     n_top_min = int(opt.n_top_min)
     n_top_max = int(opt.n_top_max)
-    auto_n_method = str(opt.auto_n_method).lower().strip()
     marker_extra = bool(opt.marker_extra)
     global_score = opt.global_score
     span = float(opt.span)
@@ -234,9 +253,10 @@ def highly_variable_genes(
         if structure_n_seeds_opt < 1:
             raise ValueError(f"structure_n_seeds must be >= 1, got {structure_n_seeds_opt}.")
 
+    mode_arg = "auto" if mode is None else mode
     mode_info = resolve_hvg_mode(
         adata,
-        mode=str(mode),
+        mode=str(mode_arg),
         label_key=label_key,
         n_obs=int(getattr(adata, "n_obs", 0) or 0) or None,
     )
@@ -251,6 +271,10 @@ def highly_variable_genes(
 
     if not isinstance(strict, bool):
         raise TypeError(f"strict must be bool, got {type(strict).__name__}={strict!r}.")
+    if isinstance(n_top_genes, bool):
+        raise TypeError(
+            f"n_top_genes must be an int or 'auto'/'structure', not bool ({n_top_genes!r})."
+        )
     if isinstance(n_top_genes, (int, np.integer)) and int(n_top_genes) < 1:
         raise ValueError("n_top_genes must be >= 1.")
     if flavor not in _ALL_FLAVORS:
@@ -258,7 +282,7 @@ def highly_variable_genes(
     if balance_method not in _BALANCE_ALIASES:
         raise ValueError(
             f"Unknown balance_method={balance_method!r}. "
-            "Use 'append' (default) or 'none'. "
+            "Use 'append' (default list buffer) or 'none' (top-k only). "
             "Cluster-aware methods (hybrid/score/reweight) were removed."
         )
     method = _BALANCE_ALIASES[balance_method]
@@ -267,13 +291,6 @@ def highly_variable_genes(
         marker_mode = "force" if marker_genes else "none"
     elif marker_mode not in ("force", "none"):
         raise ValueError("marker_mode must be None, 'force', or 'none'.")
-
-    if auto_n_method not in ("structure", "auto"):
-        raise ValueError(
-            f"auto_n_method={auto_n_method!r} is not supported. "
-            "Product auto uses structure only (options.auto_n_method='structure')."
-        )
-    auto_n_method = "structure"
 
     config_check = check_config(
         n_top_genes=n_top_genes,
@@ -443,7 +460,10 @@ def highly_variable_genes(
         else:
             _flavor_for_scores = str(hvg_run_meta.get("flavor_used") or flavor)
             global_scores = _variability_raw_scores(
-                adata, flavor=flavor, flavor_used=_flavor_for_scores
+                adata,
+                flavor=flavor,
+                flavor_used=_flavor_for_scores,
+                batch_key=batch_key,
             )
             global_rank = global_scores.rank(ascending=False, method="average")
 
@@ -485,7 +505,7 @@ def highly_variable_genes(
                 )
                 mode_info = resolve_hvg_mode(
                     adata,
-                    mode=str(mode),
+                    mode=str(mode_arg),
                     label_key=label_key,
                     n_obs=int(adata.n_obs),
                     n_density_pops=(structure_detail.get("features") or {}).get("n_density_pops"),
@@ -655,7 +675,7 @@ def highly_variable_genes(
             "fallback_reason": hvg_run_meta.get("fallback_reason"),
             "balance_method": method,
             "mode": hvg_mode,
-            "mode_requested": str(mode),
+            "mode_requested": str(mode_arg),
             "n_top_genes_request": n_top_genes if not n_top_is_auto else str(n_top_genes),
             "n_top_genes_used": (
                 int(n_top_base)
@@ -664,7 +684,7 @@ def highly_variable_genes(
             ),
             "n_top_min": int(n_top_min),
             "n_top_max": int(n_top_max),
-            "auto_n_method": "structure" if n_top_is_auto else None,
+            "auto_n_method": "structure" if n_top_is_auto else None,  # product: structure only
             "auto_n": auto_meta,
             "auto_message": (
                 (auto_meta or {}).get("message") if isinstance(auto_meta, dict) else None
@@ -822,6 +842,7 @@ def highly_variable_genes(
         _discard_raw_snapshot(adata, store_raw=effective_store_raw)
 
         if subset:
+            # Same private API scanpy uses; anndata has no public inplace subset.
             adata._inplace_subset_var(adata.var["highly_variable"].to_numpy())
 
         if not inplace:
@@ -843,12 +864,13 @@ def _progress(on: bool, msg: str, *args: Any) -> None:
 def _progress_default(adata: Any, *, n_top_is_auto: bool = False) -> bool:
     """Announce stages when the call is slow enough to look like a hang.
 
-    Auto list-size estimation runs multiple graph builds, so a lower cell
-    threshold is used when ``n_top_genes`` is automatic.
+    Auto list-size estimation runs multiple graph builds and can take tens of
+    seconds on ~1–2k cells × ~8k genes; surface progress from ``n_obs >= 1000``
+    when ``n_top_genes`` is automatic so mid-size default runs are not silent.
     """
     n_obs = int(getattr(adata, "n_obs", 0) or 0)
     n_vars = int(getattr(adata, "n_vars", 0) or 0)
-    if n_top_is_auto and n_obs >= 3_000:
+    if n_top_is_auto and n_obs >= 1_000:
         return True
     return bool(n_obs >= 10_000 or n_obs * n_vars >= 5e7)
 
@@ -949,7 +971,7 @@ def _validate_counts_matrix(
     """
     info: dict[str, Any] = {
         "counts_integer_like": None,
-        "counts_warning": None,
+        "counts_warning": [],  # list of warning codes (may accumulate)
         "n_vars": int(getattr(adata, "n_vars", 0) or 0),
     }
     if counts_layer in getattr(adata, "layers", {}):
@@ -1046,6 +1068,7 @@ def _validate_counts_matrix(
     # common footgun). Surface as UserWarning + record; strict → raise.
     is_int = bool(_is_integer_counts_like(X))
     info["counts_integer_like"] = is_int
+    warn_codes: list[str] = []
     if not is_int:
         msg = (
             f"counts matrix {where} does not look like raw integer counts "
@@ -1054,7 +1077,7 @@ def _validate_counts_matrix(
             "yields unreliable HVGs. Restore raw counts before calling, "
             "or pass layer= pointing at a true counts matrix."
         )
-        info["counts_warning"] = "non_integer_counts"
+        warn_codes.append("non_integer_counts")
         if strict:
             raise ValueError(msg + " (strict=True)")
         warnings.warn(msg, UserWarning, stacklevel=3)
@@ -1073,7 +1096,7 @@ def _validate_counts_matrix(
                 f"{min_genes} genes to fit safely; got n_vars={n_vars}. "
                 "Use more genes, or flavor='seurat' / a non-loess method."
             )
-            info["counts_warning"] = "n_vars_too_small_for_loess"
+            warn_codes.append("n_vars_too_small_for_loess")
             info["loess_min_genes"] = min_genes
             if strict:
                 raise ValueError(msg + " (strict=True)")
@@ -1084,6 +1107,7 @@ def _validate_counts_matrix(
                 stacklevel=3,
             )
 
+    info["counts_warning"] = warn_codes or None
     return info
 
 
@@ -1271,26 +1295,75 @@ def _materialize_flavor_matrix(adata: Any, *, flavor: str, counts_layer: str) ->
             raise ValueError(f"Counts layer {counts_layer!r} missing for flavor={flavor!r}.")
         return counts_layer
 
+    import anndata as ad
+
     log_layer = "_scfair_log"
     if counts_layer in adata.layers:
-        ad_tmp = adata.copy()
-        ad_tmp.X = ad_tmp.layers[counts_layer].copy()
-        ad_tmp.uns.pop("log1p", None)
+        # Minimal object: full adata.copy() would double peak memory (all layers/obsm).
+        X = adata.layers[counts_layer]
+        ad_tmp = ad.AnnData(X=X.copy() if hasattr(X, "copy") else X)
         sc.pp.normalize_total(ad_tmp, target_sum=1e4)
         sc.pp.log1p(ad_tmp)
-        adata.layers[log_layer] = ad_tmp.X.copy()
+        adata.layers[log_layer] = ad_tmp.X
         return log_layer
 
     if _is_integer_counts_like(adata.X):
-        ad_tmp = adata.copy()
-        ad_tmp.uns.pop("log1p", None)
+        X = adata.X
+        ad_tmp = ad.AnnData(X=X.copy() if hasattr(X, "copy") else X)
         sc.pp.normalize_total(ad_tmp, target_sum=1e4)
         sc.pp.log1p(ad_tmp)
-        adata.layers[log_layer] = ad_tmp.X.copy()
+        adata.layers[log_layer] = ad_tmp.X
         return log_layer
 
     logger.debug("Using existing .X for log-based flavor=%s.", flavor)
     return None
+
+
+def _batch_merge_scores(
+    adata: Any,
+    *,
+    flavor_used: str | None = None,
+) -> pd.Series | None:
+    """Descending scores that reproduce scanpy's per-batch HVG merge order.
+
+    scanpy does **not** select by the mean of per-batch ``variances_norm`` /
+    ``dispersions_norm``. Criteria (scanpy ≥1.10):
+
+    * ``seurat_v3``: ``highly_variable_rank`` ASC, then ``nbatches`` DESC
+    * ``seurat_v3_paper``: ``nbatches`` DESC, then ``rank`` ASC
+    * ``seurat`` / ``cell_ranger``: ``nbatches`` DESC, then ``dispersions_norm`` DESC
+      (no ``highly_variable_rank`` column is written)
+    """
+    var = getattr(adata, "var", None)
+    if var is None or "highly_variable_nbatches" not in var.columns:
+        return None
+
+    nbatches = pd.to_numeric(var["highly_variable_nbatches"], errors="coerce")
+    nbatches = nbatches.reindex(adata.var_names).fillna(0.0).astype(float)
+    flavor = str(flavor_used or "")
+
+    if "highly_variable_rank" in var.columns:
+        rank = pd.to_numeric(var["highly_variable_rank"], errors="coerce")
+        rank = rank.reindex(adata.var_names)
+        # Missing rank (nbatches==0) sorts last in scanpy (na_position='last').
+        rank_fill = float(np.nanmax(rank.to_numpy())) + 1.0 if rank.notna().any() else 1.0e9
+        rank_f = rank.fillna(rank_fill)
+        if flavor == "seurat_v3_paper":
+            # nbatches DESC primary, rank ASC secondary.
+            return nbatches * 1.0e9 - rank_f
+        # seurat_v3 (and any other rank-writing batch path): rank ASC primary.
+        return -rank_f + nbatches * 1.0e-6
+
+    # seurat / cell_ranger batch merge: nbatches then mean dispersions_norm.
+    for col in ("dispersions_norm", "variances_norm", "residual_variances"):
+        if col in var.columns:
+            sec = pd.to_numeric(var[col], errors="coerce")
+            sec = sec.reindex(adata.var_names)
+            sec_f = sec.fillna(float(np.nanmin(sec.to_numpy())) - 1.0 if sec.notna().any() else 0.0)
+            # nbatches in the high digits; secondary score unbroken in the low digits.
+            scale = float(np.nanmax(np.abs(sec_f.to_numpy()))) + 1.0
+            return nbatches * (scale + 1.0) + sec_f
+    return nbatches
 
 
 def _variability_raw_scores(
@@ -1298,13 +1371,24 @@ def _variability_raw_scores(
     *,
     flavor: str | None = None,
     flavor_used: str | None = None,
+    batch_key: str | None = None,
 ) -> pd.Series:
-    """All-gene variability scores for ranking / append / hybrid pool.
+    """All-gene variability scores for ranking / append.
 
     When ``flavor`` / ``flavor_used`` is set, only that flavor's scanpy score
     column is read (no priority walk across leftover columns from a prior
     call). Prefer ``flavor_used`` when seurat_v3 fell back to seurat.
+
+    **Batch mode.** With ``batch_key`` (or when scanpy wrote
+    ``highly_variable_nbatches``), use :func:`_batch_merge_scores` so the
+    selected set matches scanpy's per-batch merge — not the cross-batch mean
+    of flavor score columns.
     """
+    if batch_key is not None or "highly_variable_nbatches" in getattr(adata, "var", {}).columns:
+        batch_scores = _batch_merge_scores(adata, flavor_used=flavor_used or flavor)
+        if batch_scores is not None:
+            return batch_scores
+
     use_flavor = flavor_used or flavor
     if use_flavor is not None:
         cols = _FLAVOR_SCORE_COLS.get(str(use_flavor))
@@ -1345,11 +1429,11 @@ def _variability_raw_scores(
 
 
 def _top_genes_from_rank(rank: pd.Series, n_top: int) -> list[str]:
-    return list(rank.sort_values(ascending=True).index[:n_top])
+    return list(rank.sort_values(ascending=True, kind="stable").index[:n_top])
 
 
 def _top_genes_from_scores(scores: pd.Series, n_top: int) -> list[str]:
-    return list(scores.sort_values(ascending=False).index[:n_top])
+    return list(scores.sort_values(ascending=False, kind="stable").index[:n_top])
 
 
 def _hvg_base_plus_append(

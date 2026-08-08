@@ -507,9 +507,17 @@ def diagnose_from_labels(
 
     Use this **before** choosing scFair vs scanpy when you already have coarse
     cell-type or sample annotations. Does not run HVG.
+
+    Missing labels (``NaN`` / empty / the string ``"nan"``) are dropped before
+    size metrics; the count is reported as ``n_labels_dropped``.
     """
-    s = pd.Series(labels).astype(str)
-    s = s[s.notna() & (s != "") & (s != "nan")]
+    s_raw = pd.Series(labels)
+    n_input = int(len(s_raw))
+    # Drop missing before str cast (astype(str) turns NaN into the token "nan").
+    present = s_raw.notna()
+    s = s_raw[present].astype(str)
+    s = s[(s != "") & (s.str.lower() != "nan") & (s.str.lower() != "none")]
+    n_dropped = n_input - int(len(s))
     counts = s.value_counts()
     if min_cluster_size > 1:
         counts = counts[counts >= int(min_cluster_size)]
@@ -518,6 +526,11 @@ def diagnose_from_labels(
     rec = _recommendation_from_imbalance(metrics)
     n_types = int(metrics.get("n_clusters") or 0)
     downstream = recommend_cluster_resolution(n_types=n_types if n_types > 0 else None)
+    if n_dropped > 0:
+        tips.append(
+            f"Dropped {n_dropped}/{n_input} missing or empty labels before "
+            "imbalance metrics; check annotation coverage."
+        )
     if rec == "keep_current":
         tips.append(
             "Label imbalance alone does not say whether scFair will beat "
@@ -533,6 +546,8 @@ def diagnose_from_labels(
         "benefit_evidence": "none" if rec == "use_scanpy_or_none" else "not_predictable",
         "known_no_gain_regime": rec == "use_scanpy_or_none",
         "downstream_clustering": downstream,
+        "n_labels_input": n_input,
+        "n_labels_dropped": n_dropped,
         "tips": tips,
     }
 

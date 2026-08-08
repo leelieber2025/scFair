@@ -24,22 +24,13 @@ def _progress(on: bool, msg: str, *args: Any) -> None:
         print(f"scfair: {text}", file=sys.stderr, flush=True)
 
 
-AutoNMethod = Literal[
-    "elbow",
-    "knee",
-    "cumfrac",
-    "silhouette",
-    "coverage",
-    "ensemble",
-    "populations",
-    "structure",
-]
+# Product auto is structure-only. Elbow retained for PC-scree tips in diagnosis.
+AutoNMethod = Literal["structure"]
 
-# Genes-per-population multiplier for the `populations` estimator.
-# Provisional: the direction (more populations need more genes) is
-# established but the exact constant is not well-calibrated yet; see
-# https://github.com/leelieber2025/scFair/blob/master/examples/auto_n_populations.py
-GENES_PER_POPULATION = 150
+# Fall-through list size when no SHORT/LONG/MID rule fires: scale by density
+# cores so auto actually uses the signal that is calibrated (nd). Historical
+# populations estimator used ~150 genes/pop; keep the same order of magnitude.
+ND_GENES_PER_CORE = 150
 
 
 def _clip_k(k: int, k_min: int, k_max: int, n_genes: int) -> int:
@@ -113,353 +104,6 @@ def select_n_top_elbow(
     idx = start + int(np.argmax(dist[start:hi]))
     k = idx + 1  # convert to count
     return _clip_k(k, k_min, k_max, n)
-
-
-def select_n_top_knee(
-    scores_desc: np.ndarray,
-    *,
-    k_min: int = 500,
-    k_max: int = 5000,
-) -> int:
-    """KneeLocator on the decreasing score curve (falls back to elbow)."""
-    s = np.asarray(scores_desc, dtype=float)
-    n = s.size
-    hi = min(k_max, n)
-    if hi < max(k_min, 10):
-        return _clip_k(hi, k_min, k_max, n)
-    try:
-        from kneed import KneeLocator
-
-        x = np.arange(1, hi + 1)
-        y = s[:hi]
-        # decreasing convex-looking curve
-        kl = KneeLocator(x, y, curve="convex", direction="decreasing", interp_method="interp1d")
-        k = int(kl.knee) if kl.knee is not None else select_n_top_elbow(s, k_min=k_min, k_max=k_max)
-    except (ImportError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
-        logger.debug("KneeLocator failed (%s); using elbow.", exc)
-        k = select_n_top_elbow(s, k_min=k_min, k_max=k_max)
-    return _clip_k(k, k_min, k_max, n)
-
-
-def select_n_top_cumfrac(
-    scores_desc: np.ndarray,
-    *,
-    frac: float = 0.8,
-    k_min: int = 500,
-    k_max: int = 5000,
-) -> int:
-    """Smallest k such that cumulative score reaches ``frac`` of total (clipped)."""
-    s = np.asarray(scores_desc, dtype=float)
-    n = s.size
-    if n == 0:
-        return k_min
-    s = np.maximum(s, 0.0)
-    hi = min(k_max, n)
-    total = float(s[:hi].sum())
-    if total <= 0:
-        return _clip_k(k_min, k_min, k_max, n)
-    c = np.cumsum(s[:hi]) / total
-    # first index where cum >= frac
-    idx = int(np.searchsorted(c, frac, side="left"))
-    k = min(idx + 1, hi)
-    return _clip_k(k, k_min, k_max, n)
-
-
-def select_n_top_coverage(
-    gene_order: Sequence[str],
-    cluster_gene_ranks: dict[str, Sequence[str]],
-    *,
-    min_per_cluster: int = 20,
-    k_min: int = 500,
-    k_max: int = 5000,
-) -> int:
-    """Minimal k so each cluster has ``min_per_cluster`` of its top genes in top-k.
-
-    ``cluster_gene_ranks[cl]`` is genes ordered best→worst for that cluster
-    (e.g. by one-sided logFC).
-    """
-    n = len(gene_order)
-    if n == 0 or not cluster_gene_ranks:
-        return k_min
-    # map gene -> position in global order (0-based)
-    pos = {str(g): i for i, g in enumerate(gene_order)}
-    # for each cluster, positions of its top genes that appear in global order
-    need_positions: list[int] = []
-    for cl, ranked in cluster_gene_ranks.items():
-        hits = []
-        for g in ranked:
-            gs = str(g)
-            if gs in pos:
-                hits.append(pos[gs])
-            if len(hits) >= min_per_cluster:
-                break
-        if len(hits) < min_per_cluster:
-            # not enough genes — take whatever we have
-            if hits:
-                need_positions.append(max(hits))
-        else:
-            need_positions.append(hits[min_per_cluster - 1])
-    if not need_positions:
-        return _clip_k(k_min, k_min, k_max, n)
-    k = max(need_positions) + 1  # inclusive count
-    return _clip_k(k, k_min, k_max, n)
-
-
-def select_n_top_silhouette(
-    adata: Any,
-    gene_order: Sequence[str],
-    *,
-    candidates: Sequence[int] | None = None,
-    k_min: int = 500,
-    k_max: int = 5000,
-    counts_layer: str = "counts",
-    n_pcs: int = 30,
-    n_neighbors: int = 15,
-    resolution: float = 0.8,
-    random_state: int = 0,
-) -> tuple[int, dict[int, float]]:
-    """Pick k maximizing Leiden silhouette in PCA space (downstream proxy)."""
-    import scanpy as sc
-    from sklearn.metrics import silhouette_score
-
-    n = len(gene_order)
-    k_max_eff = min(k_max, n)
-    k_min_eff = min(k_min, k_max_eff)
-    if candidates is None:
-        # log-ish grid
-        raw = [500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000]
-        candidates = sorted({_clip_k(k, k_min_eff, k_max_eff, n) for k in raw})
-    else:
-        candidates = sorted({_clip_k(int(k), k_min_eff, k_max_eff, n) for k in candidates})
-
-    # prepare log-normalized full object once
-    ad0 = adata.copy()
-    if counts_layer in ad0.layers:
-        ad0.X = ad0.layers[counts_layer].copy()
-    ad0.uns.pop("log1p", None)
-    sc.pp.normalize_total(ad0, target_sum=1e4)
-    sc.pp.log1p(ad0)
-
-    scores: dict[int, float] = {}
-    best_k = candidates[0]
-    best_s = -np.inf
-    for k in candidates:
-        genes = list(gene_order[:k])
-        ad = ad0[:, genes].copy()
-        sc.pp.scale(ad, max_value=10)
-        n_comps = min(n_pcs, ad.n_vars - 1, ad.n_obs - 1)
-        if n_comps < 2:
-            scores[k] = -1.0
-            continue
-        sc.tl.pca(ad, n_comps=n_comps, svd_solver="arpack", random_state=random_state)
-        sc.pp.neighbors(
-            ad,
-            n_neighbors=min(n_neighbors, ad.n_obs - 1),
-            n_pcs=n_comps,
-            random_state=random_state,
-        )
-        sc.tl.leiden(
-            ad,
-            resolution=resolution,
-            random_state=random_state,
-            flavor="igraph",
-            n_iterations=2,
-            key_added="leiden",
-        )
-        X = ad.obsm["X_pca"][:, : min(20, n_comps)]
-        labels = ad.obs["leiden"].astype(str)
-        if labels.nunique() < 2:
-            s = -1.0
-        else:
-            s = float(
-                silhouette_score(
-                    X, labels, sample_size=min(2000, ad.n_obs), random_state=random_state
-                )
-            )
-        scores[k] = s
-        if s > best_s:
-            best_s = s
-            best_k = k
-    return best_k, scores
-
-
-def effective_k_floor(
-    n_genes: int,
-    *,
-    k_min: int = 500,
-    k_max: int = 5000,
-    soft_floor: int = 1000,
-    soft_frac: float = 0.2,
-) -> int:
-    """Protective lower bound for auto-n (guards against collapsing rare,
-    low-abundance cell types when k is small).
-
-    ``k_floor = max(k_min, min(soft_floor, floor(n_genes * soft_frac)))``,
-    then clipped to ``[1, k_max, n_genes]``.
-    """
-    n_genes = max(int(n_genes), 1)
-    k_max_eff = min(int(k_max), n_genes)
-    frac_cap = max(1, int(n_genes * float(soft_frac)))
-    floor = max(int(k_min), min(int(soft_floor), frac_cap))
-    return int(max(1, min(floor, k_max_eff)))
-
-
-def effective_k_ceiling(
-    n_genes: int,
-    *,
-    k_min: int = 500,
-    k_max: int = 5000,
-    soft_ceiling: int = 2500,
-) -> int:
-    """Soft upper bound for auto-n final k.
-
-    Large k rarely improves downstream separation further and can erase
-    the advantage of a well-chosen gene set. Default ceiling 2500 allows
-    modest excursions above 2000 without permitting very large k.
-    """
-    n_genes = max(int(n_genes), 1)
-    hi = min(int(soft_ceiling), int(k_max), n_genes)
-    lo = min(int(k_min), hi)
-    return int(max(lo, hi))
-
-
-def library_depth_stats(
-    adata: Any,
-    counts_layer: str = "counts",
-) -> dict[str, float]:
-    """Median library size and genes/cell from a counts matrix."""
-    from scipy import sparse
-
-    if counts_layer in getattr(adata, "layers", {}):
-        X = adata.layers[counts_layer]
-    else:
-        X = adata.X
-    if sparse.issparse(X):
-        n_counts = np.asarray(X.sum(axis=1)).ravel().astype(float)
-        n_genes = np.asarray((X > 0).sum(axis=1)).ravel().astype(float)
-    else:
-        Xa = np.asarray(X, dtype=float)
-        n_counts = Xa.sum(axis=1)
-        n_genes = (Xa > 0).sum(axis=1)
-    return {
-        "median_counts": float(np.median(n_counts)) if n_counts.size else 0.0,
-        "mean_counts": float(np.mean(n_counts)) if n_counts.size else 0.0,
-        "median_genes": float(np.median(n_genes)) if n_genes.size else 0.0,
-        "mean_genes": float(np.mean(n_genes)) if n_genes.size else 0.0,
-        "n_cells": float(n_counts.size),
-    }
-
-
-def depth_aware_auto_knobs(
-    *,
-    median_counts: float,
-    median_genes: float,
-    n_genes: int,
-    k_min: int = 500,
-    k_max: int = 5000,
-) -> dict[str, Any]:
-    """Map library depth → auto-n prior (anchor / floor / ceiling).
-
-    - **shallow** (median counts ≲500 or genes/cell ≲300): fewer
-      informative genes → lower ceiling; avoid over-picking noise.
-    - **medium** (typical 10x ~1–5k UMI): anchor 2000, ceiling 2500.
-    - **deepish** (high genes or ~10k+ counts): anchor/ceiling pulled down
-      slightly.
-    - **deep** (full-length-like, counts ≳5e4 or genes/cell ≳4000): smaller
-      k tends to work better → anchor/ceiling pulled down further.
-
-    Floor is never allowed to reach very low k, to avoid losing rare,
-    low-abundance cell types.
-    """
-    c = float(median_counts)
-    g = float(median_genes)
-    n_genes = max(int(n_genes), 1)
-
-    if c < 500.0 or g < 300.0:
-        # Shallow: cap high-k noise, but keep ceiling/anchor at 2000 rather
-        # than pulling them lower.
-        tier = "shallow"
-        soft_floor, soft_ceiling, anchor = 1000, 2000, 2000
-    elif c >= 5.0e4 or g >= 4000.0:
-        # Deep / full-length: smaller k tends to work better here.
-        tier = "deep"
-        soft_floor, soft_ceiling, anchor = 1000, 2000, 1500
-    elif c >= 1.0e4 or g >= 2500.0:
-        tier = "deepish"
-        soft_floor, soft_ceiling, anchor = 1000, 2200, 1800
-    else:
-        # Typical 10x UMI band.
-        tier = "medium"
-        soft_floor, soft_ceiling, anchor = 1000, 2500, 2000
-
-    # Respect pool size and user k_max / k_min
-    soft_ceiling = int(min(soft_ceiling, k_max, n_genes))
-    soft_floor = int(min(max(soft_floor, k_min), soft_ceiling))
-    anchor = int(min(max(anchor, soft_floor), soft_ceiling))
-
-    return {
-        "depth_tier": tier,
-        "median_counts": c,
-        "median_genes": g,
-        "soft_floor": soft_floor,
-        "soft_ceiling": soft_ceiling,
-        "anchor": anchor,
-    }
-
-
-def select_n_top_from_populations(
-    n_populations: int,
-    *,
-    sizes: Sequence[int] | None = None,
-    size_power: float = 0.0,
-    genes_per_population: int = GENES_PER_POPULATION,
-    k_min: int = 500,
-    k_max: int = 5000,
-    n_genes: int,
-) -> int:
-    """``k`` from how many populations have to be separated.
-
-    Other estimators in this module infer k from the shape of the global
-    score curve, a property of the HVG flavor's variance model rather than
-    of the data's cluster structure. This estimator instead uses the
-    number of populations the density field resolves
-    (:mod:`scfair.pp._granularity`), which is free when
-    ``resolution="auto"`` already ran since that computes the same
-    embedding.
-
-    Equal share, or more genes for bigger populations?
-    ---------------------------------------------------
-    ``size_power=0`` (default) gives every population the same share.
-    ``size_power=b`` makes the effective count ``sum((s_p / median_s) ** b)``,
-    so a population an order of magnitude above the median contributes
-    ``10**b`` shares instead of one.
-
-    The default is equal share, for three reasons:
-
-    1. Characterising a cell type takes about as many genes whether it holds
-       100 cells or 10,000.
-    2. Internal heterogeneity is already accounted for: if the density field
-       resolves the sub-structure it counts as more populations, and if it
-       does not, there is no basis for allocating more.
-    3. **Size-dependence already exists elsewhere.** ``balance_power`` weights
-       clusters by ``size ** 0.5`` when aggregating specificity, so larger
-       populations already claim more of the list. Making ``k`` scale with
-       size too would apply the same prior twice, and this package's
-       ``balance_power=0.5`` (rather than 1.0) exists precisely to stop
-       common populations from dominating.
-
-    ``select_n_top_coverage``'s ``min_per_cluster`` is the same equal-share
-    rule already present in this module.
-    """
-    n_pop = max(1, int(n_populations))
-    effective = float(n_pop)
-    if sizes is not None and size_power:
-        s = np.asarray([x for x in sizes if x > 0], dtype=float)
-        if s.size:
-            ref = float(np.median(s))
-            if ref > 0:
-                effective = float(np.sum((s / ref) ** float(size_power)))
-    return _clip_k(int(round(effective * float(genes_per_population))), k_min, k_max, n_genes)
 
 
 # Structure auto size guards (product path).
@@ -728,10 +372,12 @@ def explain_structure_rule(
 
     # LONG: few density cores + almost-all shallow valleys.
     # Continuous in mean_stability (was a hard 3000/4000 cliff at ms=0.8 that
-    # jumped 1000 genes on tiny feature noise). Maps ms∈[0.5, 0.9] → [2500, k_max].
+    # jumped 1000 genes on tiny feature noise). Maps ms∈[0.5, 0.9] → [2500, hi].
+    # Cap hi by user k_max and a relative ceiling (≤ half the gene pool) so
+    # small n_vars boards never select ~100% of genes on this branch.
     if np.isfinite(fs) and fs >= 0.85 and np.isfinite(nd) and nd <= 4.5:
         lo = 2500
-        hi = int(k_max)
+        hi = min(int(k_max), max(1, int(0.5 * int(n_genes))))
         if hi <= lo:
             k = hi
         elif np.isfinite(ms):
@@ -810,6 +456,12 @@ def explain_structure_rule(
     if np.isfinite(ms) and ms < 0.45 and np.isfinite(vm) and vm >= 0.5:
         return _emit(1000, "soft_1000_low_stability", v7_band_miss=v7_miss)
 
+    # Fall-through: use measured density cores. A hard 2000 here discarded the
+    # only calibrated structure signal (nd) and made product auto a ~150× path
+    # to the classical default. Budget ≈ nd × genes_per_core, clipped.
+    if np.isfinite(nd) and float(nd) >= 1.0:
+        k_nd = int(round(float(nd) * float(ND_GENES_PER_CORE)))
+        return _emit(k_nd, f"nd_budget:nd{int(round(float(nd)))}", v7_band_miss=v7_miss)
     return _emit(2000, "default_2000", v7_band_miss=v7_miss)
 
 
@@ -877,6 +529,14 @@ def select_n_top_from_structure(
     untrusted *without* high-nd multi-core geometry, floor to
     ``short_floor_k``.
 
+    **nd budget (fall-through):** when no SHORT/LONG/MID rule fires, base k is
+    ``round(n_density_pops × 150)`` (then clipped / soft-buffered). A hard
+    classical 2000 is only used when ``nd`` is missing.
+
+    Product default remains ``n_top_genes="auto"``: list length is not known
+    a priori, so paying for structure estimation is preferred to guessing.
+    Pass a fixed int only for locked protocols.
+
     Pass ``n_obs`` and ``n_leiden`` for v5+; without them behavior approximates
     v4. Pass ``n_types`` (from labels) to enable true-SHORT no-buffer.
 
@@ -927,21 +587,27 @@ def _prepare_structure_embedding(
     ``embedding_adata`` is None and the second value is a feature dict with
     ``reason``.
     """
+    import anndata as ad
     import scanpy as sc
 
-    ad0 = adata.copy()
-    ad0.obs_names_make_unique()
-    ad0.var_names_make_unique()
-    if counts_layer in getattr(ad0, "layers", {}):
-        ad0.X = ad0.layers[counts_layer].copy()
-    elif "counts" not in ad0.layers:
-        ad0.layers["counts"] = ad0.X.copy()
+    # Slim object: counts matrix + names only (avoid full layers/obsm peak).
+    if counts_layer in getattr(adata, "layers", {}):
+        Xc = adata.layers[counts_layer]
+        layer_use = str(counts_layer)
+    else:
+        Xc = adata.X
+        layer_use = "counts"
+    Xc = Xc.copy() if hasattr(Xc, "copy") else Xc
+    ad0 = ad.AnnData(X=Xc)
+    ad0.obs_names = np.asarray(adata.obs_names).astype(str)
+    ad0.var_names = np.asarray(adata.var_names).astype(str)
+    ad0.layers[layer_use] = ad0.X
 
     sc.pp.highly_variable_genes(
         ad0,
         n_top_genes=min(int(n_hvg), ad0.n_vars),
         flavor="seurat_v3",
-        layer=counts_layer if counts_layer in ad0.layers else None,
+        layer=layer_use,
         subset=False,
     )
     if "highly_variable" not in ad0.var.columns:
@@ -951,8 +617,9 @@ def _prepare_structure_embedding(
         if not mask.any():
             mask = np.ones(ad0.n_vars, dtype=bool)
     e = ad0[:, mask].copy()
-    if counts_layer in e.layers:
-        e.X = e.layers[counts_layer].copy()
+    if layer_use in e.layers:
+        e.X = e.layers[layer_use].copy()
+    e.uns.pop("log1p", None)
     sc.pp.normalize_total(e, target_sum=1e4)
     sc.pp.log1p(e)
     n_pcs = min(30, e.n_vars - 1, e.n_obs - 1)
@@ -1681,380 +1348,3 @@ def estimate_n_top_structure(
         "stability_n_boot": int(stability_n_boot),
     }
     return int(k), detail
-
-
-def select_n_top_ensemble(
-    picks: dict[str, int],
-    *,
-    k_min: int = 500,
-    k_max: int = 5000,
-    n_genes: int,
-    k_floor: int | None = None,
-    k_ceiling: int | None = None,
-    shape_mass_ratio: float = 0.5,
-    anchor: int | None = 2000,
-) -> int:
-    """Robust ensemble v2.1 for auto ``n_top_genes``.
-
-    Changes vs v1 (plain median of all picks):
-
-    1. **Single shape vote** — ``max(elbow, knee)`` counts once.
-    2. **Protective floor** — final k ≥ ``k_floor``.
-    3. **Untrustworthy shape** — if ``shape < shape_mass_ratio * cumfrac``,
-       raise shape to ``k_floor``.
-    4. **Coverage is a soft floor, not a high vote**.
-    5. **Anchor** (default 2000) stabilizes median near classical HVG size.
-    6. **Ceiling** (default 2500) + **clipped cumfrac vote** — keeps very
-       large cumfrac picks from dominating the median.
-    7. Silhouette is never included here.
-
-    Generic keys (not elbow/knee/cumfrac/coverage) are still included once.
-    """
-    detail = select_n_top_ensemble_detail(
-        picks,
-        k_min=k_min,
-        k_max=k_max,
-        n_genes=n_genes,
-        k_floor=k_floor,
-        k_ceiling=k_ceiling,
-        shape_mass_ratio=shape_mass_ratio,
-        anchor=anchor,
-    )
-    return int(detail["k"])
-
-
-def select_n_top_ensemble_detail(
-    picks: dict[str, int],
-    *,
-    k_min: int = 500,
-    k_max: int = 5000,
-    n_genes: int,
-    k_floor: int | None = None,
-    k_ceiling: int | None = None,
-    shape_mass_ratio: float = 0.5,
-    anchor: int | None = 2000,
-) -> dict[str, Any]:
-    """Same as :func:`select_n_top_ensemble` but returns vote diagnostics."""
-    if k_floor is None:
-        k_floor = effective_k_floor(n_genes, k_min=k_min, k_max=k_max)
-    else:
-        k_floor = _clip_k(int(k_floor), k_min, k_max, n_genes)
-
-    if k_ceiling is None:
-        k_ceiling = effective_k_ceiling(n_genes, k_min=k_min, k_max=k_max)
-    else:
-        k_ceiling = min(int(k_ceiling), int(k_max), max(int(n_genes), 1))
-    if k_ceiling < k_floor:
-        k_ceiling = k_floor
-
-    raw = {str(m): int(v) for m, v in picks.items() if v is not None}
-    votes: dict[str, int] = {}
-    notes: list[str] = []
-
-    # --- shape: one vote from elbow / knee ---
-    shape_raw = None
-    shape_parts = [raw[k] for k in ("elbow", "knee") if k in raw]
-    if shape_parts:
-        shape_raw = int(max(shape_parts))
-        shape = shape_raw
-        mass_ref = raw.get("cumfrac")
-        if (
-            mass_ref is not None
-            and shape_mass_ratio > 0
-            and shape < float(shape_mass_ratio) * float(mass_ref)
-        ):
-            shape = max(shape, k_floor)
-            notes.append(
-                f"shape_raised:{shape_raw}->{shape}(<{shape_mass_ratio}*cumfrac={mass_ref})"
-            )
-        else:
-            shape = max(shape, k_floor) if shape < k_floor else shape
-            if shape != shape_raw:
-                notes.append(f"shape_floor:{shape_raw}->{shape}")
-        # shape also should not exceed ceiling as a vote
-        if shape > k_ceiling:
-            notes.append(f"shape_ceiling:{shape}->{k_ceiling}")
-            shape = k_ceiling
-        votes["shape"] = int(shape)
-
-    # --- mass: clip cumfrac vote to ceiling (do not let 3.5k+ dominate) ---
-    if "cumfrac" in raw:
-        cf_raw = int(raw["cumfrac"])
-        cf = min(cf_raw, k_ceiling)
-        if cf != cf_raw:
-            notes.append(f"cumfrac_clipped:{cf_raw}->{cf}")
-        votes["cumfrac"] = int(cf)
-
-    # --- classical / depth-aware size anchor (always, when provided) ---
-    # Previously only injected when strictly between shape and mass; after
-    # cumfrac is clipped to ceiling that often equals anchor, the guard
-    # skipped injection and median(shape_floor, ceiling) collapsed to
-    # (1000+2000)/2=1500. Always vote the anchor for stability.
-    if anchor is not None and ("shape" in votes or "cumfrac" in votes):
-        a = _clip_k(int(anchor), k_min, k_max, n_genes)
-        a = min(max(a, k_floor), k_ceiling)
-        votes["anchor"] = a
-        notes.append(f"anchor:{a}")
-
-    # --- any other custom keys (exclude already-handled) ---
-    skip = {"elbow", "knee", "cumfrac", "coverage", "silhouette"}
-    for key, val in raw.items():
-        if key not in skip and key not in votes:
-            votes[key] = int(min(int(val), k_ceiling))
-
-    if not votes:
-        k = _clip_k(max(int(anchor or 2000), k_floor), k_min, k_max, n_genes)
-        k = min(k, k_ceiling)
-        return {
-            "k": k,
-            "k_floor": k_floor,
-            "k_ceiling": k_ceiling,
-            "votes": {},
-            "raw_picks": raw,
-            "notes": notes + ["fallback_2000"],
-            "version": "ensemble_v2.2",
-        }
-
-    vals = list(votes.values())
-    k_med = int(np.median(np.asarray(vals, dtype=float)))
-    k = max(k_med, k_floor)
-
-    # coverage: soft *floor* only when *raw* coverage is modest (≤1.25×k).
-    # Clipping a huge coverage (4k→ceiling) must not force k up to ceiling.
-    if "coverage" in raw:
-        cover_raw = int(raw["coverage"])
-        soft_cap = int(1.25 * max(k, 1))
-        if cover_raw > k and cover_raw <= soft_cap:
-            k_new = min(cover_raw, k_ceiling)
-            notes.append(f"coverage_soft_raise:{k}->{k_new}")
-            k = k_new
-        else:
-            notes.append(
-                f"coverage_ignored_as_vote:{cover_raw}(soft_cap={soft_cap}, k_med={k_med})"
-            )
-
-    k = min(k, k_ceiling)
-    k = _clip_k(k, k_min, k_max, n_genes)
-    if k != k_med:
-        notes.append(f"final_adjust:{k_med}->{k}")
-
-    return {
-        "k": k,
-        "k_floor": k_floor,
-        "k_ceiling": k_ceiling,
-        "votes": votes,
-        "raw_picks": raw,
-        "notes": notes,
-        "version": "ensemble_v2.2",
-    }
-
-
-def resolve_n_top_genes(
-    n_top_genes: int | str | None,
-    scores_desc: np.ndarray,
-    gene_order: Sequence[str],
-    *,
-    method: str | None = None,
-    k_min: int = 500,
-    k_max: int = 5000,
-    cumfrac: float = 0.8,
-    adata: Any | None = None,
-    counts_layer: str = "counts",
-    cluster_gene_ranks: dict[str, Sequence[str]] | None = None,
-    min_per_cluster: int = 20,
-    silhouette_candidates: Sequence[int] | None = None,
-    random_state: int = 0,
-    shape_mass_ratio: float = 0.5,
-    soft_floor: int = 1000,
-    soft_ceiling: int = 2500,
-    anchor: int | None = 2000,
-    depth_aware: bool = True,
-) -> tuple[int, dict[str, Any]]:
-    """Resolve ``n_top_genes`` int or auto strategy name into an integer k.
-
-    Parameters
-    ----------
-    n_top_genes
-        int, or one of ``auto`` / ``elbow`` / ``knee`` / ``cumfrac`` /
-        ``silhouette`` / ``coverage`` / ``ensemble`` / ``structure``.
-    method
-        Override strategy when ``n_top_genes='auto'`` (default
-        ``structure`` via HVG). ``"structure"`` needs ``adata``.
-    shape_mass_ratio, soft_floor, soft_ceiling, anchor
-        Ensemble knobs (see :func:`select_n_top_ensemble_detail`). When
-        ``depth_aware`` and ``adata`` are set, floor/ceiling/anchor are
-        overridden from library depth (see :func:`depth_aware_auto_knobs`).
-    depth_aware
-        If True (default) and ``adata`` is provided for ensemble, set
-        anchor/ceiling/floor from median counts and genes per cell.
-    """
-    n_genes = len(gene_order)
-    meta: dict[str, Any] = {"k_min": k_min, "k_max": k_max}
-
-    if isinstance(n_top_genes, (int, np.integer)):
-        k = _clip_k(int(n_top_genes), 1, k_max, n_genes)
-        meta.update({"strategy": "fixed", "n_top_selected": k})
-        return k, meta
-
-    if n_top_genes is None:
-        n_top_genes = "auto"
-
-    name = str(n_top_genes).lower()
-    if name == "auto":
-        name = (method or "ensemble").lower()
-
-    picks: dict[str, int] = {}
-    picks["elbow"] = select_n_top_elbow(scores_desc, k_min=k_min, k_max=k_max)
-    picks["knee"] = select_n_top_knee(scores_desc, k_min=k_min, k_max=k_max)
-    picks["cumfrac"] = select_n_top_cumfrac(scores_desc, frac=cumfrac, k_min=k_min, k_max=k_max)
-
-    if name == "coverage" or name == "ensemble":
-        if cluster_gene_ranks:
-            picks["coverage"] = select_n_top_coverage(
-                gene_order,
-                cluster_gene_ranks,
-                min_per_cluster=min_per_cluster,
-                k_min=k_min,
-                k_max=k_max,
-            )
-        elif name == "coverage":
-            logger.warning("coverage requested but no cluster ranks; falling back to knee.")
-            name = "knee"
-
-    sil_curve: dict[int, float] | None = None
-    structure_detail: dict[str, Any] | None = None
-    if name == "silhouette":
-        if adata is None:
-            logger.warning("silhouette needs adata; falling back to knee.")
-            name = "knee"
-        else:
-            k_sil, sil_curve = select_n_top_silhouette(
-                adata,
-                gene_order,
-                candidates=silhouette_candidates,
-                k_min=k_min,
-                k_max=k_max,
-                counts_layer=counts_layer,
-                random_state=random_state,
-            )
-            picks["silhouette"] = k_sil
-
-    if name == "structure":
-        if adata is None:
-            logger.warning("structure auto_n needs adata; falling back to ensemble.")
-            name = "ensemble"
-        else:
-            try:
-                k_struct, structure_detail = estimate_n_top_structure(
-                    adata,
-                    counts_layer=counts_layer,
-                    random_state=random_state,
-                    version="v7",
-                    k_min=k_min,
-                    k_max=int(k_max),
-                    n_genes=n_genes,
-                    # Product stability: not the library default n_seeds=1.
-                    n_seeds=PRODUCT_STRUCTURE_N_SEEDS,
-                )
-                picks["structure"] = int(k_struct)
-                k = int(k_struct)
-                meta.update(
-                    {
-                        "strategy": "structure",
-                        "n_top_selected": k,
-                        "k_source": structure_detail.get("k_source"),
-                        "rule_branch": structure_detail.get("rule_branch"),
-                        "method_picks": picks,
-                        "structure": structure_detail,
-                    }
-                )
-                logger.info(
-                    "Auto n_top_genes=%d (strategy=structure, features=%s)",
-                    k,
-                    (structure_detail or {}).get("features"),
-                )
-                return k, meta
-            except (
-                ImportError,
-                ValueError,
-                TypeError,
-                RuntimeError,
-                MemoryError,
-                np.linalg.LinAlgError,
-            ) as exc:
-                logger.warning("structure auto_n failed (%s); falling back to ensemble.", exc)
-                structure_detail = {"error": str(exc)}
-                name = "ensemble"
-
-    ensemble_detail: dict[str, Any] | None = None
-    depth_meta: dict[str, Any] | None = None
-    if name == "ensemble":
-        # Ensemble v2.2: v2.1 + optional depth-aware anchor/ceiling/floor.
-        # Silhouette never included (slow; tends to pick very small k and
-        # can lose rare, low-abundance clusters).
-        use = {m: picks[m] for m in ("elbow", "knee", "cumfrac") if m in picks}
-        if "coverage" in picks:
-            use["coverage"] = picks["coverage"]
-
-        ens_floor = soft_floor
-        ens_ceiling = soft_ceiling
-        ens_anchor = anchor
-        if depth_aware and adata is not None:
-            try:
-                stats = library_depth_stats(adata, counts_layer=counts_layer)
-                knobs = depth_aware_auto_knobs(
-                    median_counts=stats["median_counts"],
-                    median_genes=stats["median_genes"],
-                    n_genes=n_genes,
-                    k_min=k_min,
-                    k_max=k_max,
-                )
-                ens_floor = int(knobs["soft_floor"])
-                ens_ceiling = int(knobs["soft_ceiling"])
-                ens_anchor = int(knobs["anchor"])
-                depth_meta = {**stats, **knobs}
-            except (ValueError, TypeError, KeyError, RuntimeError, AttributeError) as exc:
-                logger.warning("depth-aware auto knobs failed (%s); using defaults.", exc)
-                depth_meta = {"error": str(exc)}
-
-        k_floor = effective_k_floor(n_genes, k_min=k_min, k_max=k_max, soft_floor=ens_floor)
-        k_ceiling = effective_k_ceiling(n_genes, k_min=k_min, k_max=k_max, soft_ceiling=ens_ceiling)
-        ensemble_detail = select_n_top_ensemble_detail(
-            use,
-            k_min=k_min,
-            k_max=k_max,
-            n_genes=n_genes,
-            k_floor=k_floor,
-            k_ceiling=k_ceiling,
-            shape_mass_ratio=shape_mass_ratio,
-            anchor=ens_anchor,
-        )
-        k = int(ensemble_detail["k"])
-    elif name in picks:
-        k = picks[name]
-    else:
-        raise ValueError(
-            f"Unknown n_top_genes={n_top_genes!r}. Use int or one of "
-            f"auto/elbow/knee/cumfrac/silhouette/coverage/ensemble/structure."
-        )
-
-    meta.update(
-        {
-            "strategy": name,
-            "n_top_selected": k,
-            "method_picks": picks,
-            "depth": depth_meta,
-            "silhouette_curve": sil_curve,
-            "cumfrac": cumfrac if name in ("cumfrac", "ensemble", "auto") else None,
-            "ensemble": ensemble_detail,
-            "structure": structure_detail,
-        }
-    )
-    logger.info(
-        "Auto n_top_genes=%d (strategy=%s, picks=%s, ensemble=%s)",
-        k,
-        name,
-        picks,
-        ensemble_detail,
-    )
-    return k, meta

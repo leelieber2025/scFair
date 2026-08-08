@@ -7,41 +7,39 @@
 
 ## What scFair does
 
-scFair is HVG selection with two problems in mind — both common in real
-analysis, both easy to get wrong if you only call
+scFair is HVG selection focused on **list size**, with a small optional buffer
+and diagnostics. Easy to get wrong if you only call
 `scanpy.pp.highly_variable_genes` with a copied `n_top_genes=2000`.
 
 ### 1. How many genes (`n`)?
 
-Most pipelines pick a fixed length (often 2000) by habit. That number is
-rarely tuned to the dataset: too short can under-represent structure; too long
-adds noise and cost. **`n_top_genes="auto"`** (the default) estimates a base
-size from cell density structure.
+**Nobody can predict a reasonable list length before seeing the data.** Most
+pipelines copy `2000` from a tutorial — simple, and easy to get wrong silently
+(too short erases structure; too long adds noise and cost).
 
-We do **not** claim auto is always the best `n` for every experiment. Its job
-is to be a **data-informed default and a safety net** — so users who are not
-ready to sweep `k` still get a reasoned list size instead of an arbitrary
-cutoff. When density confidence is low, auto prefers classical 2000 over a
-risky short list. Pass `n_top_genes=2000` (or any int) for papers and fixed
-protocols.
+**`n_top_genes="auto"` is the default for that reason.** It estimates a base
+size from multi-seed density structure so you are less likely to ship a bad
+`n` by habit. The extra compute is intentional: **avoiding a wrong `n` is
+worth more than a sub-second HVG pass.** We do **not** claim auto is always
+optimal — only that it is a safer default than an unexamined fixed length.
+Pass a fixed int when a paper or locked protocol already requires one.
 
-### 2. Unfair HVG allocation
+### 2. How many populations (no resolution sweep)?
 
-Global HVG ranking is driven by the largest populations. Markers for smaller
-or rare types often land just below the cutoff even when they matter for later
-clustering and annotation. That is an **allocation** problem, not a missing
-variance formula.
+{func}`scfair.pp.estimate_n_populations` reads a 3D density field after
+`sc.pp.neighbors`. It is advisory (does not change genes) and works best on
+well-separated data up to ~20 populations.
 
-scFair keeps a standard global ranking as the backbone. By default
-(`balance_method="append"`) it **freezes** the base top-`k` and **appends** a
-small extension of near-miss genes from the **same** ranking. Nothing is
-pushed *out* of the base list. Use `balance_method="none"` for a scanpy-like
-exact top-`k` with no extension.
+### 3. Optional list buffer (`append`)
 
-### Default in one line
+Default `balance_method="append"` extends the **same** global ranking by
+`append_budget` genes → **`top-(k+m)`**, not population-aware reallocation.
+Use `balance_method="none"` for exact top-`k`.
+
+### Default HVG in one line
 
 ```text
-auto n  →  global top-k  →  append near-miss genes
+auto n (default)  →  global top-k  →  optional same-ranking buffer
 ```
 
 ## Where to go

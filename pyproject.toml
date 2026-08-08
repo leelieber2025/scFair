@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scfair"
 dynamic = ["version"]
-description = "HVG selection for scRNA-seq: auto list size (n) plus fairer allocation for small populations"
+description = "HVG selection for scRNA-seq: structure-aware auto list size (n), optional same-ranking list buffer, and diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -55,9 +55,6 @@ dependencies = [
     "scikit-misc>=0.3",
 ]
 
-[tool.setuptools.package-data]
-scfair = ["py.typed"]
-
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
@@ -94,6 +91,9 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Notebooks / Sphinx sources are not part of the lint surface (CI lints
+# src tests examples only). Exclude so a bare `ruff check .` stays green.
+extend-exclude = ["docs", ".venv", "venv", "build", "dist"]
 
 [tool.ruff.lint]
 # Explicit rule set — do not follow ruff's expanding defaults (C408/RUF046/…),

@@ -51,7 +51,7 @@ pip install -e ".[docs]"
 
 ## Versioning
 
-The single source of truth is `src/scfair/_version.py` (currently **0.7.0**).
+The single source of truth is `src/scfair/_version.py` (currently **0.8.0**).
 Runtime `scfair.__version__`, packaging metadata, and the docs release string
 all read it. For a release: bump `__version__`, update `CHANGELOG.md`, then
 `python -m build` or the GitHub **Publish to PyPI** workflow.

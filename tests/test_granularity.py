@@ -120,7 +120,8 @@ def test_precomputed_embedding_needs_no_neighbours(adata_blobs):
 
 
 def test_missing_neighbours_is_reported_not_raised(adata_blobs):
-    est = estimate_n_populations(adata_blobs)
+    with pytest.warns(UserWarning, match="neighbour graph|neighbors"):
+        est = estimate_n_populations(adata_blobs)
     assert est.n_populations is None
     assert est.reason == "no_embedding"
     assert adata_blobs.uns["scfair"]["granularity"]["reason"] == "no_embedding"

@@ -5,11 +5,13 @@ Not part of the public API. Users should only call
 
 Design (package-private):
 
-- Axis-aligned copy in ``adata.layers[layer]`` (default ``"counts"``) for the
-  HVG call — this is the normal product path.
+- Axis-aligned copy in ``adata.layers['counts']`` only when the source is
+  integer-like (or recoverable from ``adata.raw``). Non-integer / log ``.X``
+  is staged on :data:`INTERNAL_COUNTS_LAYER` and popped after the HVG call —
+  never left as a permanent fake ``layers['counts']``.
 - Optional label-indexed sidecar in ``adata.uns['scfair']['raw_snapshot']``
-  only when ``store_raw=True`` / ``"ondisk"``. Default HVG discards any
-  ephemeral uns snapshot at the end of the call.
+  only when ``store_raw=True`` / ``"ondisk"``. A later default call does
+  **not** delete a snapshot the user deliberately kept.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ logger.addHandler(logging.NullHandler())
 INTERNAL_COUNTS_LAYER = "_scfair_counts"
 
 
-def _record_raw_counts_metadata(adata: Any, *, overwrite: bool = False) -> None:
+def _record_raw_counts_metadata(adata: Any) -> None:
     """Write scfair metadata (raw_gene_list)."""
     if UNS_KEY not in adata.uns:
         adata.uns[UNS_KEY] = {}
@@ -130,21 +132,18 @@ def _store_raw_snapshot(
 
 
 def _discard_raw_snapshot(adata: Any, *, store_raw: bool | str = False) -> None:
-    """Drop ``uns['scfair']`` raw-count sidecar unless the user opted to keep it.
+    """End-of-call snapshot policy for one HVG invocation.
 
-    Product default: HVG only needs ``layers['counts']`` for the call; a second
-    full matrix in ``uns`` (~3× h5ad bloat) is useless for most downstream steps.
-    Keep the sidecar only when ``store_raw=True`` or ``store_raw="ondisk"``.
+    Snapshots are only written when ``store_raw=True`` / ``"ondisk"``. A later
+    default call (``store_raw=False``) must **not** delete a snapshot the user
+    deliberately kept for ``subset=True`` full-gene restore.
+
+    This helper is therefore a no-op: historical ``raw_snapshot`` data is left
+    alone. Ephemeral internal layers (``_scfair_counts``, ``_scfair_log``) are
+    popped separately by the HVG caller.
     """
-    if store_raw is True or store_raw == "ondisk":
-        return
-    meta = adata.uns.get(UNS_KEY)
-    if not isinstance(meta, dict):
-        return
-    meta.pop("raw_snapshot", None)
-    meta.pop("raw_gene_list", None)
-    meta.pop("raw_gene_list_full", None)
-    meta.pop("store_raw_counts_n_genes", None)
+    # No-op by design (signature kept for call-site clarity).
+    _ = (adata, store_raw)
 
 
 def _sidecar_mode(sidecar: bool | str) -> tuple[bool, bool]:
@@ -178,7 +177,7 @@ def _store_raw_counts(
                 ondisk=ondisk,
                 snapshot_path=snapshot_path,
             )
-            _record_raw_counts_metadata(adata, overwrite=overwrite)
+            _record_raw_counts_metadata(adata)
 
     if mode == "auto":
         if (
@@ -279,6 +278,51 @@ def _restore_full_genes_from_snapshot(adata: Any, *, layer: str = "counts") -> A
     return new
 
 
+def restore_raw_counts(
+    adata: Any,
+    *,
+    layer: str = "counts",
+    inplace: bool = False,
+    full_genes: bool = False,
+    prefer_snapshot: bool = True,
+) -> Any | None:
+    """Restore raw counts into ``.X`` from a snapshot or counts layer.
+
+    Pair with ``options=HVGOptions(store_raw=True)`` (or ``"ondisk"``) when you
+    need a full-gene universe after ``subset=True``, or to put integer counts
+    back into ``.X`` after log-normalisation.
+
+    Parameters
+    ----------
+    adata
+        AnnData that may hold ``uns['scfair']['raw_snapshot']`` and/or
+        ``layers[layer]``.
+    layer
+        Counts layer name when no snapshot is used (default ``"counts"``).
+    inplace
+        Write into ``adata.X`` when True (not allowed with ``full_genes=True``).
+    full_genes
+        If True, return a **new** AnnData whose gene axis matches the stored
+        full-universe snapshot (requires a prior ``store_raw=True`` call).
+    prefer_snapshot
+        Prefer ``uns['scfair']['raw_snapshot']`` over ``layers[layer]`` when both
+        exist.
+
+    Returns
+    -------
+    AnnData or None
+        ``None`` when ``inplace=True``; otherwise a copy (or a new full-gene
+        object when ``full_genes=True``).
+    """
+    return _restore_raw_counts(
+        adata,
+        layer=layer,
+        inplace=inplace,
+        full_genes=full_genes,
+        prefer_snapshot=prefer_snapshot,
+    )
+
+
 def _restore_raw_counts(
     adata: Any,
     layer: str = "counts",
@@ -286,7 +330,7 @@ def _restore_raw_counts(
     full_genes: bool = False,
     prefer_snapshot: bool = True,
 ) -> Any | None:
-    """Private: restore raw counts into ``.X`` (current genes or full snapshot)."""
+    """Internal restore implementation (also used by tests)."""
     if full_genes:
         if inplace:
             raise ValueError("full_genes=True changes the gene axis and cannot be done inplace.")
@@ -344,12 +388,16 @@ def _restore_raw_counts(
 
 
 def _matrix_fingerprint(X: Any) -> tuple[Any, ...]:
-    """Cheap identity for count matrices: shape + nnz + total + column-sum hash.
+    """Cheap content identity: shape + nnz + total + column-sum hash.
 
     Used to detect a stale ``layers['counts']`` after the user replaced ``.X``
     with a new integer count matrix without updating the layer. Column-sum hash
     (adler32 of float64 col sums) catches permutations / redistributions that
     keep the global sum unchanged.
+
+    Storage format (dense vs sparse) is **not** part of the fingerprint: the
+    same counts in CSR vs ndarray must compare equal so a format-only change
+    does not bypass the user's counts layer.
     """
     import zlib
 
@@ -361,14 +409,12 @@ def _matrix_fingerprint(X: Any) -> tuple[Any, ...]:
         nnz = int(X.nnz)
         total = float(X.data.sum()) if X.data.size else 0.0
         col_sums = np.asarray(X.sum(axis=0), dtype=np.float64).ravel()
-        kind = "sparse"
         shape = tuple(X.shape)
     else:
         arr = np.asarray(X)
         shape = tuple(arr.shape)
-        kind = "dense"
         if arr.size == 0:
-            return (shape, kind, 0, 0.0, 0)
+            return (shape, 0, 0.0, 0)
         flat = arr.ravel()
         nnz = int(np.count_nonzero(flat))
         total = float(flat.sum())
@@ -379,7 +425,7 @@ def _matrix_fingerprint(X: Any) -> tuple[Any, ...]:
         )
     # Stable across processes (unlike Python's salted hash()).
     col_hash = int(zlib.adler32(np.ascontiguousarray(col_sums).tobytes())) & 0xFFFFFFFF
-    return (shape, kind, nnz, total, col_hash)
+    return (shape, nnz, total, col_hash)
 
 
 def _prepare_counts_layer(
@@ -502,19 +548,62 @@ def _prepare_counts_layer(
         )
         return counts_layer
 
-    # No usable counts layer: copy .X into counts (and optional uns sidecar).
-    _store_raw_counts(
-        adata,
-        layer=counts_layer,
-        mode="auto",
-        overwrite=False,
-        sidecar=sidecar,
-        snapshot_path=snapshot_path,
+    # No usable counts layer. Prefer real integer counts in layers[counts_layer]
+    # (.X integer, or recoverable from adata.raw). Never permanently write
+    # log-normalized / non-integer .X as layers['counts'] — scvi-tools and
+    # scanpy treat that name as raw UMI counts.
+    x_int = _is_integer_counts_like(adata.X)
+    raw_attr = getattr(adata, "raw", None)
+    raw_ok = (
+        raw_attr is not None
+        and _is_integer_counts_like(raw_attr.X)
+        and raw_attr.shape[1] == adata.n_vars
+        and hasattr(raw_attr, "var_names")
+        and np.array_equal(raw_attr.var_names, adata.var_names)
     )
-    if counts_layer not in adata.layers:
-        raise ValueError(
-            "Could not prepare a counts layer for highly_variable_genes. "
-            "Provide raw integer counts in adata.X or adata.layers['counts'], "
-            "or pass layer= explicitly."
+    if x_int or raw_ok:
+        _store_raw_counts(
+            adata,
+            layer=counts_layer,
+            mode="auto",
+            overwrite=False,
+            sidecar=sidecar,
+            snapshot_path=snapshot_path,
         )
-    return counts_layer
+        if counts_layer not in adata.layers:
+            raise ValueError(
+                "Could not prepare a counts layer for highly_variable_genes. "
+                "Provide raw integer counts in adata.X or adata.layers['counts'], "
+                "or pass layer= explicitly."
+            )
+        return counts_layer
+
+    # Non-integer .X, no raw recovery: stage on the internal key only (same
+    # policy as fingerprint-mismatch). Caller pops INTERNAL_COUNTS_LAYER.
+    warnings.warn(
+        f"No integer counts layer found and .X does not look like raw counts. "
+        f"Using .X for this call via internal layer {INTERNAL_COUNTS_LAYER!r}; "
+        f"not writing layers[{counts_layer!r}] (downstream tools treat that "
+        f"name as raw UMI counts). Pass layer= or keep raw counts in "
+        f"layers[{counts_layer!r}] / .X before normalize/log1p.",
+        UserWarning,
+        stacklevel=3,
+    )
+    adata.layers[INTERNAL_COUNTS_LAYER] = adata.X.copy()
+    if sidecar:
+        ondisk = sidecar == "ondisk"
+        _store_raw_snapshot(
+            adata,
+            adata.layers[INTERNAL_COUNTS_LAYER],
+            overwrite=True,
+            ondisk=ondisk,
+            snapshot_path=snapshot_path,
+        )
+        if UNS_KEY not in adata.uns:
+            adata.uns[UNS_KEY] = {}
+        snap = adata.uns[UNS_KEY].get("raw_snapshot")
+        if isinstance(snap, dict):
+            adata.uns[UNS_KEY]["raw_snapshot"] = dict(snap)
+            adata.uns[UNS_KEY]["raw_snapshot"]["source_layer"] = INTERNAL_COUNTS_LAYER
+        _record_raw_counts_metadata(adata)
+    return INTERNAL_COUNTS_LAYER

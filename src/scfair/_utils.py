@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 UNS_KEY = "scfair"
 
 
-# Full integer check is cheap (~tens of ms at 1e7 floats). Above this, subsample.
-_INTEGER_COUNTS_FULL_CHECK_UPTO = 10_000_000
+# Full integer check is cheap (~50 ms at 5e7 float32). Real 50k×20k at 5%
+# density is ~5e7 nnz; keep full check up to that class of matrices.
+_INTEGER_COUNTS_FULL_CHECK_UPTO = 100_000_000
 
 
 def _is_integer_counts_like(
@@ -32,14 +33,28 @@ def _is_integer_counts_like(
 
     Tolerant of float storage of integer values (common after aggregation).
 
-    - ``nnz ≤ full_check_upto`` (default 1e7): check **all** stored values so a
-      single fractional entry at the end of a large sparse ``.data`` is not
-      missed by strided sampling.
-    - larger: two deterministic strided passes (``max_check`` samples).
+    - ``nnz ≤ full_check_upto`` (default 1e8): check **all** stored values.
+    - larger: strided samples **plus** pinned endpoints (first / mid / last)
+      so a single fractional/negative at the tail is not invisible. This is a
+      heuristic above the full-check threshold, not a proof over every entry.
 
     Uses **atol only** (``rtol=0``): a relative tolerance would accept e.g.
     ``100000.5`` as integer-like (``rtol * 1e5 ≈ 1``).
+
+    Non-numeric / on-disk backed arrays raise ``TypeError`` (call
+    ``adata.to_memory()`` first).
     """
+    if X is None:
+        return False
+
+    # Backed / lazy anndata sparse datasets are not scipy sparse and not ndarray.
+    x_mod = type(X).__module__
+    x_name = type(X).__name__
+    if "anndata" in x_mod and "Dataset" in x_name:
+        raise TypeError(
+            f"count matrix looks on-disk/backed ({x_name}); call adata.to_memory() before scfair."
+        )
+
     if sparse.issparse(X):
         data = X.data
         if data.size == 0:
@@ -49,6 +64,14 @@ def _is_integer_counts_like(
         vals = data
     else:
         arr = np.asarray(X)
+        if arr.dtype == object or not np.issubdtype(arr.dtype, np.number):
+            raise TypeError(
+                f"count matrix is not a numeric array (dtype={arr.dtype!r}, "
+                f"type={type(X).__name__}). If using backed AnnData, call "
+                "adata.to_memory() first."
+            )
+        if arr.size == 0:
+            return True
         if not np.all(np.isfinite(arr)):
             return False
         vals = arr.ravel()
@@ -58,14 +81,21 @@ def _is_integer_counts_like(
 
     n_full = int(full_check_upto)
     if vals.size > n_full:
-        # Two strided passes with different offsets — O(max_check) memory, not
-        # O(nnz). rng.choice(..., replace=False) would copy the full .data array.
+        # Strided passes + pinned endpoints (first / mid / last). O(max_check)
+        # memory; not a full proof over every entry above full_check_upto.
         half = max(1, max_check // 2)
         stride = max(1, vals.size // half)
         stride_vals = vals[::stride][:half]
         offset = int(stride // 2)
-        second = vals[offset::stride][: max_check - stride_vals.size]
-        vals = np.concatenate([stride_vals, second]) if second.size else stride_vals
+        second = vals[offset::stride][: max(0, max_check - stride_vals.size - 3)]
+        pins = np.asarray(
+            [vals[0], vals[vals.size // 2], vals[-1]],
+            dtype=vals.dtype,
+        )
+        parts = [stride_vals, pins]
+        if second.size:
+            parts.insert(1, second)
+        vals = np.concatenate(parts)
 
     rounded = np.round(vals)
     return bool(np.all(vals >= 0) and np.allclose(vals, rounded, atol=atol, rtol=0.0))

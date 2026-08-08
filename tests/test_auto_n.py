@@ -3,28 +3,18 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from scfair.pp._auto_n import (
     APPEND_BUDGET_FLOOR,
     APPEND_BUDGET_HI,
     APPEND_BUDGET_OFFSET,
     APPEND_BUDGET_PER_NEED,
-    depth_aware_auto_knobs,
-    effective_k_ceiling,
-    effective_k_floor,
     estimate_n_top_structure,
     explain_structure_rule,
     plain_auto_n_message,
     product_append_budget,
-    resolve_n_top_genes,
-    select_n_top_coverage,
-    select_n_top_cumfrac,
     select_n_top_elbow,
-    select_n_top_ensemble,
-    select_n_top_ensemble_detail,
     select_n_top_from_structure,
-    select_n_top_knee,
 )
 
 
@@ -99,17 +89,10 @@ def test_plain_auto_n_message_low_conf_and_sizes():
     assert "override" in msg_mid.lower() or "structure" in msg_mid.lower()
 
 
-@pytest.mark.parametrize("fn", [select_n_top_elbow, select_n_top_knee])
-def test_shape_strategies_respect_bounds(fn):
-    """Both shape strategies must clamp into [k_min, k_max]."""
-    assert 500 <= fn(_fake_scores(), k_min=500, k_max=5000) <= 5000
-
-
-def test_cumfrac_monotonic():
-    s = _fake_scores()
-    k7 = select_n_top_cumfrac(s, frac=0.7, k_min=100, k_max=5000)
-    k9 = select_n_top_cumfrac(s, frac=0.9, k_min=100, k_max=5000)
-    assert k7 <= k9
+def test_elbow_respects_bounds():
+    """Elbow strategy must clamp into [k_min, k_max]."""
+    k = select_n_top_elbow(_fake_scores(), k_min=500, k_max=5000)
+    assert 500 <= k <= 5000
 
 
 def test_structure_auto_n_duo_like_long():
@@ -155,6 +138,25 @@ def test_structure_k_max_reaches_5000():
     )
     assert k > 4000
     assert k <= 5000
+
+
+def test_structure_long_branch_caps_relative_to_n_genes():
+    """LONG must not select ~100% of genes on small pools (n_vars < k_max)."""
+    from scfair.pp._auto_n import explain_structure_rule
+
+    for n_genes in (1200, 4000):
+        d = explain_structure_rule(
+            valley_median=0.03,
+            frac_shallow=1.0,
+            n_density_pops=3,
+            mean_stability=0.95,
+            min_stability=0.5,
+            k_max=5000,
+            n_genes=n_genes,
+        )
+        assert d["rule_branch"].startswith("long_shallow_few_cores")
+        assert d["n_top"] <= int(0.5 * n_genes)
+        assert d["n_top"] < n_genes
 
 
 def test_structure_auto_n_pancreas_like_short():
@@ -436,13 +438,61 @@ def test_combine_structure_k_prefers_aggregate_not_fragile_vote():
     assert src3 == "aggregated_features"
 
 
-def test_structure_auto_n_default_fallback():
-    k = select_n_top_from_structure(
+def test_structure_auto_n_default_uses_nd_budget():
+    """Fall-through scales with density cores instead of a hard 2000."""
+    from scfair.pp._auto_n import ND_GENES_PER_CORE, explain_structure_rule
+
+    d5 = explain_structure_rule(
         valley_median=0.4,
         frac_shallow=0.4,
         n_density_pops=5,
+        density_confidence="high",
     )
-    assert k == 2000
+    assert d5["rule_branch"].startswith("nd_budget")
+    assert d5["n_top"] == _clip_expect(5 * ND_GENES_PER_CORE)
+
+    d10 = explain_structure_rule(
+        valley_median=0.4,
+        frac_shallow=0.4,
+        n_density_pops=10,
+        density_confidence="high",
+    )
+    d20 = explain_structure_rule(
+        valley_median=0.4,
+        frac_shallow=0.4,
+        n_density_pops=20,
+        density_confidence="high",
+    )
+    # nd must move k (the old default_2000 discarded this signal)
+    assert d5["n_top"] < d10["n_top"] <= d20["n_top"]
+    assert d20["n_top"] >= 2000
+
+
+def _clip_expect(k: int, k_min: int = 500, k_max: int = 5000, n_genes: int = 50_000) -> int:
+    from scfair.pp._auto_n import _clip_k, apply_structure_k_buffer
+
+    k0 = _clip_k(int(k), k_min, k_max, n_genes)
+    k1, _ = apply_structure_k_buffer(k0)
+    return _clip_k(int(k1), k_min, k_max, n_genes)
+
+
+def test_structure_missing_nd_falls_back_to_2000():
+    """Without a finite nd, classical 2000 remains the fall-through."""
+    # n_density_pops is required by the signature as int — pass 0-ish via
+    # explain with a non-finite path is hard; zero cores → nd_budget:nd0
+    # uses the >=1 guard and falls to default_2000 only when nd is non-finite.
+    # Use n_density_pops that is finite but check missing-nd via direct call
+    # with NaN through explain's float path:
+    from scfair.pp._auto_n import explain_structure_rule
+
+    d = explain_structure_rule(
+        valley_median=0.4,
+        frac_shallow=0.4,
+        n_density_pops=float("nan"),  # type: ignore[arg-type]
+        density_confidence="high",
+    )
+    assert d["n_top"] == 2000
+    assert d["rule_branch"].startswith("default_2000")
 
 
 def test_structure_v5_large_atlas_floor():
@@ -570,59 +620,6 @@ def test_structure_soft_1000_buffers_to_1500():
     assert "k_buffer" in d["rule_branch"]
 
 
-def test_resolve_structure_without_adata_falls_back():
-    """structure needs adata; without it resolve falls back (still returns a k)."""
-    s = _fake_scores()
-    order = [f"g{i}" for i in range(s.size)]
-    k, meta = resolve_n_top_genes(
-        "structure",
-        s,
-        order,
-        method=None,
-        adata=None,
-        k_min=500,
-        k_max=5000,
-    )
-    assert 500 <= k <= 5000
-    # fallback path is ensemble
-    assert meta["strategy"] == "ensemble"
-
-
-def test_product_structure_uses_n_seeds_3_not_library_default():
-    """Shipped auto must not inherit estimate_n_top_structure's n_seeds=1 default."""
-    from scfair.pp._auto_n import PRODUCT_STRUCTURE_N_SEEDS
-
-    assert PRODUCT_STRUCTURE_N_SEEDS == 3
-
-    import anndata as ad
-    import scipy.sparse as sp
-
-    rng = np.random.default_rng(0)
-    n_obs, n_vars = 200, 400
-    X = sp.csr_matrix(rng.poisson(1.2, size=(n_obs, n_vars)).astype(np.float32))
-    a = ad.AnnData(X)
-    a.layers["counts"] = a.X.copy()
-    a.var_names = [f"g{i}" for i in range(n_vars)]
-    a.obs_names = [f"c{i}" for i in range(n_obs)]
-
-    # resolve_n_top_genes("structure") is the non-fast-path product entry
-    scores = np.arange(n_vars, 0, -1, dtype=float)
-    order = [f"g{i}" for i in range(n_vars)]
-    k, meta = resolve_n_top_genes(
-        "structure",
-        scores,
-        order,
-        adata=a,
-        k_min=50,
-        k_max=300,
-        random_state=0,
-    )
-    assert 50 <= k <= 300
-    struct = meta.get("structure") or {}
-    assert struct.get("n_seeds") == PRODUCT_STRUCTURE_N_SEEDS
-    assert len(struct.get("per_seed_k") or []) == PRODUCT_STRUCTURE_N_SEEDS
-
-
 def test_estimate_n_top_structure_records_stability_n_boot():
     """Detail records which n_boot was used for structure stability."""
     import anndata as ad
@@ -708,155 +705,6 @@ def test_fine_mode_floor_respects_k_max():
     assert k <= n_vars
 
 
-def test_coverage_requires_all_clusters():
-    order = [f"g{i}" for i in range(100)]
-    # cluster A needs gene at position 40; B at 60
-    ranks = {
-        "A": [f"g{i}" for i in range(40, 50)],
-        "B": [f"g{i}" for i in range(60, 70)],
-    }
-    k = select_n_top_coverage(order, ranks, min_per_cluster=5, k_min=10, k_max=100)
-    # 5th gene of B is g64 → k >= 65
-    assert k >= 65
-
-
-def test_ensemble_median_generic_keys():
-    # custom keys still median; floor on n_genes=5000 is 1000 but median=2000
-    k = select_n_top_ensemble({"a": 500, "b": 2000, "c": 3000}, k_min=100, k_max=5000, n_genes=5000)
-    assert k == 2000
-
-
-def test_ensemble_v2_no_double_count_shape():
-    """elbow+knee both 500 must not pull median to 500 when mass is high."""
-    detail = select_n_top_ensemble_detail(
-        {"elbow": 500, "knee": 500, "cumfrac": 3500, "coverage": 4000},
-        k_min=500,
-        k_max=5000,
-        n_genes=10000,
-    )
-    # shape once + floor; cumfrac clipped to ceiling 2500; anchor 2000
-    assert detail["version"] == "ensemble_v2.2"
-    assert "shape" in detail["votes"]
-    assert "elbow" not in detail["votes"]
-    assert "anchor" in detail["votes"]
-    assert detail["k"] >= 1000
-    assert detail["k"] != 500
-    assert detail["k"] <= detail["k_ceiling"]
-    # votes {shape:1000, cumfrac:2500 (clipped), anchor:2000} → median 2000
-    assert detail["k"] == 2000
-    assert any("coverage_ignored" in n for n in detail["notes"])
-    assert any("cumfrac_clipped" in n for n in detail["notes"])
-
-
-def test_ensemble_v2_1_ceiling_blocks_high_k():
-    """Even without anchor, final k must not exceed soft ceiling (~2500)."""
-    k = select_n_top_ensemble(
-        {"elbow": 2000, "knee": 2000, "cumfrac": 4000, "coverage": 5000},
-        k_min=500,
-        k_max=5000,
-        n_genes=10000,
-        anchor=None,
-    )
-    assert k <= 2500
-
-
-def test_ensemble_v2_no_coverage_still_safe():
-    """Without coverage, v1 median(500,500,3500)=500; v2 must stay ≥ floor."""
-    k = select_n_top_ensemble(
-        {"elbow": 500, "knee": 500, "cumfrac": 3500},
-        k_min=500,
-        k_max=5000,
-        n_genes=10000,
-    )
-    assert k >= 1000
-    # with anchor → 2000
-    assert k == 2000
-
-
-def test_ensemble_v2_coverage_soft_raise_only():
-    """Modest coverage can raise k slightly; huge coverage cannot explode k."""
-    # coverage just above median band
-    k_soft = select_n_top_ensemble(
-        {"elbow": 1500, "knee": 1500, "cumfrac": 1800, "coverage": 2000},
-        k_min=500,
-        k_max=5000,
-        n_genes=10000,
-        anchor=None,  # isolate coverage effect
-    )
-    # median(shape=1500, cumfrac=1800)=1650; cover 2000 <= 1.25*1650=2062 → raise to 2000
-    assert k_soft == 2000
-
-    k_huge = select_n_top_ensemble(
-        {"elbow": 1500, "knee": 1500, "cumfrac": 1800, "coverage": 5000},
-        k_min=500,
-        k_max=5000,
-        n_genes=10000,
-        anchor=None,
-    )
-    # 5000 > 1.25*1650 → ignored; k stays median 1650
-    assert k_huge == 1650
-
-
-def test_effective_k_floor():
-    assert effective_k_floor(10000, k_min=500) == 1000
-    assert effective_k_floor(3000, k_min=500) == 600  # 0.2 * 3000
-    assert effective_k_floor(80, k_min=20, soft_floor=1000) == 20
-
-
-def test_effective_k_ceiling():
-    assert effective_k_ceiling(10000, k_min=500, soft_ceiling=2500) == 2500
-    assert effective_k_ceiling(1000, k_min=500, soft_ceiling=2500) == 1000
-
-
-def test_resolve_fixed():
-    s = _fake_scores(1000)
-    order = [f"g{i}" for i in range(1000)]
-    k, meta = resolve_n_top_genes(800, s, order, k_min=100, k_max=900)
-    assert k == 800
-    assert meta["strategy"] == "fixed"
-
-
-def test_resolve_auto_ensemble():
-    s = _fake_scores(3000)
-    order = [f"g{i}" for i in range(3000)]
-    ranks = {"c0": order[:50], "c1": order[100:150]}
-    k, meta = resolve_n_top_genes(
-        "auto",
-        s,
-        order,
-        method="ensemble",
-        k_min=200,
-        k_max=2500,
-        cluster_gene_ranks=ranks,
-        min_per_cluster=10,
-    )
-    assert 200 <= k <= 2500
-    assert meta["strategy"] == "ensemble"
-    assert "method_picks" in meta
-    assert meta["ensemble"] is not None
-    assert meta["ensemble"]["version"] == "ensemble_v2.2"
-    # floor for 3000 genes with k_min=200 → max(200, min(1000,600))=600
-    assert k >= meta["ensemble"]["k_floor"]
-    assert k <= meta["ensemble"]["k_ceiling"]
-
-
-def test_depth_aware_knobs_tiers():
-    sh = depth_aware_auto_knobs(median_counts=245, median_genes=150, n_genes=10000)
-    assert sh["depth_tier"] == "shallow"
-    assert sh["anchor"] == 2000
-    assert sh["soft_ceiling"] == 2000
-
-    mid = depth_aware_auto_knobs(median_counts=2200, median_genes=820, n_genes=10000)
-    assert mid["depth_tier"] == "medium"
-    assert mid["anchor"] == 2000
-    assert mid["soft_ceiling"] == 2500
-
-    deep = depth_aware_auto_knobs(median_counts=288391, median_genes=6070, n_genes=10000)
-    assert deep["depth_tier"] == "deep"
-    assert deep["soft_ceiling"] <= 2000
-    assert deep["anchor"] <= 1500
-
-
 def test_hvg_auto_runs():
     """Product auto (structure) runs and records auto_message."""
     import anndata as ad
@@ -904,28 +752,6 @@ def test_hvg_auto_structure_default():
     )
     assert a.uns["scfair"]["hvg"]["auto_n"]["strategy"] == "structure"
     assert a.uns["scfair"]["hvg"]["balance_method"] == "append"
-
-
-def test_hvg_auto_ensemble_rejected():
-    """Ensemble auto_n_method is no longer a product option."""
-    import anndata as ad
-
-    import scfair as scf
-    from scfair.pp import HVGOptions
-
-    rng = np.random.default_rng(2)
-    X = rng.poisson(1.2, size=(80, 50)).astype(np.float32)
-    a = ad.AnnData(X)
-    a.var_names = [f"g{i}" for i in range(50)]
-    a.obs_names = [f"c{i}" for i in range(80)]
-    with pytest.raises(ValueError, match="structure"):
-        scf.pp.highly_variable_genes(
-            a,
-            n_top_genes="auto",
-            options=HVGOptions(auto_n_method="ensemble", n_top_min=10, n_top_max=30),
-            diagnose=False,
-            progress=False,
-        )
 
 
 def test_structure_k_buffer_ladder():

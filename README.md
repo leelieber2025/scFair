@@ -6,13 +6,14 @@
 [![CI](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml/badge.svg)](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**scFair** is drop-in HVG selection for single-cell RNA-seq that targets two
-everyday pain points:
+**scFair** is drop-in HVG selection for single-cell RNA-seq, plus a density
+population count that does not need a Leiden resolution sweep:
 
 | Problem | What goes wrong | What scFair does |
 |---------|-----------------|------------------|
-| **How many genes (`n`)?** | Users guess 2000 (or copy a paper). Too short can erase structure; too long adds noise. | **`n_top_genes="auto"`** (default) suggests a base size from the data. It is **not** proven optimal for every dataset — it is a **safe default and a prompt** so unfamiliar users are less likely to ship a silent bad `n`. Override with `n_top_genes=2000` anytime. |
-| **Unfair HVG allocation** | Global ranking is driven by large populations. Markers for smaller types often sit just below the cutoff. | Keeps that global ranking as the backbone and, by default, **`append`s** a small extension from the same ranking so near-miss genes are not discarded. The base top-`k` is never displaced. |
+| **How many genes (`n`)?** | Nobody knows a priori what length is safe. Copying `2000` is a silent gamble. | **`n_top_genes="auto"`** (**default**) estimates a base size from density structure. That multi-seed cost is intentional: **avoiding a wrong `n` is worth the compute** when you cannot predict a reasonable length. Pass a fixed int only when the protocol is already locked. |
+| **How many populations?** | Users sweep Leiden resolution by hand. | **`estimate_n_populations`** reads a 3D density field (needs `sc.pp.neighbors` first). Strong on well-separated data up to ~20 populations. |
+| **List length near the cutoff** | Near-miss genes just below a hard top-`k` cutoff are discarded. | Default **`append`** extends the **same** global ranking by `append_budget` genes → mathematically **`top-(k+m)`**, not population-aware reallocation. Use `balance_method="none"` for pure top-`k`. |
 
 Docs: [Read the Docs](https://scfair.readthedocs.io/en/latest/).
 
@@ -43,28 +44,36 @@ sc.pp.log1p(adata)
 sc.pp.scale(adata, max_value=10)
 sc.tl.pca(adata)
 sc.pp.neighbors(adata)
-sc.tl.leiden(adata)
+sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False)
 ```
 
-That is the default path: pick a base size from the data (`n_top_genes="auto"`),
-then append a few more genes from the same ranking. Auto is slower than a fixed
-`k` (extra multi-seed graph builds). Read `adata.uns["scfair"]["hvg"]["auto_message"]`
-for a one-line plain summary of the chosen base size. For a classical fixed list
-or a paper protocol:
+Default path: structure auto-`n` + same-ranking list buffer (`append`). Auto
+runs extra multi-seed graph builds and is slower than a fixed `k` — that is
+by design. **A silent wrong list length is more expensive than the compute.**
+Read `adata.uns["scfair"]["hvg"]["auto_message"]` for a one-line summary of the
+chosen base size. Use a fixed int only for a locked paper/protocol:
 
 ```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000)
 ```
 
-To match scanpy with no extension:
+Pure top-`k` (no buffer):
 
 ```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000, balance_method="none")
 ```
 
+Population count without resolution sweep (after neighbors):
+
+```python
+sc.pp.neighbors(adata)
+est = scf.pp.estimate_n_populations(adata)
+print(est.n_populations, est.confidence)
+```
+
 ## Status
 
-**0.7.0 (Beta).** Import as `import scfair as scf` and use names in
+**0.8.0 (Beta).** Import as `import scfair as scf` and use names in
 `scfair.__all__` and `scf.pp`. See the
 [API reference](https://scfair.readthedocs.io/en/latest/api/index.html).
 

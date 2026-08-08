@@ -6,6 +6,63 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-08
+
+### Changed
+
+- **Default remains `n_top_genes="auto"`.** Docs state clearly: auto exists to
+  **avoid a wrong `n` when no length is known a priori**; the multi-seed cost
+  is intentional and worth it. Structure fall-through no longer hard-codes
+  2000: when no SHORT/LONG/MID rule fires, base k scales as
+  `round(n_density_pops × 150)` (`nd_budget`). Classical 2000 only when `nd`
+  is missing; low-confidence floors still apply. Pass a fixed int only for
+  locked protocols.
+- **Honest product framing.** `append` = same-ranking list buffer
+  (`top-(k+m)`), not population-aware reallocation. Density population count
+  (`estimate_n_populations`) is documented as a first-class feature (scope
+  ~≤20 well-separated populations).
+- **Public `restore_raw_counts`** for `store_raw=True` snapshots.
+- **`pp.__all__`** is the documented surface only.
+- **Removed dead auto-n strategies** (elbow/knee/cumfrac/… dispatcher);
+  `auto_n_method` option removed.
+- Dropped `py.typed` (no mypy CI / type guarantee). Gitignore root
+  `PKG-INFO` / `setup.cfg` egg_info noise.
+- Structure embedding prep uses a slim AnnData; stable gene ranking;
+  `n_top_genes=True` rejected; `mode=None` → `"auto"`;
+  diagnose_from_labels reports `n_labels_dropped`.
+
+### Fixed
+
+- **Counts fingerprint no longer treats dense vs sparse as different content.**
+  Format-only changes (e.g. ``layers['counts'] = X.copy()`` then densify
+  ``.X``) no longer bypass the user's counts layer via a false mismatch.
+- **Backed AnnData** raises a clear ``NotImplementedError`` (use
+  ``to_memory()``) instead of a numpy ``isfinite`` TypeError.
+- **Integer-counts check** full-scan threshold raised to 1e8 nnz; above that,
+  strided sampling always pins first/mid/last entries (docstring no longer
+  overclaims full coverage when subsampled).
+- **`batch_key` selection matches scanpy.** After the per-batch HVG merge,
+  ranking now follows scanpy's criteria (`highly_variable_rank` /
+  `highly_variable_nbatches` / `dispersions_norm` as appropriate), not the
+  cross-batch mean of ``variances_norm``. Previously up to ~36% of selected
+  genes could differ, including genes with ``nbatches==0``.
+- **No fake `layers['counts']` from log `.X`.** When there is no integer counts
+  layer and `.X` is non-integer, HVG stages data on internal `_scfair_counts`
+  (popped after the call) instead of permanently writing log values as
+  `layers['counts']`. Emits `UserWarning`.
+- **`store_raw=True` snapshots survive later default calls.** A subsequent
+  `store_raw=False` HVG no longer deletes `uns['scfair']['raw_snapshot']`.
+- **Structure auto LONG branch** caps `hi` at `min(k_max, ⌊0.5 · n_genes⌋)` so
+  small gene pools no longer return `k = n_vars` via `long_shallow_few_cores`.
+- **`estimate_n_populations` without neighbors** uses `warnings.warn` (visible
+  by default) and documents the `sc.pp.neighbors` precondition.
+- Auto progress threshold lowered to `n_obs >= 1000`; docs note auto cost
+  (~10–100× vs fixed `n_top_genes`).
+- `HVGOptions.merged` applies only non-`None` overrides; options/legacy mix
+  error text matches “do not mix” policy; counts validation can record multiple
+  warning codes; log-flavor materialization uses a minimal AnnData (lower peak
+  memory); ruff `extend-exclude` for `docs/`.
+
 ## [0.7.0] - 2026-08-04
 
 ### Removed
@@ -40,8 +97,9 @@ All notable changes to this project are documented in this file.
 - Structure auto: when density confidence is low, prefer a classical base of
   **2000** over short lists (except multi-core short geometry with enough
   labeled types, which may keep a shorter base).
-- Do not leave an inline `uns["scfair"]["raw_snapshot"]` matrix after HVG
-  unless `options=HVGOptions(store_raw=True)` (or `"ondisk"`).
+- Write an inline `uns["scfair"]["raw_snapshot"]` only when
+  `options=HVGOptions(store_raw=True)` (or `"ondisk"`); later default calls do
+  not delete a snapshot the user kept.
 - Document `batch_key` on `HVGOptions` (forwarded to scanpy on the global HVG
   pass only).
 - **Default `filter_mito=False` and `filter_ribo=False`** on `HVGOptions`:
@@ -49,8 +107,8 @@ All notable changes to this project are documented in this file.
   `options=HVGOptions(filter_mito=True, filter_ribo=True)` to drop MT /
   ribosomal structural-protein symbols and refill (markers kept;
   auto-detects human/mouse naming via `gene_nomenclature`).
-- Progress is on by default for auto on medium-size data (≥3k cells) as well as
-  large fixed-k runs. After auto, stderr and
+- Progress is on by default for auto once `n_obs >= 1000`, and for large
+  fixed-k runs. After auto, stderr and
   `uns["scfair"]["hvg"]["auto_message"]` carry one plain-language line for the
   chosen base size.
 - Optional faster auto pass: `options=HVGOptions(structure_n_seeds=1)` (product
@@ -58,10 +116,9 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
-- User guide, README, quickstart, and FAQ emphasize two product goals: choosing
-  a sensible gene budget (`n`), and fairer allocation of HVG slots for smaller
-  populations. Auto is described as a safe default, not a claim of global
-  optimality.
+- User guide, README, quickstart, and FAQ emphasize structure-aware auto-`n`
+  and an optional same-ranking list buffer (not population-aware
+  reallocation). Auto is a safe default, not a claim of global optimality.
 - Quickstart and README show a full downstream scanpy path without subsetting
   the gene matrix.
 
