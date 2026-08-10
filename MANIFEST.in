@@ -25,9 +25,16 @@ global-exclude docs/review.md
 global-exclude docs/AUTO_N_*
 global-exclude docs/CELLBRF_*
 global-exclude docs/DATA_SOURCES.md
+global-exclude docs/TEST5_PANEL.md
 global-exclude docs/**/*.docx
 global-exclude docs/**/*.csv
 global-exclude *.docx
+
+# Editor/notebook checkpoint litter (should never be tracked, but MANIFEST
+# packaging reads the filesystem, not git, so prune defensively).
+global-exclude *-checkpoint.*
+global-exclude *.ipynb_checkpoints
+global-exclude *.ipynb_checkpoints/*
 
 # Public tree: pointer to RTD only. Research / benchmark scripts stay in the
 # developer checkout and are not shipped on PyPI or GitHub release zips.

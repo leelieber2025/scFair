@@ -45,7 +45,6 @@ Useful fields:
 |-------|------|
 | `append_budget` | Genes appended after the frozen base. `None` → **floor 200**; with `n_top_genes="auto"`, may rise as `max(200, min(300, 200 + max(0, n_density_pops − 12) × 12))`. Explicit `0`/`N` never overridden. |
 | `n_top_min` / `n_top_max` | Bounds for automatic `n_top_genes` |
-| `auto_n_method` | Product auto is structure-only (default `"structure"`) |
 | `structure_n_seeds` | Multi-seed count for structure auto (`None` → product default 3; use `1` for a faster pass) |
 | `store_raw` | Opt-in: keep a full raw-count sidecar in `uns['scfair']['raw_snapshot']` after HVG (default `False`). `True` = inline; `"ondisk"` needs `snapshot_path` |
 | `label_key` | Optional obs key for type-count detection in auto mode |

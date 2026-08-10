@@ -126,7 +126,7 @@ After a call, `adata.uns["scfair"]["hvg"]["auto_n"]` records what happened:
 
 | Field | Meaning |
 |-------|---------|
-| `strategy` | Which estimator ran (`"structure"` unless you changed `auto_n_method`) |
+| `strategy` | Always `"structure"` — product auto is structure-only; there is no user-settable alternative estimator |
 | `n_top_selected` | The base `k` it picked |
 | `structure` | Density features (population count, valley depth, stability) |
 | `rule_branch` | Internal tag for which rule fired — useful in bug reports |

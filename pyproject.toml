@@ -37,16 +37,17 @@ dependencies = [
     "anndata>=0.10",
     "numpy>=1.24",
     "pandas>=2.0",
-    # scanpy>=1.10, not 1.9: the intermediate clustering calls
+    # scanpy>=1.10, not 1.9: structure auto-n and the granularity tools call
     # sc.tl.leiden(flavor="igraph"), and `flavor` did not exist before 1.10.
-    # That call has no fallback, so on 1.9 every balanced method raises TypeError.
+    # That call has no fallback, so on 1.9 those code paths raise TypeError.
     # `flavor="seurat_v3_paper"` is also 1.10+.
     "scanpy>=1.10",
     "scipy>=1.10",
     # Direct imports: silhouette / NearestNeighbors / KMeans / ARI (not only via scanpy).
     "scikit-learn>=1.2",
-    # Required, not optional: every balanced method runs an intermediate Leiden
-    # via sc.tl.leiden(flavor="igraph"). flavor="igraph" does not need leidenalg.
+    # Required, not optional: structure auto-n and the granularity tools run an
+    # intermediate Leiden via sc.tl.leiden(flavor="igraph"). flavor="igraph"
+    # does not need leidenalg.
     "igraph>=0.10",
     # Also required, not optional: the DEFAULT flavor="seurat_v3" is implemented in
     # scanpy as `from skmisc.loess import loess`. Without it scanpy raises; scFair
