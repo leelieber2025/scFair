@@ -23,6 +23,12 @@ Runtime floors that matter in practice:
 pip install scfair
 ```
 
+**Bioconda:**
+
+```bash
+conda install -c conda-forge -c bioconda scfair
+```
+
 ## Check the install
 
 ```python

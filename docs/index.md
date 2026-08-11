@@ -1,9 +1,13 @@
 # scFair Documentation
 
 [![PyPI version](https://img.shields.io/pypi/v/scfair.svg)](https://pypi.org/project/scfair/)
+[![PyPI downloads](https://img.shields.io/pepy/dt/scfair.svg)](https://pepy.tech/project/scfair)
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/scfair.svg)](https://anaconda.org/bioconda/scfair)
+[![Conda downloads](https://img.shields.io/conda/dn/bioconda/scfair.svg)](https://anaconda.org/bioconda/scfair)
 [![Python versions](https://img.shields.io/pypi/pyversions/scfair.svg)](https://pypi.org/project/scfair/)
 [![CI](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml/badge.svg)](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/leelieber2025/scFair/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21761251.svg)](https://doi.org/10.5281/zenodo.21761251)
 
 ## What scFair does
 
@@ -65,7 +69,7 @@ auto n (default)  →  global top-k  →  same-rank append (cutoff buffer)
 
 ### A sensible path
 
-1. Install: `pip install scfair`
+1. Install: `pip install scfair` (or `conda install -c conda-forge -c bioconda scfair`)
 2. Follow {doc}`quickstart`
 3. Work through the {doc}`tutorials/pbmc3k_first_analysis` notebook
 4. Use {doc}`faq` when a call looks off

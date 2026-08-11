@@ -1,10 +1,14 @@
 # scFair
 
 [![PyPI version](https://img.shields.io/pypi/v/scfair.svg)](https://pypi.org/project/scfair/)
+[![PyPI downloads](https://img.shields.io/pepy/dt/scfair.svg)](https://pepy.tech/project/scfair)
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/scfair.svg)](https://anaconda.org/bioconda/scfair)
+[![Conda downloads](https://img.shields.io/conda/dn/bioconda/scfair.svg)](https://anaconda.org/bioconda/scfair)
 [![Python versions](https://img.shields.io/pypi/pyversions/scfair.svg)](https://pypi.org/project/scfair/)
 [![Documentation Status](https://readthedocs.org/projects/scfair/badge/?version=latest)](https://scfair.readthedocs.io/en/latest/?badge=latest)
 [![CI](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml/badge.svg)](https://github.com/leelieber2025/scFair/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21761251.svg)](https://doi.org/10.5281/zenodo.21761251)
 
 **scFair** is drop-in HVG selection for single-cell RNA-seq aimed at two
 problems every pipeline hits — plus an optional density population count:
@@ -29,7 +33,10 @@ Docs: [Read the Docs](https://scfair.readthedocs.io/en/latest/).
 
 ```bash
 pip install scfair
+# or: conda install -c conda-forge -c bioconda scfair
 ```
+
+Details: [installation guide](https://scfair.readthedocs.io/en/latest/installation.html).
 
 ## First run
 
@@ -86,6 +93,11 @@ print(est.n_populations, est.confidence)
 2. [Quickstart](https://scfair.readthedocs.io/en/latest/quickstart.html)
 3. [Tutorial: PBMC 10k misclustered cells vs standard HVG](https://scfair.readthedocs.io/en/latest/tutorials/index.html)
 4. [FAQ](https://scfair.readthedocs.io/en/latest/faq.html) if something looks off
+
+## Citation
+
+For the software, cite the Zenodo DOI above. For analyses tied to package
+version **0.8.0**, use `scfair==0.8.0`. See `CITATION.cff`.
 
 ## License
 
