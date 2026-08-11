@@ -2,16 +2,14 @@
 
 Public entry point: :func:`highly_variable_genes`.
 
-Product path:
-
 1. **How many genes (``n``)?** Default ``n_top_genes="auto"`` estimates a base
-   size ``k`` from density structure (safer than guessing; not proven optimal).
-2. **Unfair allocation at the cutoff.** Global HVG ranking is dominated by large
+   size ``k`` from multi-seed density structure. Pass a fixed int when the
+   protocol already locks ``n``.
+2. **Hard top-``k`` cutoff.** Global HVG ranking is dominated by large
    populations; genes useful for smaller types often sit just below top-``k``.
    Default ``balance_method="append"`` freezes the global backbone and adds a
-   short **same-rank** tail (``append_budget``). The set is
-   ``top-(k+m)`` — a conservative response to cutoff unfairness, **not**
-   cluster-conditional reallocation. Pass ``balance_method="none"`` (or
+   short **same-rank** tail (``append_budget``). The set is ``top-(k+m)``.
+   Not cluster-conditional reallocation. Pass ``balance_method="none"`` (or
    ``append_budget=0``) for pure top-``k``.
 
 Cluster-aware reallocation methods (``hybrid`` / ``score`` / ``reweight``)
@@ -145,22 +143,18 @@ def highly_variable_genes(
         ``layer=``).
     n_top_genes
         ``"auto"`` / ``"structure"`` (**default**): structure-aware base size
-        from multi-seed density features. **Default is auto on purpose:** no
-        fixed ``n`` is known to be safe a priori; paying for structure
-        estimation is meant to reduce silent wrong list lengths. Pass a fixed
-        int (e.g. ``2000``) only when the protocol is locked. Booleans are
-        rejected.
+        from multi-seed density features. Pass a fixed int (e.g. ``2000``)
+        when the protocol is locked. Booleans are rejected. Auto is multi-seed
+        and slower than a fixed ``k``.
     flavor
         Scanpy HVG method for the global ranking:
         counts: ``seurat_v3``, ``seurat_v3_paper``, ``pearson_residuals``;
         log: ``seurat``, ``cell_ranger``.
     balance_method
         ``"append"`` (default): freeze global top-``k``, then add the next
-        ``append_budget`` genes from the **same** ranking so near-miss genes
-        (often relevant to less dominant structure) are not discarded by a
-        hard cut. The set equals ``top-(k+m)`` — a conservative response to
-        **cutoff unfairness**, not cluster-conditional reallocation.
-        ``"none"``: top-``k`` only (scanpy-like fixed list size).
+        ``append_budget`` genes from the **same** ranking (near-miss genes
+        kept). The set equals ``top-(k+m)``. Not cluster-conditional
+        reallocation. ``"none"``: top-``k`` only (scanpy-like fixed list size).
     mode
         ``"auto"`` / ``"compact"`` / ``"balanced"`` / ``"fine"`` — steers
         auto-``k`` floors and default append budget when not set explicitly.

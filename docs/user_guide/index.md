@@ -5,10 +5,10 @@ covers the default method, the main parameters, and the opt-in alternatives.
 
 ## Two problems scFair targets
 
-| # | Problem | Default answer | Honest scope |
-|---|---------|----------------|--------------|
-| **A** | **How many genes (`n`)?** No a priori safe length; users copy 2000. | `n_top_genes="auto"` | Safer than guessing. Extra compute is intentional — **avoiding a wrong `n` is worth it**. Not a proof of the best `n`. |
-| **B** | **Unfair HVG allocation at the cutoff** Large types fill the list; rare / small-type markers often miss a hard top-`k`. | `balance_method="append"` | Freezes global top-`k`, adds same-rank near-miss tail. Set = `top-(k+m)`. Conservative response to **cutoff unfairness** — not cluster-conditional reallocation. |
+| # | Problem | Default answer | Scope |
+|---|---------|----------------|-------|
+| **A** | **How many genes (`n`)?** No universal safe length; users often copy 2000. | `n_top_genes="auto"` | Data-informed base size from density structure. Not a proof of the best `n`. Extra multi-seed cost vs fixed `k`. |
+| **B** | **Hard top-`k` cutoff** Large types fill the list; small-type markers often miss the cut. | `balance_method="append"` | Freezes global top-`k`, adds same-rank near-miss tail. Set = `top-(k+m)`. Not cluster-conditional reallocation. |
 
 Details and caveats: {doc}`method`.
 

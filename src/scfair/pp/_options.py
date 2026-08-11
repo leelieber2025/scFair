@@ -78,8 +78,8 @@ class HVGOptions:
     # auto bounds / structure seeds
     n_top_min: int = 500
     n_top_max: int = 5000
-    # Structure auto multi-seed count. None → product default (3). Use 1 for
-    # a faster exploratory pass (less stable k).
+    # Structure auto multi-seed count. None → default 3. Use 1 for a faster
+    # exploratory pass (less stable k).
     structure_n_seeds: int | None = None
 
     # Optional obs key for auto mode / fine detection (n_types).
@@ -89,10 +89,10 @@ class HVGOptions:
     marker_extra: bool = True
 
     # Extra genes beyond base ``n_top_genes`` / auto-``k`` from the **same**
-    # global ranking (ranks ``k+1 … k+m``). Softens unfair hard cutoffs
-    # (near-miss genes kept); set equals ``top-(k+m)``, not cluster quotas.
-    # None → product default floor 200; on ``n_top_genes="auto"`` may rise with
-    # structure density cores. Explicit ``0``/``N`` is never overridden.
+    # global ranking (ranks ``k+1 … k+m``). Near-miss genes kept; set equals
+    # ``top-(k+m)``, not cluster quotas. None → floor 200; on
+    # ``n_top_genes="auto"`` may rise with structure density cores. Explicit
+    # ``0``/``N`` is never overridden.
     append_budget: int | None = None
 
     # Opt-in: keep a full raw-count sidecar in ``uns['scfair']['raw_snapshot']``

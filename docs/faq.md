@@ -6,7 +6,7 @@ First analysis: {doc}`quickstart`. Method detail: {doc}`user_guide/method`.
 
 | Goal | Function |
 |------|----------|
-| Everyday HVG selection | {func}`scfair.pp.highly_variable_genes` (default: **auto** + append) |
+| Default HVG selection | {func}`scfair.pp.highly_variable_genes` (default: **auto** + append) |
 | Locked paper / fixed protocol | Same function with `n_top_genes=2000` |
 | Match scanpy gene set (no buffer) | `n_top_genes=2000, balance_method="none"` (+ same `batch_key` if any) |
 | How many populations (no res sweep) | {func}`scfair.pp.estimate_n_populations` after `sc.pp.neighbors` |
@@ -16,19 +16,15 @@ First analysis: {doc}`quickstart`. Method detail: {doc}`user_guide/method`.
 
 **1. How many genes (`n`)?**  
 There is no a priori correct list length. Default `n_top_genes="auto"`
-estimates a base size from density structure so users who would otherwise copy
-`2000` are less likely to ship a silent wrong `n`. We do **not** claim auto is
-always optimal — we claim the **default should not force you to guess**.
-Override with a fixed int only when the protocol is already locked.
+estimates a base size from density structure. Auto is not always optimal;
+override with a fixed int when the protocol is already locked.
 
-**2. Unfair HVG allocation at the cutoff?**  
+**2. Hard cutoff on a global ranking?**  
 A plain top-`k` global ranking is dominated by large populations; markers for
-smaller types often miss the cut. Default `append` keeps that ranking as a
-frozen backbone and adds a short **same-rank** tail of near-miss genes so the
-base top-`k` is never displaced. That is a **conservative response to cutoff
-unfairness** — not a new variance model and not cluster-conditional
-reallocation (those methods were removed). Use `balance_method="none"` for
-pure top-`k`.
+smaller types often miss the cut. Default `append` freezes that ranking and
+adds a short **same-rank** tail of near-miss genes so the base top-`k` is never
+displaced. Not a new variance model and not cluster-conditional reallocation
+(those methods were removed). Use `balance_method="none"` for pure top-`k`.
 
 See {doc}`user_guide/method` for the full story.
 
@@ -66,7 +62,7 @@ strict size.
 ## Can scFair push genes *out* of the top 2000?
 
 **No.** The base top-`k` is frozen on `"append"`. Only `"none"` (exact size
-`k`) and `"append"` (base + tail) are product methods.
+`k`) and `"append"` (base + tail) are available.
 
 ## Are mitochondrial and ribosomal genes removed from HVGs?
 
@@ -177,8 +173,8 @@ scf.pp.highly_variable_genes(
 ```
 
 Use this when you call `subset=True` and later need the pre-subset gene universe
-from `uns`, or when another tool expects that sidecar. Everyday pipelines can
-leave the default alone.
+from `uns`, or when another tool expects that sidecar. Most pipelines can leave
+the default alone.
 
 ## Multi-batch data: how do I pass `batch_key`?
 
@@ -226,16 +222,14 @@ On small matrices, structure-based auto-`k` can hit the ceiling. Prefer a fixed
 
 ## Why is the default slower than scanpy?
 
-Because the default is **`n_top_genes="auto"`**, not a copied `2000`.
+Because the default is **`n_top_genes="auto"`**, not a fixed `2000`.
 
 Auto builds multi-seed HVG→PCA→neighbors→density graphs to estimate list size.
-That is **much slower** than one scanpy HVG pass (often ~10–150×). **That cost
-is intentional:** there is no reliable a priori `n`, and a silent wrong list
-length is usually more expensive than waiting for structure estimation.
-Progress messages print on stderr once `n_obs >= 1000` under auto.
+That is much slower than one scanpy HVG pass (often ~10–150×). Progress messages
+print on stderr once `n_obs >= 1000` under auto.
 
-Pass a fixed int only when a paper or protocol is already locked (append still
-applies unless you set `balance_method="none"`).
+Pass a fixed int when a paper or protocol already locks the length (append
+still applies unless you set `balance_method="none"`).
 
 ## How many populations without sweeping Leiden?
 
@@ -253,15 +247,14 @@ groups (e.g. 30 types × tens of cells each) it can under-count. It answers
 ## How does this differ from GiniClust or CellSIUS?
 
 **Different problem.** GiniClust / CellSIUS hunt **rare-subpopulation markers**
-(Gini or per-cluster tests, usually after a coarse partition). scFair product
-path does **not**: default **`append`** only extends the **same global HVG
-ranking** by a short tail (`k+1 … k+m`). No Gini LOESS pool, no cluster-wise
-FDR, no co-expression communities in the shipped default.
+(Gini or per-cluster tests, usually after a coarse partition). Default scFair
+**`append`** only extends the **same global HVG ranking** by a short tail
+(`k+1 … k+m`). No Gini LOESS pool, no cluster-wise FDR, no co-expression
+communities.
 
-**Rare types still poorly resolved?** Prefer known markers with
+**Rare types still poorly resolved?** Pass known markers with
 `marker_genes=…`, `marker_mode="force"` (additive when `marker_extra=True`,
-the default) and re-cluster — domain knowledge, not automatic rare-gene
-compensation.
+the default) and re-cluster.
 
 ## Is scFair the same as mixHVG?
 
@@ -281,7 +274,6 @@ Pin the version in analysis code and manuscripts, for example `scfair==0.8.0`.
 
 ## Is auto always better than 2000?
 
-**No.** Auto is a data-informed default so you are less likely to pick a bad
-length by accident. On many datasets it lands near 2000; on some gold panels
-a hand-tuned `k` still wins on ARI. For manuscripts and benchmarks, fix
-`n_top_genes=` explicitly and report that number.
+**No.** Auto is a data-informed default. On many datasets it lands near 2000;
+on some gold panels a hand-tuned `k` still wins on ARI. For manuscripts and
+benchmarks, fix `n_top_genes=` explicitly and report that number.

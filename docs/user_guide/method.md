@@ -1,50 +1,38 @@
 # How selection works
 
-scFair is built around **two** problems. Everything else (flavors,
-diagnostics) is secondary. Cluster-aware reallocation methods were removed
-from the product; the shipped path still addresses cutoff unfairness with a
-conservative same-rank append.
+scFair addresses two choices in HVG selection. Flavors and diagnostics are
+secondary. Cluster-aware reallocation methods were removed; the shipped path
+handles a hard top-`k` cutoff with a same-rank append.
 
 ## Two problems
 
 ### Problem A — How many genes (`n`)?
 
-Pipelines almost always need a gene budget. **There is no a priori correct
-length** — copying 2000 from a tutorial is simple and easy to get wrong
-silently (too short erases structure; too long adds noise and cost).
+Pipelines need a gene budget. There is no single correct length a priori —
+copying 2000 from a tutorial is simple and can be wrong for a given dataset
+(too short erases structure; too long adds noise and cost).
 
-**What scFair does:** default **`n_top_genes="auto"`** estimates a base size
-`k` from the data’s density structure (multi-seed). That is the product
-default **on purpose**: the first job is to **avoid a wrong `n`**, not to win
-a wall-clock race against a fixed-int HVG call.
+**Default:** `n_top_genes="auto"` estimates a base size `k` from multi-seed
+density structure. Auto is a data-informed default, not a proof of the best
+`n` on every dataset. When density confidence is low, it prefers classical
+**2000** over a short list. Pass a fixed int for papers and locked protocols.
+Auto is multi-seed and slower than a fixed `k`.
 
-**What we claim:** auto is a **safer default than guessing**, not a proof of
-global optimality. The extra compute is intentional and worth it when you
-cannot predict a reasonable length. When density confidence is low, it still
-prefers classical **2000** over a risky short list. Pass a fixed int only for
-papers and locked protocols.
-
-### Problem B — Unfair HVG allocation at the cutoff
+### Problem B — Hard cutoff on a global ranking
 
 Global HVG ranking measures variability across all cells. When a few cell types
 dominate, the top of the list is filled by genes that separate those large
-groups. Markers for smaller populations often sit **just below** a fixed
-cutoff. They are not uninformative — they lose the **vote count** to bulk
-variation. That is unfair **allocation of slots** in a fixed-length list, not
-a failure of “finding variable genes” in the abstract.
+groups. Markers for smaller populations often sit just below a fixed cutoff —
+not because they are uninformative, but because bulk variation fills the slots
+first.
 
-**What scFair does:** keep a standard global ranking as the backbone, then by
-default **`append`** a short extension of near-miss genes from the **same**
-ranking so genes that barely missed the base cut are not discarded. The base
-top-`k` is **frozen** — nothing is pushed out. The selected set equals
-**`top-(k+m)`** (same genes as `balance_method="none"` with
-`n_top_genes=k+m`).
+**Default:** `append` freezes the global top-`k` and adds a short extension of
+near-miss genes from the **same** ranking (ranks `k+1 … k+m`). Nothing is
+pushed out of the base. The selected set equals **`top-(k+m)`** (same genes as
+`balance_method="none"` with `n_top_genes=k+m`).
 
-**What we claim:** append is a **conservative response to cutoff unfairness**
-— a same-rank tail that softens a hard truncation. It is **not**
-cluster-conditional reallocation (no per-cluster quotas, no intermediate
-Leiden for gene identity). Those product methods were removed; do not read
-`append` as a restored hybrid.
+This is a same-rank tail, not cluster-conditional reallocation (no per-cluster
+quotas, no intermediate Leiden for gene identity). Those methods were removed.
 
 Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
 
@@ -54,26 +42,24 @@ Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
 2. **Problem A:** choose base size **`k`** with structure-aware auto (default).
    Low density confidence floors soft short lists to classical **2000**
    (except labeled true-SHORT paths). Pass `n_top_genes=2000` to skip auto.
-3. Freeze the top `k` genes (familiar HVG backbone).
+3. Freeze the top `k` genes.
 4. **Problem B:** append the next `append_budget` genes from the same ranking
-   (ranks `k+1 … k+m`). Product default floor **200**; when
-   `n_top_genes="auto"`, budget may rise with structure `n_density_pops` as
+   (ranks `k+1 … k+m`). Default floor **200**; when `n_top_genes="auto"`,
+   budget may rise with structure `n_density_pops` as
    `m = max(200, min(300, 200 + max(0, n_need − 12) × 12))`. Explicit
    `HVGOptions(append_budget=N)` always wins.
 
-Properties that matter in practice:
+Properties:
 
 - No intermediate clustering for gene selection.
 - Nothing is removed from the base top-`k` (allocation is “base + tail”).
 - Final size is `k + append_budget` (capped at `n_vars`) when append is on.
-- Auto is multi-seed and slower than a fixed `k`. That cost buys a
-  data-informed list length when you would otherwise guess.
+- Auto is multi-seed and slower than a fixed `k`.
 
-**Not GiniClust / CellSIUS.** Those methods score **rare** genes (normalized
-Gini, cluster-wise tests, evidence communities). Product `append` only adds
-near-miss genes from the **global** HVG list — slot handling at a fixed
-cutoff, not rare-subtype discovery. For a known missing type, force-include
-markers (`marker_mode="force"`) rather than expecting auto rare compensation.
+**Not GiniClust / CellSIUS.** Those methods score rare-subtype genes (Gini,
+cluster-wise tests). Product `append` only adds near-miss genes from the
+global HVG list. For a known missing type, force-include markers
+(`marker_mode="force"`).
 
 ```python
 import scfair as scf
@@ -86,14 +72,14 @@ If the data has technical batches and you want scanpy's per-batch HVG merge on
 that global ranking, pass `options=HVGOptions(batch_key="...")`. See
 {doc}`parameters` and the FAQ entry on multi-batch data.
 
-## Reproduce scanpy: fixed `k` + `balance_method="none"`
+## Match scanpy: fixed `k` + `balance_method="none"`
 
 ```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000, balance_method="none")
 ```
 
-This is a single global HVG pass with no extension. Use it for drop-in
-comparisons against existing protocols.
+This is a single global HVG pass with no extension. Use it for comparisons
+against existing protocols.
 
 ## Choosing `n_top_genes`
 
@@ -140,8 +126,7 @@ and select almost every gene (see {doc}`../faq`). Prefer a fixed
 `mode` adjusts the default base size / append budget for broad regimes
 (`compact`, `balanced`, `fine`, or `auto`). With a fixed integer
 `n_top_genes`, mode does not rewrite the gene list; it mainly matters when you
-use `"auto"` or leave size decisions to the product defaults. See
-{doc}`parameters`.
+use `"auto"` or leave size decisions to the defaults. See {doc}`parameters`.
 
 ## Markers
 

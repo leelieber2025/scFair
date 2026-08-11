@@ -11,38 +11,32 @@
 
 ## What scFair does
 
-scFair is HVG selection for two problems that show up in almost every
-scRNA-seq pipeline — easy to get wrong if you only call
-`scanpy.pp.highly_variable_genes` with a copied `n_top_genes=2000`.
+scFair is HVG selection for two choices that appear in almost every scRNA-seq
+pipeline. Both are easy to get wrong if you only call
+`scanpy.pp.highly_variable_genes` with a fixed `n_top_genes=2000`.
 
 ### 1. How many genes (`n`)?
 
-**Nobody can predict a reasonable list length before seeing the data.** Most
-pipelines copy `2000` from a tutorial — simple, and easy to get wrong silently
-(too short erases structure; too long adds noise and cost).
+There is no universal correct list length. Pipelines often copy `2000` from a
+tutorial. Too short can erase structure; too long adds noise and cost.
 
-**`n_top_genes="auto"` is the default for that reason.** It estimates a base
-size from multi-seed density structure so you are less likely to ship a bad
-`n` by habit. The extra compute is intentional: **avoiding a wrong `n` is
-worth more than a sub-second HVG pass.** We do **not** claim auto is always
-optimal — only that it is a safer default than an unexamined fixed length.
-Pass a fixed int when a paper or locked protocol already requires one.
+**`n_top_genes="auto"` is the default.** It estimates a base size from
+multi-seed density structure. Auto is not guaranteed optimal on every dataset;
+it is a data-informed alternative to an unexamined fixed length. Pass a fixed
+int when a paper or locked protocol already requires one. Auto needs extra
+graph builds and is slower than a fixed `k`.
 
-### 2. Unfair HVG allocation at the cutoff
+### 2. Hard cutoff on a global ranking
 
-Global ranking measures variability across **all** cells. Large populations
-fill the top of the list; markers for smaller types often land **just below**
-a fixed top-`k` cutoff. They are not uninformative — they lose the vote count
-to bulk variation. That is unfair **allocation of slots** in a fixed-length
-list.
+Global ranking measures variability across all cells. Large populations fill
+the top of the list; markers for smaller types often land just below a fixed
+top-`k` cutoff.
 
-**What scFair does:** keep a standard global ranking as the backbone, then by
-default (`balance_method="append"`) **freeze** the base top-`k` and **append**
-a short same-rank tail of near-miss genes so they are not discarded. The
-selected set equals **`top-(k+m)`**. This is a **conservative response to
-cutoff unfairness** — not cluster-conditional reallocation (per-cluster
-quota / hybrid methods were removed). Use `balance_method="none"` for exact
-top-`k`.
+**Default (`balance_method="append"`):** keep a standard global ranking as the
+backbone, freeze the base top-`k`, and append a short same-rank tail of
+near-miss genes. The selected set equals **`top-(k+m)`**. This is not
+cluster-conditional reallocation (per-cluster quota methods were removed). Use
+`balance_method="none"` for exact top-`k`.
 
 ### 3. How many populations (optional)
 

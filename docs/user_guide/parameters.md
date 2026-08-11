@@ -23,8 +23,8 @@ This page summarizes the main arguments of
 
 ## Secondary knobs (`HVGOptions`)
 
-Less common controls live on {class}`scfair.pp.HVGOptions` so the everyday call
-stays short:
+Less common controls live on {class}`scfair.pp.HVGOptions` so the top-level
+signature stays short:
 
 ```python
 from scfair.pp import HVGOptions
@@ -45,7 +45,7 @@ Useful fields:
 |-------|------|
 | `append_budget` | Genes appended after the frozen base. `None` → **floor 200**; with `n_top_genes="auto"`, may rise as `max(200, min(300, 200 + max(0, n_density_pops − 12) × 12))`. Explicit `0`/`N` never overridden. |
 | `n_top_min` / `n_top_max` | Bounds for automatic `n_top_genes` |
-| `structure_n_seeds` | Multi-seed count for structure auto (`None` → product default 3; use `1` for a faster pass) |
+| `structure_n_seeds` | Multi-seed count for structure auto (`None` → default 3; use `1` for a faster pass) |
 | `store_raw` | Opt-in: keep a full raw-count sidecar in `uns['scfair']['raw_snapshot']` after HVG (default `False`). `True` = inline; `"ondisk"` needs `snapshot_path` |
 | `label_key` | Optional obs key for type-count detection in auto mode |
 | `batch_key` | Optional `obs` column for scanpy-style per-batch HVG merge on the **global** ranking (default `None`). See below. |
@@ -100,13 +100,13 @@ read `adata.uns["scfair"]["hvg"]["n_marker_genes_already_selected"]`. See
 
 ## Typical recipes
 
-**Everyday preprocessing** (auto size + append)
+**Default preprocessing** (auto size + append)
 
 ```python
 scf.pp.highly_variable_genes(adata)
 ```
 
-**Faster fixed size** (skip auto)
+**Fixed size** (skip auto)
 
 ```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000)

@@ -8,16 +8,11 @@ Public surface: the names below, plus `scfair.__version__`. Everything else
 in `scfair.pp` is an implementation detail used by `highly_variable_genes`
 and is not listed here.
 
-**How to read this page.** Signatures and parameter text are generated from
-the source docstrings at build time (not hand-copied). Product defaults
-include `n_top_genes="auto"` (safer than guessing a list length a priori;
-the multi-seed cost is intentional) and `balance_method="append"` (same-rank
-tail for **cutoff unfairness** — set equals `top-(k+m)`, not
-cluster-conditional reallocation). For *why* those defaults exist, start with
-{doc}`../user_guide/method` or {doc}`../quickstart` — this page is the
-reference, not the tutorial.
-
-Narrative usage: {doc}`../user_guide/index`.
+Signatures and parameter text are generated from the source docstrings at
+build time. Defaults are `n_top_genes="auto"` (structure-aware base size) and
+`balance_method="append"` (same-rank tail; set equals `top-(k+m)`, not
+cluster-conditional reallocation). For usage narrative, see
+{doc}`../user_guide/method` or {doc}`../quickstart`.
 
 ## Preprocessing (`scfair.pp`)
 

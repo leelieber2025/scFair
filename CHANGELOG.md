@@ -8,26 +8,22 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
-- Restore **Problem B** framing: unfair HVG allocation **at the cutoff**
-  (large types fill top-`k`; small-type markers often sit just below). Product
-  `append` is documented as a **conservative same-rank response** to that
-  unfairness (`top-(k+m)`), without reviving cluster-conditional reallocation
-  claims.
+- Clarify **Problem B**: hard top-`k` cutoff on a global ranking (large types
+  fill the list; small-type markers often sit just below). Document `append` as
+  a same-rank tail (`top-(k+m)`), not cluster-conditional reallocation.
 
 ## [0.8.0] - 2026-08-08
 
 ### Changed
 
-- **Default remains `n_top_genes="auto"`.** Docs state clearly: auto exists to
-  **avoid a wrong `n` when no length is known a priori**; the multi-seed cost
-  is intentional and worth it. Structure fall-through no longer hard-codes
-  2000: when no SHORT/LONG/MID rule fires, base k scales as
+- **Default remains `n_top_genes="auto"`.** Structure fall-through no longer
+  hard-codes 2000: when no SHORT/LONG/MID rule fires, base k scales as
   `round(n_density_pops × 150)` (`nd_budget`). Classical 2000 only when `nd`
-  is missing; low-confidence floors still apply. Pass a fixed int only for
-  locked protocols.
-- **Honest product framing.** `append` = same-ranking list buffer
-  (`top-(k+m)`), not population-aware reallocation. Density population count
-  (`estimate_n_populations`) is documented as a first-class feature (scope
+  is missing; low-confidence floors still apply. Pass a fixed int for locked
+  protocols.
+- **`append` documented as same-rank list buffer** (`top-(k+m)`), not
+  population-aware reallocation. Density population count
+  (`estimate_n_populations`) documented as a first-class feature (scope
   ~≤20 well-separated populations).
 - **Public `restore_raw_counts`** for `store_raw=True` snapshots.
 - **`pp.__all__`** is the documented surface only.
@@ -124,9 +120,9 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
-- User guide, README, quickstart, and FAQ emphasize structure-aware auto-`n`
+- User guide, README, quickstart, and FAQ describe structure-aware auto-`n`
   and an optional same-ranking list buffer (not population-aware
-  reallocation). Auto is a safe default, not a claim of global optimality.
+  reallocation).
 - Quickstart and README show a full downstream scanpy path without subsetting
   the gene matrix.
 

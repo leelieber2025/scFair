@@ -1,6 +1,6 @@
-"""Tests for the public scfair.pp.highly_variable_genes product API.
+"""Tests for the public scfair.pp.highly_variable_genes API.
 
-Product surface: balance_method append | none; n_top_genes auto|structure|int.
+balance_method: append | none; n_top_genes: auto | structure | int.
 Cluster-aware methods (hybrid/score/reweight) were removed.
 """
 

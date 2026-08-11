@@ -2,17 +2,15 @@
 
 Install the package, run one HVG selection, and read the main outputs.
 
-scFair is aimed at two things you already face in every scRNA-seq workflow:
+scFair covers two choices in scRNA-seq HVG selection:
 
-1. **How many HVGs (`n`)?** — nobody knows a safe length a priori. Default
-   `"auto"` estimates a base size from the data so you do not ship a silent
-   wrong `n` by copying `2000`. The extra compute is intentional. Use a fixed
-   int only when a paper or protocol is already locked.
-2. **Unfair allocation at the cutoff** — large populations dominate a plain
+1. **How many HVGs (`n`)?** — default `"auto"` estimates a base size from
+   density structure. Use a fixed int when a paper or protocol already locks
+   the length. Auto is slower than a fixed `k`.
+2. **Hard cutoff on a global ranking** — large populations dominate a plain
    top-`k` list; smaller-type markers often sit just below the cut. Default
    `"append"` freezes that ranking and adds a short same-rank tail
-   (`top-(k+m)`) so near-miss genes are not discarded. Conservative cutoff
-   handling, not cluster-conditional reallocation.
+   (`top-(k+m)`). Not cluster-conditional reallocation.
 
 ## 1. Install
 
@@ -61,8 +59,7 @@ By default this is:
 
 Final list size is `k + append_budget`, capped at `n_vars`. The default append
 path does not re-rank genes with intermediate clustering. Auto needs extra
-graph builds and is slower than a fixed `k` — that is the price of not guessing
-`n`.
+graph builds and is slower than a fixed `k`.
 
 See what auto picked:
 
@@ -75,7 +72,7 @@ print(h.get("auto_n", {}).get("rule_branch"))  # optional diagnostics
 print(h.get("auto_n", {}).get("append_budget_info"))  # density rule detail
 ```
 
-### Fixed size (locked paper / protocol only)
+### Fixed size (locked paper / protocol)
 
 ```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000)
@@ -154,4 +151,3 @@ Both helpers are advisory and do not run HVG selection.
 | PBMC 10k: misclustered cells vs standard HVG | {doc}`tutorials/pbmc10k_hvg_compare` |
 | Full signatures | {doc}`api/index` |
 | Common questions | {doc}`faq` |
-
