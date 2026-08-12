@@ -3,12 +3,22 @@
 Read {doc}`../quickstart` first if you have not run scFair yet. This guide
 covers the default method, the main parameters, and the opt-in alternatives.
 
+```python
+import scfair as scf
+from scfair.pp import HVGOptions
+
+scf.pp.highly_variable_genes(adata)  # auto n + append
+# scf.pp.highly_variable_genes(adata, n_top_genes=2000)
+# scf.pp.highly_variable_genes(adata, n_top_genes=2000, balance_method="none")
+# scf.pp.highly_variable_genes(adata, options=HVGOptions(batch_key="batch"))
+```
+
 ## Two problems scFair targets
 
 | # | Problem | Default answer | Scope |
 |---|---------|----------------|-------|
-| **A** | **How many genes (`n`)?** No universal safe length; users often copy 2000. | `n_top_genes="auto"` | Data-informed base size from density structure. Not a proof of the best `n`. Extra multi-seed cost vs fixed `k`. |
-| **B** | **Hard top-`k` cutoff** Large types fill the list; small-type markers often miss the cut. | `balance_method="append"` | Freezes global top-`k`, adds same-rank near-miss tail. Set = `top-(k+m)`. Not cluster-conditional reallocation. |
+| **A** | **How many genes (`n`)?** No universal safe length; users often copy 2000. | `n_top_genes="auto"` | Base size from density structure. Extra multi-seed cost vs a fixed `k`. |
+| **B** | **Hard top-`k` cutoff** Large types fill the list; small-type markers often miss the cut. | `balance_method="append"` | Keeps global top-`k` and adds a same-rank tail. Set = `top-(k+m)`. |
 
 Details and caveats: {doc}`method`.
 
@@ -34,7 +44,7 @@ Details and caveats: {doc}`method`.
 |-------|----------------|
 | Entry point | `scf.pp.highly_variable_genes` |
 | Problem A (`n`) | `"auto"` from structure; pass `2000` for a fixed base |
-| Problem B (cutoff) | `"append"`: freeze top-`k`, same-rank tail → `top-(k+m)` |
+| Problem B (cutoff) | `"append"`: top-`k` plus same-rank tail → `top-(k+m)` |
 | Extension | floor 200 genes (`append_budget`); auto may raise to ≤300 via density cores |
 | Match scanpy | `n_top_genes=2000, balance_method="none"` |
 | Secondary knobs | `options=HVGOptions(...)` |

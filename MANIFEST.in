@@ -14,20 +14,7 @@ include .readthedocs.yaml
 graft tests
 graft docs
 prune docs/_build
-prune docs/paper_draft
-prune docs/paper_supplement
-# Local research notes and paper tables are not part of the public docs site.
-global-exclude docs/PAPER_*
-global-exclude docs/DEVELOPMENT_LOG.md
-global-exclude docs/PACKAGE_VALUE.md
-global-exclude docs/gold.md
-global-exclude docs/review.md
-global-exclude docs/AUTO_N_*
-global-exclude docs/CELLBRF_*
-global-exclude docs/DATA_SOURCES.md
-global-exclude docs/TEST5_PANEL.md
-global-exclude docs/**/*.docx
-global-exclude docs/**/*.csv
+prune bak
 global-exclude *.docx
 
 # Editor/notebook checkpoint litter (should never be tracked, but MANIFEST

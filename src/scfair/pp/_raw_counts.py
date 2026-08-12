@@ -11,7 +11,7 @@ Design (package-private):
   never left as a permanent fake ``layers['counts']``.
 - Optional label-indexed sidecar in ``adata.uns['scfair']['raw_snapshot']``
   only when ``store_raw=True`` / ``"ondisk"``. A later default call does
-  **not** delete a snapshot the user deliberately kept.
+  **not** delete a snapshot the user already stored.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from .._utils import (
     _clear_log_preprocess_metadata,
     _get_raw_snapshot,
     _is_integer_counts_like,
+    resolve_aligned_raw_counts,
 )
 from .._version import __version__
 
@@ -131,21 +132,6 @@ def _store_raw_snapshot(
     )
 
 
-def _discard_raw_snapshot(adata: Any, *, store_raw: bool | str = False) -> None:
-    """End-of-call snapshot policy for one HVG invocation.
-
-    Snapshots are only written when ``store_raw=True`` / ``"ondisk"``. A later
-    default call (``store_raw=False``) must **not** delete a snapshot the user
-    deliberately kept for ``subset=True`` full-gene restore.
-
-    This helper is therefore a no-op: historical ``raw_snapshot`` data is left
-    alone. Ephemeral internal layers (``_scfair_counts``, ``_scfair_log``) are
-    popped separately by the HVG caller.
-    """
-    # No-op by design (signature kept for call-site clarity).
-    _ = (adata, store_raw)
-
-
 def _sidecar_mode(sidecar: bool | str) -> tuple[bool, bool]:
     if isinstance(sidecar, str):
         if sidecar == "ondisk":
@@ -230,15 +216,23 @@ def _restore_full_genes_from_snapshot(adata: Any, *, layer: str = "counts") -> A
     """Build a new AnnData with the full pre-subset gene universe.
 
     Prefers ``uns['scfair']['raw_snapshot']`` (survives ``subset=True``). When
-    no snapshot exists (product default ``store_raw=False``), treats the
-    **current** gene axis as the full universe and copies counts from
-    ``layers[layer]`` or integer-like ``.X``.
+    no snapshot exists, uses ``adata.raw`` if it is a gene superset (usual
+    scanpy pattern). Otherwise treats the current gene axis as the universe.
     """
     aligned = _align_snapshot_counts(adata, full_genes=True)
     if aligned is None:
-        # No sidecar: mid-pipeline or store_raw=False without subset — current
-        # genes *are* the full universe. Prefer the counts layer.
-        if layer in getattr(adata, "layers", {}):
+        raw_attr = getattr(adata, "raw", None)
+        if (
+            raw_attr is not None
+            and raw_attr.X is not None
+            and hasattr(raw_attr, "var_names")
+            and int(getattr(raw_attr, "n_vars", raw_attr.X.shape[1])) > int(adata.n_vars)
+            and int(getattr(raw_attr, "n_obs", raw_attr.X.shape[0])) == int(adata.n_obs)
+            and _is_integer_counts_like(raw_attr.X)
+        ):
+            X_full = raw_attr.X.copy() if hasattr(raw_attr.X, "copy") else raw_attr.X
+            var_names = np.asarray(raw_attr.var_names)
+        elif layer in getattr(adata, "layers", {}):
             X_full = adata.layers[layer].copy()
             var_names = adata.var_names.to_numpy()
         elif _is_integer_counts_like(adata.X):
@@ -246,10 +240,11 @@ def _restore_full_genes_from_snapshot(adata: Any, *, layer: str = "counts") -> A
             var_names = adata.var_names.to_numpy()
         else:
             raise ValueError(
-                f"Full-gene restore requires adata.uns['{UNS_KEY}']['raw_snapshot'] "
-                f"or integer counts in layers[{layer!r}] / .X. "
+                f"Full-gene restore requires adata.uns['{UNS_KEY}']['raw_snapshot'], "
+                "integer adata.raw with the full gene axis, or integer counts in "
+                f"layers[{layer!r}] / .X. "
                 "Pass options=HVGOptions(store_raw=True) before subset=True, "
-                "or keep raw counts in layers['counts']."
+                "or keep raw counts in layers['counts'] / adata.raw."
             )
         var_df = pd.DataFrame(index=pd.Index(var_names, name=adata.var_names.name))
         new = ad.AnnData(X=X_full, obs=adata.obs.copy(), var=var_df)
@@ -302,8 +297,9 @@ def restore_raw_counts(
     inplace
         Write into ``adata.X`` when True (not allowed with ``full_genes=True``).
     full_genes
-        If True, return a **new** AnnData whose gene axis matches the stored
-        full-universe snapshot (requires a prior ``store_raw=True`` call).
+        If True, return a **new** AnnData with the full gene axis from a
+        ``store_raw=True`` snapshot, or from ``adata.raw`` when that is a
+        gene superset.
     prefer_snapshot
         Prefer ``uns['scfair']['raw_snapshot']`` over ``layers[layer]`` when both
         exist.
@@ -345,31 +341,8 @@ def _restore_raw_counts(
             _clear_log_preprocess_metadata(target)
             return None if inplace else target
 
-    raw_attr = getattr(adata, "raw", None)
-    if layer in adata.layers:
+    if layer in adata.layers and getattr(adata.layers[layer], "shape", (0, 0))[1] == adata.n_vars:
         raw = adata.layers[layer].copy()
-        source = f"layers['{layer}']"
-    elif raw_attr is not None and _is_integer_counts_like(raw_attr.X):
-        raw = raw_attr.X.copy()
-        source = "adata.raw"
-    else:
-        detail = ""
-        if raw_attr is not None:
-            detail = " adata.raw is present but does not look like integer counts and was not used."
-        raise ValueError(
-            f"No usable raw counts found in layer '{layer}' or the uns snapshot.{detail}"
-        )
-
-    if raw.shape[1] != adata.n_vars:
-        raise ValueError(
-            f"Stored raw counts have {raw.shape[1]} genes, but current adata has "
-            f"{adata.n_vars} genes."
-        )
-
-    if source == "adata.raw" and hasattr(adata.raw, "var_names"):
-        if not np.array_equal(adata.raw.var_names, adata.var_names):
-            raise ValueError("adata.raw gene names/order differ from current adata.var_names.")
-    elif source.startswith("layers"):
         raw_gene_list = adata.uns.get(UNS_KEY, {}).get("raw_gene_list")
         if (
             raw_gene_list is not None
@@ -377,9 +350,16 @@ def _restore_raw_counts(
             and not np.array_equal(np.asarray(raw_gene_list), adata.var_names.to_numpy())
         ):
             raise ValueError(
-                f"Stored counts in {source} match n_vars but raw_gene_list order differs "
-                "from current adata.var_names."
+                f"Stored counts in layers['{layer}'] match n_vars but raw_gene_list "
+                "order differs from current adata.var_names."
             )
+    else:
+        aligned = resolve_aligned_raw_counts(adata, layer=layer, require_integer=True)
+        if aligned is None:
+            raise ValueError(
+                f"No usable raw counts found in layer '{layer}', uns snapshot, or adata.raw."
+            )
+        raw = aligned.copy() if hasattr(aligned, "copy") else aligned
 
     target = adata if inplace else adata.copy()
     target.X = raw
@@ -500,7 +480,7 @@ def _prepare_counts_layer(
         return layer
 
     # Prefer existing integer counts layer *if it still matches .X* when .X
-    # also looks like raw counts. Standard scanpy pattern (.X log-normalised,
+    # also looks like raw counts. Standard scanpy pattern (.X log-normalized,
     # counts layer raw) keeps the layer: .X is not integer-like.
     if counts_layer in adata.layers and _is_integer_counts_like(adata.layers[counts_layer]):
         x_int = _is_integer_counts_like(adata.X)
@@ -515,7 +495,7 @@ def _prepare_counts_layer(
                 f"this call via internal layer {INTERNAL_COUNTS_LAYER!r}; "
                 f"layers[{counts_layer!r}] is left unchanged. "
                 f"To use the layer instead, pass layer={counts_layer!r}. "
-                "If .X is log-normalised, keep raw counts only in the layer "
+                "If .X is log-normalized, keep raw counts only in the layer "
                 "(usual scanpy workflow) — that path still uses the layer.",
                 UserWarning,
                 stacklevel=3,

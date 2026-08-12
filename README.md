@@ -11,17 +11,17 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21761251.svg)](https://doi.org/10.5281/zenodo.21761251)
 
 **scFair** selects highly variable genes (HVGs) for single-cell RNA-seq. It
-targets two practical choices pipelines already make, plus an optional
-population count:
+handles two choices most pipelines already make, plus an optional population
+count:
 
 | Choice | Common default | What scFair does |
 |--------|----------------|------------------|
-| **How many genes (`n`)?** | Fixed `2000` | **`n_top_genes="auto"`** (default) estimates a base size from multi-seed density structure. Pass an int when your protocol already fixes `n`. Auto is slower than a fixed `k`. |
-| **Hard top-`k` cutoff** | Rank globally and keep top-`k` | Default **`append`** freezes the global top-`k` and adds a short same-rank tail (`append_budget`). Selected set = **`top-(k+m)`**. Use `balance_method="none"` for exact top-`k`. This is not cluster-conditional reallocation. |
+| **How many genes (`n`)?** | Fixed `2000` | **`n_top_genes="auto"`** (default) estimates a base size from multi-seed density structure. Pass an int when a protocol already fixes `n`. Auto is slower than a fixed `k`. |
+| **Hard top-`k` cutoff** | Rank globally and keep top-`k` | Default **`append`** keeps the global top-`k` and adds the next `append_budget` genes from the same ranking (`top-(k+m)`). Use `balance_method="none"` for exact top-`k`. |
 
 Optional: **`estimate_n_populations`** counts populations from a 3D density
-field after `sc.pp.neighbors` (no Leiden resolution sweep; works best up to
-~20 well-separated populations).
+field after `sc.pp.neighbors`. It works best on well-separated data with up to
+about 20 populations.
 
 Docs: [Read the Docs](https://scfair.readthedocs.io/en/latest/).
 
@@ -83,7 +83,7 @@ print(est.n_populations, est.confidence)
 
 ## Status
 
-**0.8.0 (Beta).** Import as `import scfair as scf` and use names in
+**0.9.0 (Beta).** Import as `import scfair as scf` and use names in
 `scfair.__all__` and `scf.pp`. See the
 [API reference](https://scfair.readthedocs.io/en/latest/api/index.html).
 
@@ -97,7 +97,7 @@ print(est.n_populations, est.confidence)
 ## Citation
 
 For the software, cite the Zenodo DOI above. For analyses tied to package
-version **0.8.0**, use `scfair==0.8.0`. See `CITATION.cff`.
+version **0.9.0**, use `scfair==0.9.0`. See `CITATION.cff`.
 
 ## License
 

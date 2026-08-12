@@ -13,10 +13,9 @@ it does not aim for the same output density as {doc}`pbmc10k_hvg_compare`.
 | A real workflow: load → QC → scFair → Leiden/UMAP, no labels needed | {doc}`pbmc3k_first_analysis` |
 | Gold-label clustering errors: standard HVG vs scFair (PBMC 10k) | {doc}`pbmc10k_hvg_compare` |
 
-**If you are new:** read {doc}`../quickstart`, then
+If you are new, read {doc}`../quickstart`, then
 {doc}`pbmc3k_first_analysis`. {doc}`pbmc10k_hvg_compare` is a method
-comparison, not a usage guide — read it once you want to see the evidence
-behind the default.
+comparison. Read it when you want a labeled check against standard HVG.
 
 ## Run locally
 

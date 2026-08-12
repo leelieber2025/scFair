@@ -10,8 +10,8 @@ and is not listed here.
 
 Signatures and parameter text are generated from the source docstrings at
 build time. Defaults are `n_top_genes="auto"` (structure-aware base size) and
-`balance_method="append"` (same-rank tail; set equals `top-(k+m)`, not
-cluster-conditional reallocation). For usage narrative, see
+`balance_method="append"` (same-rank tail; the set equals `top-(k+m)`).
+For usage narrative, see
 {doc}`../user_guide/method` or {doc}`../quickstart`.
 
 ## Preprocessing (`scfair.pp`)

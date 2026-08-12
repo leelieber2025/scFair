@@ -1,4 +1,4 @@
-"""Tests for HVGOptions resolution (legacy kwargs, merge, conflicts)."""
+"""Tests for HVGOptions resolution."""
 
 from __future__ import annotations
 
@@ -14,27 +14,17 @@ def test_merged_skips_none_overrides():
     assert out.filter_mito is False
 
 
-def test_resolve_legacy_only():
-    opt = resolve_hvg_options(None, {"append_budget": 100, "filter_ribo": True})
-    assert opt.append_budget == 100
-    assert opt.filter_ribo is True
+def test_resolve_none_is_defaults():
+    opt = resolve_hvg_options(None)
+    assert isinstance(opt, HVGOptions)
+    assert opt.append_budget is None
 
 
 def test_resolve_options_only():
-    opt = resolve_hvg_options(HVGOptions(append_budget=80), None)
+    opt = resolve_hvg_options(HVGOptions(append_budget=80))
     assert opt.append_budget == 80
 
 
-def test_resolve_mix_raises():
-    with pytest.raises(ValueError, match="Do not mix"):
-        resolve_hvg_options(HVGOptions(filter_mito=True), {"append_budget": 50})
-
-
-def test_resolve_removed_auto_n_method():
-    with pytest.raises(TypeError, match="removed option"):
-        resolve_hvg_options(None, {"auto_n_method": "ensemble"})
-
-
-def test_resolve_unknown_raises():
-    with pytest.raises(TypeError, match="unknown"):
-        resolve_hvg_options(None, {"not_a_real_knob": 1})
+def test_resolve_dict_raises():
+    with pytest.raises(TypeError, match="HVGOptions"):
+        resolve_hvg_options({"append_budget": 50})

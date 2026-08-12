@@ -13,6 +13,7 @@ from scfair._utils import UNS_KEY
 from scfair.pp._diagnosis import (
     check_config,
     cluster_size_metrics,
+    count_label_types,
     diagnose_from_labels,
     diagnose_hvg_run,
     recommend_cluster_resolution,
@@ -95,17 +96,19 @@ def test_diagnose_from_labels_single_population_is_decidable():
     assert d["known_no_gain_regime"] is True
 
 
+def test_count_label_types_drops_missing():
+    labels = ["A", "B", "C", np.nan, None, "nan", ""]
+    assert count_label_types(labels) == 3
+    assert count_label_types([np.nan, None, ""]) is None
+    # 14 real types + missing must not become 15 (fine-mode threshold)
+    labs14 = [f"T{i}" for i in range(14)] + [np.nan]
+    assert count_label_types(labs14) == 14
+
+
 def _cao_like_diagnosis(**overrides):
     kw = dict(
         balance_method="append",
         n_top_genes_used=2000,
-        neighbor_contrast=0.0,
-        clustering={
-            "n_clusters_kept": 5,
-            "n_clusters_total": 5,
-            "cluster_sizes": {"0": 3000, "1": 200, "2": 100, "3": 50, "4": 40},
-            "clusters_dropped": [],
-        },
         log=False,
     )
     kw.update(overrides)
@@ -113,10 +116,7 @@ def _cao_like_diagnosis(**overrides):
 
 
 def test_append_path_does_not_grade_from_intermediate_sizes():
-    """Product append has no intermediate clustering; clustering dict is ignored.
-
-    Benefit is not forecast from fake intermediate sizes.
-    """
+    """append does not forecast benefit from cluster sizes."""
     d = _cao_like_diagnosis()
     assert d["benefit_evidence"] == "not_predictable"
     assert d["recommendation"] == "keep_current"
@@ -157,8 +157,8 @@ def test_none_path_does_not_call_the_data_degenerate(adata_for_hvg):
     """balance_method='none' runs no clustering, so it has no finding about populations.
 
     Reporting "fewer than 2 populations in intermediate_clusters" there is a
-    category error -- and it was emitted at WARNING, telling a user who
-    deliberately chose the scanpy path that their data is degenerate.
+    config note -- and it was emitted at WARNING, telling a user who
+    chose the scanpy path that their data is degenerate.
     """
     ad = adata_for_hvg.copy()
     scf.pp.highly_variable_genes(ad, n_top_genes=40, balance_method="none")
@@ -230,7 +230,7 @@ def test_structure_auto_tips_v7_band_floor():
 
 
 def test_structure_auto_tips_soft_buffer_short():
-    """Soft-buffer is normal product behaviour — flag only, no user tip."""
+    """Soft-buffer is normal product behavior — flag only, no user tip."""
     from scfair.pp._diagnosis import _structure_auto_tips
 
     tips, flags = _structure_auto_tips(

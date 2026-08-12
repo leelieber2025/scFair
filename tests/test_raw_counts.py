@@ -460,3 +460,35 @@ def test_log_X_without_counts_uses_internal_layer():
     assert used == INTERNAL_COUNTS_LAYER
     assert "counts" not in adata.layers
     assert INTERNAL_COUNTS_LAYER in adata.layers
+
+
+def test_restore_aligns_raw_after_gene_subset(adata_counts):
+    """Public restore must use adata.raw when layers['counts'] is absent."""
+    import scfair as scf
+
+    ad = adata_counts.copy()
+    X_full = np.asarray(ad.X, dtype=float).copy()
+    ad.raw = ad.copy()
+    sub = ad[:, :5].copy()
+    sub.layers.pop("counts", None)
+    if UNS_KEY in sub.uns:
+        sub.uns[UNS_KEY].pop("raw_snapshot", None)
+        sub.uns[UNS_KEY].pop("raw_gene_list", None)
+    restored = scf.pp.restore_raw_counts(sub, inplace=False)
+    assert restored.n_vars == 5
+    assert np.allclose(np.asarray(restored.X, dtype=float), X_full[:, :5])
+
+
+def test_full_genes_from_raw_without_snapshot(adata_counts):
+    import scfair as scf
+
+    ad = adata_counts.copy()
+    n_full = ad.n_vars
+    ad.raw = ad.copy()
+    sub = ad[:, :5].copy()
+    sub.layers.pop("counts", None)
+    if UNS_KEY in sub.uns:
+        sub.uns[UNS_KEY].pop("raw_snapshot", None)
+    full = scf.pp.restore_raw_counts(sub, full_genes=True)
+    assert full.n_vars == n_full
+    assert full.n_obs == sub.n_obs

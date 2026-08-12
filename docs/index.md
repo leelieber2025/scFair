@@ -11,20 +11,18 @@
 
 ## What scFair does
 
-scFair is HVG selection for two choices that appear in almost every scRNA-seq
-pipeline. Both are easy to get wrong if you only call
-`scanpy.pp.highly_variable_genes` with a fixed `n_top_genes=2000`.
+scFair selects HVGs and covers two choices that come up in almost every
+scRNA-seq pipeline.
 
 ### 1. How many genes (`n`)?
 
 There is no universal correct list length. Pipelines often copy `2000` from a
-tutorial. Too short can erase structure; too long adds noise and cost.
+tutorial. A short list can miss structure; a long list adds noise and cost.
 
 **`n_top_genes="auto"` is the default.** It estimates a base size from
-multi-seed density structure. Auto is not guaranteed optimal on every dataset;
-it is a data-informed alternative to an unexamined fixed length. Pass a fixed
-int when a paper or locked protocol already requires one. Auto needs extra
-graph builds and is slower than a fixed `k`.
+multi-seed density structure. Auto is a data-informed starting point, not a
+proof of the best `n`. Pass a fixed int when a paper or protocol already
+requires one. Auto runs extra graph builds and is slower than a fixed `k`.
 
 ### 2. Hard cutoff on a global ranking
 
@@ -32,17 +30,15 @@ Global ranking measures variability across all cells. Large populations fill
 the top of the list; markers for smaller types often land just below a fixed
 top-`k` cutoff.
 
-**Default (`balance_method="append"`):** keep a standard global ranking as the
-backbone, freeze the base top-`k`, and append a short same-rank tail of
-near-miss genes. The selected set equals **`top-(k+m)`**. This is not
-cluster-conditional reallocation (per-cluster quota methods were removed). Use
-`balance_method="none"` for exact top-`k`.
+**Default (`balance_method="append"`):** keep the global top-`k` and append
+the next genes from the same ranking. The selected set is **`top-(k+m)`**.
+Use `balance_method="none"` for exact top-`k`.
 
 ### 3. How many populations (optional)
 
 {func}`scfair.pp.estimate_n_populations` reads a 3D density field after
-`sc.pp.neighbors`. Advisory only (does not change genes); works best on
-well-separated data up to ~20 populations.
+`sc.pp.neighbors`. It does not change the gene list. It works best on
+well-separated data with up to about 20 populations.
 
 ### Default HVG in one line
 

@@ -603,13 +603,21 @@ def _prepare_structure_embedding(
     ad0.var_names = np.asarray(adata.var_names).astype(str)
     ad0.layers[layer_use] = ad0.X
 
-    sc.pp.highly_variable_genes(
-        ad0,
-        n_top_genes=min(int(n_hvg), ad0.n_vars),
-        flavor="seurat_v3",
-        layer=layer_use,
-        subset=False,
-    )
+    from scfair.pp._highly_variable_genes import _loess_unsafe
+
+    n_hvg_use = min(int(n_hvg), ad0.n_vars)
+    if _loess_unsafe(ad0.n_obs, ad0.n_vars) is None:
+        try:
+            sc.pp.highly_variable_genes(
+                ad0,
+                n_top_genes=n_hvg_use,
+                flavor="seurat_v3",
+                layer=layer_use,
+                subset=False,
+            )
+        except (ValueError, TypeError, RuntimeError, ArithmeticError, MemoryError):
+            # Leave all genes; structure only needs a compact embedding.
+            pass
     if "highly_variable" not in ad0.var.columns:
         mask = np.ones(ad0.n_vars, dtype=bool)
     else:
@@ -1143,7 +1151,7 @@ def estimate_n_top_structure(
     passes ``n_seeds=``:data:`PRODUCT_STRUCTURE_N_SEEDS` (3) so pred_k is
     multi-seed stable. This function's own default remains ``n_seeds=1``
     for fast one-shot / probe calls only — do not rely on the default for
-    shipped auto behaviour. ``k_max`` defaults to 5000 to match
+    shipped auto behavior. ``k_max`` defaults to 5000 to match
     ``n_top_max`` / HVGOptions (was 4000, which silently capped the documented
     5000 bound).
 
@@ -1182,12 +1190,10 @@ def estimate_n_top_structure(
     if label_key is None and "label_key" in feature_kwargs:
         label_key = feature_kwargs.pop("label_key")
     if n_types is None and label_key and adata is not None:
-        try:
-            if label_key in getattr(adata, "obs", {}):
-                labs = np.asarray(adata.obs[label_key].astype(str))
-                n_types = int(len(np.unique(labs)))
-        except Exception:
-            n_types = None
+        if label_key in getattr(adata, "obs", {}):
+            from scfair.pp._diagnosis import count_label_types
+
+            n_types = count_label_types(adata.obs[label_key])
     if feature_kwargs:
         logger.debug("estimate_n_top_structure ignoring kwargs %s", feature_kwargs)
 

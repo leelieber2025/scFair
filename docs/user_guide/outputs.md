@@ -17,7 +17,6 @@ Every successful call writes a structured record, including:
 
 - options actually used (including resolved `n_top_genes` and `append_budget`)
 - method / balance path
-- timings
 - diagnosis tips when `diagnose=True`
 
 ```python
@@ -33,19 +32,19 @@ leave a false mask behind.
 
 ## Counts layer
 
-For count-based flavors, scFair ensures a usable raw counts matrix (typically
-`layers["counts"]`). It does **not** overwrite a user counts layer when that
+For count-based flavors, scFair prepares a usable raw counts matrix (typically
+`layers["counts"]`). It does not overwrite a user counts layer when that
 layer disagrees with integer `.X`; staging uses an internal layer that is
 removed after the call. Prefer an explicit `layer=` when you already know where
 raw counts live.
 
-## No raw-count matrix left in `uns` (default)
+## No raw-count matrix in `uns` (default)
 
-By default the call does **not** keep a second full counts table under
+By default the call does not write a second full counts table under
 `adata.uns["scfair"]["raw_snapshot"]`. That sidecar is opt-in via
-`options=HVGOptions(store_raw=True)` (or `"ondisk"`) for the rare case where you
-need the pre-subset gene universe after `subset=True` or for external tooling.
-Most analyses only need `layers["counts"]` plus the HVG mask.
+`options=HVGOptions(store_raw=True)` (or `"ondisk"`) when you need the
+pre-subset gene universe after `subset=True`. Most analyses only need the HVG
+mask and, if present, `layers["counts"]`.
 
 ## Planning helpers
 

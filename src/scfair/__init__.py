@@ -1,4 +1,4 @@
-"""scFair — structure-aware HVG list size and same-rank append at the cutoff.
+"""scFair: structure-aware HVG list size and same-rank append at the cutoff.
 
 Public API:
 
@@ -8,14 +8,12 @@ Public API:
    than a fixed ``k``.
 2. **Hard top-``k`` cutoff.** Global ranking is driven by large populations;
    markers for smaller types often sit just below the cut. Default ``append``
-   freezes that backbone and adds a short **same-rank** tail
-   (``top-(k+m)``). Not cluster-conditional reallocation
-   (``hybrid`` / ``score`` / ``reweight`` were removed). Use
-   ``balance_method="none"`` for pure top-``k``.
+   keeps the global top-``k`` and adds a short same-rank tail
+   (``top-(k+m)``). Use ``balance_method="none"`` for pure top-``k``.
 3. **How many populations?** :func:`~scfair.pp.estimate_n_populations` reads
    a 3D density field so you need not sweep Leiden resolution (requires
-   ``sc.pp.neighbors`` first). Reliable on well-separated data up to ~20
-   populations; can under-count many tiny groups.
+   ``sc.pp.neighbors`` first). Works best on well-separated data up to about
+   20 populations; can under-count many tiny groups.
 
 Usage::
 

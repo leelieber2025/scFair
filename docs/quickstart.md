@@ -1,16 +1,7 @@
 # Quickstart
 
-Install the package, run one HVG selection, and read the main outputs.
-
-scFair covers two choices in scRNA-seq HVG selection:
-
-1. **How many HVGs (`n`)?** — default `"auto"` estimates a base size from
-   density structure. Use a fixed int when a paper or protocol already locks
-   the length. Auto is slower than a fixed `k`.
-2. **Hard cutoff on a global ranking** — large populations dominate a plain
-   top-`k` list; smaller-type markers often sit just below the cut. Default
-   `"append"` freezes that ranking and adds a short same-rank tail
-   (`top-(k+m)`). Not cluster-conditional reallocation.
+Install the package, run one HVG selection, and continue a normal scanpy
+pipeline.
 
 ## 1. Install
 
@@ -23,131 +14,89 @@ import scfair as scf
 print(scf.__version__)
 ```
 
-### What data do you need?
+You need an AnnData object with **raw integer counts** in `.X` or
+`layers["counts"]`. If counts live in another layer, pass `layer="..."`.
 
-An AnnData object with **raw integer counts** in `.X` or `layers["counts"]`.
-If counts live elsewhere, pass `layer="..."`.
-
-```python
-# example: keep a dedicated counts layer for later steps
-# adata.layers["counts"] = adata.X.copy()
-```
-
-## 2. Run the default path
+## 2. Select HVGs
 
 ```python
+import scanpy as sc
 import scfair as scf
 
 scf.pp.highly_variable_genes(adata)
 
 print(int(adata.var["highly_variable"].sum()), "genes selected")
-# Keep the full matrix. Downstream scanpy PCA uses
-# mask_var="highly_variable" by default when that column is present.
+print(adata.uns["scfair"]["hvg"].get("auto_message"))
 ```
 
-By default this is:
+Keep the full gene matrix. Scanpy PCA uses `var["highly_variable"]` as a mask.
 
-1. One global HVG ranking (`flavor="seurat_v3"`)
-2. Choose a base size **`k` from the data** (`n_top_genes="auto"`) — often
-   near 2000; when the density signal is weak, scFair prefers 2000 over a
-   short list
-3. Append the next `append_budget` genes from the **same** ranking.
-   Default is a **tight density** rule: floor **200**, and when auto sees
-   many density cores may rise up to **300**
-   (`m = max(200, min(300, 200 + max(0, n_need − 12) × 12))`). Fixed-`k`
-   calls stay at 200 unless you set `options=HVGOptions(append_budget=…)`.
+Default behavior:
 
-Final list size is `k + append_budget`, capped at `n_vars`. The default append
-path does not re-rank genes with intermediate clustering. Auto needs extra
-graph builds and is slower than a fixed `k`.
+1. Rank genes with `flavor="seurat_v3"`.
+2. Choose a base size `k` from the data (`n_top_genes="auto"`).
+3. Add a short same-rank tail (`append_budget`, usually 200 genes).
 
-See what auto picked:
+Final size is about `k + 200`. Auto is slower than a fixed `k` because it
+builds extra neighbor graphs.
+
+### Common alternatives
 
 ```python
-h = adata.uns["scfair"]["hvg"]
-print(h.get("auto_message"))          # one plain-language line
-print(h.get("n_top_genes_used"))      # base k
-print(h.get("append_budget"))         # resolved m (often 200–300)
-print(h.get("auto_n", {}).get("rule_branch"))  # optional diagnostics
-print(h.get("auto_n", {}).get("append_budget_info"))  # density rule detail
-```
-
-### Fixed size (locked paper / protocol)
-
-```python
+# locked paper / protocol (still appends ~200 genes)
 scf.pp.highly_variable_genes(adata, n_top_genes=2000)
-```
 
-### Match scanpy gene set (no append)
-
-```python
-# same flavor + n_top_genes + batch_key (if any) → same selected genes as scanpy
+# exact scanpy top-2000 (no tail)
 scf.pp.highly_variable_genes(adata, n_top_genes=2000, balance_method="none")
-# multi-batch:
-# scf.pp.highly_variable_genes(
-#     adata, n_top_genes=2000, balance_method="none",
-#     options=scf.pp.HVGOptions(batch_key="batch"),
-# )
+
+# extra knobs (batch, store_raw, append size, …)
+from scfair.pp import HVGOptions
+scf.pp.highly_variable_genes(
+    adata,
+    n_top_genes=2000,
+    options=HVGOptions(batch_key="batch", append_budget=100),
+)
 ```
 
-## 3. Downstream (keep the full matrix)
-
-Do **not** subset to HVGs. Keep all genes; scanpy PCA uses
-`mask_var="highly_variable"` when that column is present.
+## 3. Downstream
 
 ```python
-import scanpy as sc
-
-# after scf.pp.highly_variable_genes(adata) …
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 sc.pp.scale(adata, max_value=10)
-sc.tl.pca(adata)                       # uses highly_variable by default
+sc.tl.pca(adata)
 sc.pp.neighbors(adata)
 sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False)
-# sc.tl.umap(adata)                    # optional
 ```
 
-## 4. What to look at
+## 4. What was written
 
-```python
-adata.var["highly_variable"]       # boolean mask
-adata.var["highly_variable_rank"]  # rank among selected; NaN if not selected
-adata.var["scfair_score"]          # ranking score used for selection
-h = adata.uns["scfair"]["hvg"]     # options used, k, timings, diagnosis
-print(h.get("auto_message"))       # plain summary when auto ran
-```
-
-| Field | Meaning |
+| Where | Meaning |
 |-------|---------|
-| `var["highly_variable"]` | Final gene mask |
-| `var["highly_variable_rank"]` | Finite ranks for selected genes only |
-| `uns["scfair"]["hvg"]` | Full call record (method, k, diagnosis tips) |
-| `uns["scfair"]["hvg"]["auto_message"]` | One-line plain English when `n_top_genes="auto"` |
+| `adata.var["highly_variable"]` | Final gene mask |
+| `adata.var["highly_variable_rank"]` | Rank among selected genes; NaN otherwise |
+| `adata.var["scfair_score"]` | Score used for ranking |
+| `adata.uns["scfair"]["hvg"]` | Options, chosen `k`, diagnosis tips |
+| `adata.uns["scfair"]["hvg"]["auto_message"]` | One-line summary when auto ran |
 
-Diagnosis (`diagnose=True`, default) writes advisory tips. It never changes
-which genes are selected.
-
-## 5. Optional planning helpers
+## 5. Optional helpers
 
 ```python
-# Known cell-type labels: imbalance tips before you choose a method
+# labels you already have
 scf.pp.diagnose_from_labels(adata.obs["cell_type"])
 
-# Label-free: how many populations the density field supports
-# needs sc.pp.neighbors(adata) run first (or pass embedding=...);
-# without a graph it returns n_populations=None, confidence="none"
+# after sc.pp.neighbors(adata)
 est = scf.pp.estimate_n_populations(adata)
 print(est.n_populations, est.confidence)
 ```
 
-Both helpers are advisory and do not run HVG selection.
+These do not change the HVG list.
 
 ## Next
 
 | Step | Page |
 |------|------|
-| Defaults and parameters | {doc}`user_guide/index` |
-| PBMC 10k: misclustered cells vs standard HVG | {doc}`tutorials/pbmc10k_hvg_compare` |
-| Full signatures | {doc}`api/index` |
-| Common questions | {doc}`faq` |
+| Parameters and recipes | {doc}`user_guide/parameters` |
+| How selection works | {doc}`user_guide/method` |
+| PBMC notebooks | {doc}`tutorials/index` |
+| FAQ | {doc}`faq` |

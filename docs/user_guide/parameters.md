@@ -12,7 +12,7 @@ This page summarizes the main arguments of
 | `flavor` | `"seurat_v3"` | Global ranking method; same family as scanpy |
 | `layer` | `None` | Counts layer; default prepares / uses `layers["counts"]` |
 | `balance_method` | `"append"` | `"append"` (base + tail) or `"none"` (scanpy-like exact size) |
-| `mode` | `"auto"` | Product size preset for auto / default budgets |
+| `mode` | `"auto"` | Size preset for auto / default budgets |
 | `marker_genes` / `marker_mode` | `None` | Optional forced markers |
 | `diagnose` | `True` | Advisory tips in `uns`; never changes the gene list |
 | `strict` | `False` | Raise instead of falling back when a dependency is missing |
@@ -36,8 +36,8 @@ scf.pp.highly_variable_genes(
 )
 ```
 
-Pass an `HVGOptions` instance, not a bare dict. Fields that used to be
-top-level kwargs still work with a deprecation warning; prefer `options=`.
+Pass an `HVGOptions` instance, not a bare dict. Top-level kwargs such as
+`append_budget=200` are rejected; put them on `HVGOptions`.
 
 Useful fields:
 
@@ -56,7 +56,7 @@ Useful fields:
 
 When cells come from several technical batches (or samples you treat as
 batches), pass the `obs` column name via `HVGOptions`. scFair forwards it to
-scanpy on the global HVG pass — the same lightweight merge as
+scanpy on the global HVG pass, the same merge as
 `scanpy.pp.highly_variable_genes(..., batch_key=...)`:
 
 ```python

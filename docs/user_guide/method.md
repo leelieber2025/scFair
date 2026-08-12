@@ -1,15 +1,14 @@
 # How selection works
 
 scFair addresses two choices in HVG selection. Flavors and diagnostics are
-secondary. Cluster-aware reallocation methods were removed; the shipped path
-handles a hard top-`k` cutoff with a same-rank append.
+secondary.
 
 ## Two problems
 
 ### Problem A — How many genes (`n`)?
 
-Pipelines need a gene budget. There is no single correct length a priori —
-copying 2000 from a tutorial is simple and can be wrong for a given dataset
+Pipelines need a gene budget. There is no single correct length a priori.
+Copying 2000 from a tutorial is simple and can be wrong for a given dataset
 (too short erases structure; too long adds noise and cost).
 
 **Default:** `n_top_genes="auto"` estimates a base size `k` from multi-seed
@@ -22,19 +21,16 @@ Auto is multi-seed and slower than a fixed `k`.
 
 Global HVG ranking measures variability across all cells. When a few cell types
 dominate, the top of the list is filled by genes that separate those large
-groups. Markers for smaller populations often sit just below a fixed cutoff —
-not because they are uninformative, but because bulk variation fills the slots
-first.
+groups. Markers for smaller populations often sit just below a fixed cutoff,
+because bulk variation fills the slots first.
 
-**Default:** `append` freezes the global top-`k` and adds a short extension of
+**Default:** `append` keeps the global top-`k` and adds a short extension of
 near-miss genes from the **same** ranking (ranks `k+1 … k+m`). Nothing is
 pushed out of the base. The selected set equals **`top-(k+m)`** (same genes as
 `balance_method="none"` with `n_top_genes=k+m`).
 
-This is a same-rank tail, not cluster-conditional reallocation (no per-cluster
-quotas, no intermediate Leiden for gene identity). Those methods were removed.
-
-Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
+Pass **`balance_method="none"`** (or `options=HVGOptions(append_budget=0)`)
+for pure top-`k`.
 
 ## Default path: auto `n` + append
 
@@ -42,7 +38,7 @@ Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
 2. **Problem A:** choose base size **`k`** with structure-aware auto (default).
    Low density confidence floors soft short lists to classical **2000**
    (except labeled true-SHORT paths). Pass `n_top_genes=2000` to skip auto.
-3. Freeze the top `k` genes.
+3. Keep the top `k` genes.
 4. **Problem B:** append the next `append_budget` genes from the same ranking
    (ranks `k+1 … k+m`). Default floor **200**; when `n_top_genes="auto"`,
    budget may rise with structure `n_density_pops` as
@@ -52,14 +48,13 @@ Pass **`balance_method="none"`** (or `append_budget=0`) for pure top-`k`.
 Properties:
 
 - No intermediate clustering for gene selection.
-- Nothing is removed from the base top-`k` (allocation is “base + tail”).
+- The base top-`k` is kept in full; the extra genes are a tail.
 - Final size is `k + append_budget` (capped at `n_vars`) when append is on.
 - Auto is multi-seed and slower than a fixed `k`.
 
-**Not GiniClust / CellSIUS.** Those methods score rare-subtype genes (Gini,
-cluster-wise tests). Product `append` only adds near-miss genes from the
-global HVG list. For a known missing type, force-include markers
-(`marker_mode="force"`).
+GiniClust and CellSIUS score rare-subtype genes (Gini, cluster-wise tests).
+Default `append` only adds near-miss genes from the global HVG list. For a
+known missing type, force-include markers (`marker_mode="force"`).
 
 ```python
 import scfair as scf
@@ -90,20 +85,19 @@ against existing protocols.
 | `"structure"` | Same size estimator as `"auto"`, exposed as an explicit name |
 
 With the default `balance_method="append"`, auto only chooses **how many**
-genes; it does **not** re-rank the list. That keeps the gene set a frozen
-global top-`k` plus a small extension.
+genes. It does not re-rank the list. The gene set is a frozen global top-`k`
+plus a small extension.
 
 ### What auto does under the hood
 
 Auto builds a short multi-seed view of cell **density** in a low-dimensional
-embedding (after neighbors / PCA), not a second gene-variance formula. Roughly:
+embedding (after neighbors / PCA). It is not a second gene-variance formula.
+Roughly:
 
-- several clear dense cores → allow a longer or shorter list by rule, often
-  near the classical 2000 band
+- several clear dense cores → a longer or shorter list by rule, often near
+  the classical 2000 band
 - low density confidence → prefer classical **2000** rather than a short list
-  (label-free safety)
-- true multi-core short geometry **with** cell-type labels can still keep a
-  short base (research / fine atlases)
+- labeled multi-core short geometry can still keep a short base
 
 Bounds: `n_top_min` / `n_top_max` (default 500–5000). Cost: several graph
 builds, so large objects take longer than `n_top_genes=2000`.
@@ -112,13 +106,13 @@ After a call, `adata.uns["scfair"]["hvg"]["auto_n"]` records what happened:
 
 | Field | Meaning |
 |-------|---------|
-| `strategy` | Always `"structure"` — product auto is structure-only; there is no user-settable alternative estimator |
+| `strategy` | Always `"structure"` (auto is structure-only) |
 | `n_top_selected` | The base `k` it picked |
 | `structure` | Density features (population count, valley depth, stability) |
-| `rule_branch` | Internal tag for which rule fired — useful in bug reports |
+| `rule_branch` | Internal tag for which rule fired; useful in bug reports |
 
-**Known limitation:** on small matrices the estimator can hit `n_top_max`
-and select almost every gene (see {doc}`../faq`). Prefer a fixed
+**Limitation:** on small matrices the estimator can hit `n_top_max` and
+select almost every gene (see {doc}`../faq`). Prefer a fixed
 `n_top_genes=2000` for locked paper protocols.
 
 ## Product modes
@@ -131,5 +125,5 @@ use `"auto"` or leave size decisions to the defaults. See {doc}`parameters`.
 ## Markers
 
 You can force known markers into the final set with `marker_genes` and
-`marker_mode`. Read the function docstring before relying on this: injecting
-markers is not free even when they are added outside the base count.
+`marker_mode`. With the default `marker_extra=True`, forced markers are added
+on top of the selected list, so the final size can exceed `n_top_genes`.

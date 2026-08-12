@@ -6,11 +6,35 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-12
+
+### Fixed
+
+- **seurat_v3 loess guard** now also checks `n_obs` (1-cell matrices SIGSEGV).
+  Structure auto no longer calls `seurat_v3` on unsafe shapes.
+- **`label_key` type count** drops missing / empty / `"nan"` labels, matching
+  `diagnose_from_labels` (missing values no longer flip fine mode or true-SHORT).
+- **`restore_raw_counts`** aligns `adata.raw` by gene name after HVG subset;
+  `full_genes=True` uses `.raw` as the full universe when no snapshot exists.
+- Failed HVG no longer leaves a newly created `layers["counts"]`.
+- Missing `marker_genes` emit `UserWarning`. `inplace=False, subset=True`
+  warns that subset is ignored.
+
+### Removed
+
+- Dead leftover from cluster-aware HVG: Leiden resolution bisection
+  (`resolution_from_density_field`, `resolution_for_n_clusters`), PC-elbow
+  diagnosis, no-op `_discard_raw_snapshot`, and `scfair_hvg_clusters` writes.
+- Deprecated top-level HVG option kwargs. Secondary knobs only via
+  `options=HVGOptions(...)`. Removed names still raise `TypeError`.
+
 ### Documentation
 
-- Clarify **Problem B**: hard top-`k` cutoff on a global ranking (large types
-  fill the list; small-type markers often sit just below). Document `append` as
-  a same-rank tail (`top-(k+m)`), not cluster-conditional reallocation.
+- Tighten published docs and source comments: American English, drop leftover
+  hybrid/fairness wording, and remove claims that do not match the code
+  (`uns` timings; default `raw_snapshot` discard).
+- Quickstart and FAQ rewritten around copy-paste recipes (`HVGOptions`,
+  restore from `.raw`, `inplace=False` + `subset=True`).
 
 ## [0.8.0] - 2026-08-08
 
