@@ -30,7 +30,7 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
-- Tighten published docs and source comments: American English, drop leftover
+- Tighten published docs and source comments: Drop leftover
   hybrid/fairness wording, and remove claims that do not match the code
   (`uns` timings; default `raw_snapshot` discard).
 - Quickstart and FAQ rewritten around copy-paste recipes (`HVGOptions`,
