@@ -1,7 +1,6 @@
-"""Tests for the public scfair.pp.highly_variable_genes product API.
+"""Tests for the public scfair.pp.highly_variable_genes API.
 
-Product surface: balance_method append | none; n_top_genes auto|structure|int.
-Cluster-aware methods (hybrid/score/reweight) were removed.
+balance_method: append | none; n_top_genes: auto | structure | int.
 """
 
 from __future__ import annotations
@@ -132,6 +131,12 @@ def test_removed_options_rejected(adata_for_hvg):
         scf.pp.highly_variable_genes(
             ad, n_top_genes=10, options=HVGOptions(), neighbor_contrast=1.0
         )
+
+
+def test_top_level_option_kwargs_rejected(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, append_budget=5)
 
 
 def test_mito_ribo_name_helpers():
@@ -653,3 +658,155 @@ def test_diagnosis_none_path(adata_for_hvg):
     diag = ad.uns[UNS_KEY]["hvg"]["diagnosis"]
     assert diag["balance_method"] == "none"
     assert "balance_method_none" in diag["flags"]
+
+
+def test_loess_unsafe_on_tiny_shapes():
+    from scfair.pp._highly_variable_genes import _loess_unsafe
+
+    assert _loess_unsafe(1, 80) is not None
+    assert _loess_unsafe(20, 8) is not None
+    assert _loess_unsafe(40, 80) is None
+
+
+def test_tiny_auto_does_not_segfault():
+    """n_top_genes='auto' on a 2x2 matrix must not SIGSEGV (structure loess)."""
+    import warnings
+
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    a = ad.AnnData(X=rng.poisson(2.0, size=(2, 2)).astype(np.float32))
+    a.obs_names = ["c0", "c1"]
+    a.var_names = ["g0", "g1"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            scf.pp.highly_variable_genes(
+                a, n_top_genes="auto", balance_method="none", diagnose=False, progress=False
+            )
+        except ValueError:
+            # seurat fallback on 2 genes may still raise; must not abort the process
+            return
+    assert "highly_variable" in a.var.columns
+
+
+def test_missing_marker_warns(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.warns(UserWarning, match="not in adata.var_names"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            marker_genes=["NOT_A_GENE"],
+            diagnose=False,
+        )
+
+
+def test_inplace_false_subset_warns(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    n0 = ad.n_vars
+    with pytest.warns(UserWarning, match="subset=True is ignored"):
+        out = scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            inplace=False,
+            subset=True,
+            diagnose=False,
+        )
+    assert ad.n_vars == n0
+    assert "highly_variable" not in ad.var.columns
+    assert out is not None
+    assert out["highly_variable"].sum() == 10
+
+
+def test_failed_call_does_not_invent_counts_layer(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    assert "counts" not in ad.layers
+    with pytest.raises(ValueError):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            diagnose=False,
+            options=HVGOptions(global_score=pd.Series([1.0], index=["nope"])),
+        )
+    assert "counts" not in ad.layers
+    assert "highly_variable" not in ad.var.columns
+    assert "hvg" not in ad.uns
+
+
+def test_none_with_integer_var_names_sets_mask():
+    """RangeIndex gene names must still produce a boolean HVG mask."""
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    X = rng.poisson(2, size=(80, 40)).astype(np.float64)
+    X[:20, 0] = 30
+    adata = ad.AnnData(X)
+    adata.var_names = pd.RangeIndex(adata.n_vars)
+    scf.pp.highly_variable_genes(
+        adata,
+        n_top_genes=10,
+        flavor="seurat",
+        balance_method="none",
+        diagnose=False,
+        progress=False,
+    )
+    assert int(adata.var["highly_variable"].sum()) == 10
+    assert adata.uns[UNS_KEY]["hvg"]["n_highly_variable_final"] == 10
+
+
+def test_batch_merge_scores_mixed_sign_preserves_nbatches():
+    """nbatches=2 must beat nbatches=1 even when disp_norm has mixed sign."""
+    import anndata as ad
+
+    from scfair.pp._highly_variable_genes import _batch_merge_scores
+
+    var = pd.DataFrame(
+        {
+            "highly_variable_nbatches": [2, 1],
+            "dispersions_norm": [-3.0, 10.0],
+        },
+        index=["A", "B"],
+    )
+    adata = ad.AnnData(np.zeros((4, 2)))
+    adata.var = var
+    scores = _batch_merge_scores(adata, flavor_used="seurat")
+    assert scores is not None
+    assert list(scores.sort_values(ascending=False).index) == ["A", "B"]
+
+
+def test_seurat_on_log_x_matches_scanpy(adata_for_hvg):
+    """Already-logged .X must not be log1p'd again for flavor='seurat'."""
+    ad = adata_for_hvg.copy()
+    sc.pp.normalize_total(ad, target_sum=1e4)
+    sc.pp.log1p(ad)
+    a_sc = ad.copy()
+    a_sf = ad.copy()
+    sc.pp.highly_variable_genes(a_sc, n_top_genes=20, flavor="seurat")
+    scf.pp.highly_variable_genes(
+        a_sf,
+        n_top_genes=20,
+        flavor="seurat",
+        balance_method="none",
+        diagnose=False,
+        progress=False,
+    )
+    set_sc = set(a_sc.var_names[a_sc.var["highly_variable"].to_numpy()])
+    set_sf = set(a_sf.var_names[a_sf.var["highly_variable"].to_numpy()])
+    assert set_sf == set_sc
+
+
+def test_store_raw_ignored_when_inplace_false(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.warns(UserWarning, match="store_raw is ignored"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            inplace=False,
+            diagnose=False,
+            options=HVGOptions(store_raw=True),
+        )
+    assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})

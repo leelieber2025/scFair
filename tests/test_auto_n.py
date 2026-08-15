@@ -295,6 +295,56 @@ def test_structure_true_short_skips_buffer_with_n_types():
     assert "k_buffer" in d3["rule_branch"]
     assert "low_conf_floor" in d3["rule_branch"]
 
+    # nd=10 sits on the "few cores" side of the threshold, so it is not
+    # true-SHORT (that now requires nd≥11). Soft buffer applies.
+    d4 = explain_structure_rule(
+        valley_median=0.92,
+        frac_shallow=0.1,
+        n_density_pops=10,
+        mean_stability=0.7,
+        min_stability=0.1,
+        n_obs=15_000,
+        n_leiden=12,
+        density_confidence="high",
+        n_types=9,
+    )
+    assert d4["n_top"] == 1000
+    assert d4["no_buffer"] is False
+    assert "no_buffer" not in d4["rule_branch"]
+
+
+def test_aggregate_skips_failed_seed_sentinels():
+    from scfair.pp._auto_n import _aggregate_structure_features
+
+    failed = {
+        "n_obs": 3,
+        "n_leiden": 1,
+        "n_density_pops": None,
+        "valley_median": float("nan"),
+        "frac_shallow": float("nan"),
+        "mean_stability": float("nan"),
+        "min_stability": float("nan"),
+        "reason": "too_few_pcs",
+        "density_confidence": "none",
+    }
+    good = {
+        "n_obs": 200,
+        "n_leiden": 8,
+        "n_density_pops": 15,
+        "valley_median": 0.7,
+        "frac_shallow": 0.2,
+        "mean_stability": 0.6,
+        "min_stability": 0.4,
+        "reason": "ok",
+        "density_confidence": "high",
+    }
+    out = _aggregate_structure_features([good, failed, failed])
+    assert out["n_density_pops"] == 15
+    assert out["reason"] == "ok_aggregated"
+    all_fail = _aggregate_structure_features([failed, dict(failed)])
+    assert all_fail["n_density_pops"] == 0
+    assert all_fail["reason"] == "too_few_pcs"
+
 
 def test_structure_anti_short_residual_and_false_short_post_combine():
     """Post-combine floors: false_short and low_conf; high-nd 500 exempt."""
@@ -436,6 +486,16 @@ def test_combine_structure_k_prefers_aggregate_not_fragile_vote():
     )
     assert k3 == 1500
     assert src3 == "aggregated_features"
+
+    # Buffered SHORT (1000) on large n must not beat an aggregate mid/long.
+    k4, src4 = _combine_structure_k(
+        k_from_agg=2000,
+        k_vote=1000,
+        per_seed_k=[1000, 1000, 1000],
+        n_obs=20_000,
+    )
+    assert k4 == 2000
+    assert src4 == "anti_short_veto_large_n"
 
 
 def test_structure_auto_n_default_uses_nd_budget():

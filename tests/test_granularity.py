@@ -17,7 +17,6 @@ import numpy as np
 import pytest
 
 from scfair.pp._granularity import (
-    AUTO_RESOLUTION_LO,
     DEFAULT_BANDWIDTH_FRAC,
     MIN_BANDWIDTH,
     default_bandwidth,
@@ -26,7 +25,6 @@ from scfair.pp._granularity import (
     knn_graph,
     merge_peaks,
     population_count_from_embedding,
-    resolution_for_n_clusters,
 )
 
 
@@ -63,7 +61,7 @@ def test_one_blob_gives_one_population():
 
 
 def test_bandwidth_is_a_fraction_of_n_not_an_absolute_count():
-    """Calibrated as 2% of n_obs; an absolute neighbour count does not transfer
+    """Calibrated as 2% of n_obs; an absolute neighbor count does not transfer
     across dataset sizes."""
     assert default_bandwidth(20_000) == round(DEFAULT_BANDWIDTH_FRAC * 20_000)
     assert default_bandwidth(100) == MIN_BANDWIDTH  # floor for small data
@@ -120,7 +118,7 @@ def test_precomputed_embedding_needs_no_neighbours(adata_blobs):
 
 
 def test_missing_neighbours_is_reported_not_raised(adata_blobs):
-    with pytest.warns(UserWarning, match="neighbour graph|neighbors"):
+    with pytest.warns(UserWarning, match="neighbor graph|neighbors"):
         est = estimate_n_populations(adata_blobs)
     assert est.n_populations is None
     assert est.reason == "no_embedding"
@@ -145,54 +143,6 @@ def test_does_not_touch_selection_or_the_users_umap(adata_blobs):
     np.testing.assert_array_equal(adata_blobs.obsm["X_umap"], before)
     assert "highly_variable" not in adata_blobs.var
     assert "hvg" not in adata_blobs.uns.get("scfair", {})
-
-
-# ---------------------------------------------------------------------------
-# resolution bisection
-# ---------------------------------------------------------------------------
-def test_bisection_hits_an_reachable_target():
-    # a monotone step function standing in for Leiden
-    def leiden(res: float) -> int:
-        return int(np.clip(round(2 + 12 * res), 1, 40))
-
-    res, n, calls = resolution_for_n_clusters(leiden, 8)
-    assert n == 8
-    assert calls <= 12
-    assert leiden(res) == 8
-
-
-def test_bisection_returns_the_closest_when_the_target_is_skipped():
-    def leiden(res: float) -> int:
-        return 5 if res < 1.0 else 9  # 8 is never produced
-
-    res, n, calls = resolution_for_n_clusters(leiden, 8)
-    assert n == 9  # closest to 8
-    assert calls <= 12
-
-
-def test_bisection_reports_targets_outside_the_bracket():
-    def leiden(res: float) -> int:
-        return int(np.clip(round(2 + 2 * res), 1, 10))
-
-    _, n, calls = resolution_for_n_clusters(leiden, 40, lo=0.05, hi=4.0)
-    assert n == 10  # the bracket's best
-    assert calls == 2  # gives up immediately, no search
-
-
-def test_bisection_floors_lo_to_auto_resolution_lo():
-    """Ultra-low lo (e.g. 0.05) is raised to AUTO_RESOLUTION_LO so rare types
-    are not erased by a near-zero resolution that still reports high ARI on
-    the coarse majority partition."""
-    seen: list[float] = []
-
-    def leiden(res: float) -> int:
-        seen.append(float(res))
-        return int(np.clip(round(2 + 12 * res), 1, 40))
-
-    res, n, _ = resolution_for_n_clusters(leiden, 8, lo=0.05, hi=4.0)
-    assert res >= AUTO_RESOLUTION_LO - 1e-12
-    assert min(seen) >= AUTO_RESOLUTION_LO - 1e-12
-    assert n == 8
 
 
 def test_population_count_exposes_confidence_margin():
@@ -222,15 +172,3 @@ def test_knn_density_finite_on_duplicate_points():
     assert est.n_populations is not None
     # With two graph-separated components, count should not explode to n_obs.
     assert est.n_populations <= 10
-
-
-def test_bisection_tie_prefers_higher_resolution():
-    """Equal |n−target| must keep the higher resolution (rare-type bias)."""
-
-    # lo→n=6, hi→n=10; target=8 is equidistant (gap 2). Prefer hi.
-    def leiden(res: float) -> int:
-        return 6 if res < 1.0 else 10
-
-    res, n, _ = resolution_for_n_clusters(leiden, 8, lo=0.2, hi=4.0)
-    assert n == 10
-    assert res >= 1.0

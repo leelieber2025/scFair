@@ -6,28 +6,90 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-15
+
+### Fixed
+
+- **Integer / RangeIndex gene names** with `balance_method="none"` wrote
+  `n_highly_variable_final=k` but left `var["highly_variable"]` all False.
+  Ranking helpers now stringify names, matching the append path.
+- **`flavor="seurat"` / `"cell_ranger"` + `batch_key`**: mixed-sign
+  `dispersions_norm` could invert scanpy's nbatches-primary merge order.
+- **Log flavors no longer re-log** a staged non-integer matrix (already-log
+  `.X` without `layers["counts"]`, or `seurat_v3` fallback to seurat).
+- **Non-integer leftover `layers["counts"]` + integer `.X`** no longer feeds
+  the log layer into HVG; `.X` is staged on an internal layer.
+- **`store_raw` snapshots** refresh when counts change. On-disk files with the
+  same path are rewritten unless shape, names, and fingerprint still match.
+- **`store_raw=True` + `inplace=False`** no longer writes a snapshot on a
+  discarded copy (warns and skips).
+- **`restore_raw_counts(full_genes=True)`** does not let a same-size snapshot
+  hide a larger `adata.raw`. Missing on-disk files fall back to the counts
+  layer instead of raising. `prefer_snapshot` is honored on the full-gene path.
+- Failed HVG calls now drop a scanpy `uns["hvg"]` they created.
+- **`pearson_residuals`** forwards `batch_key`.
+- Auto-n: `TRUE_SHORT_ND_MIN` is 11 so nd=10 cannot be both "few cores" and
+  true-SHORT. Unanimous buffered-SHORT (k=1000) no longer overrides an
+  aggregate mid/long list on large n. Failed structure seeds no longer inject
+  fake `n_density_pops` into the median.
+- `n_leiden` for the v7 ratio uses size-filtered clusters, not Leiden dust.
+- Missing-label tokens (`NA`, `n/a`, `unknown`) no longer inflate `n_types`
+  into fine mode.
+- Fine mode floors every k&lt;2000, not only the SHORT rungs.
+- Density merge no longer divides by a zero-height peak. User `uns["umap"]`
+  is copied before the 3D UMAP used for population count.
+
 ### Documentation
 
-- Restore **Problem B** framing: unfair HVG allocation **at the cutoff**
-  (large types fill top-`k`; small-type markers often sit just below). Product
-  `append` is documented as a **conservative same-rank response** to that
-  unfairness (`top-(k+m)`), without reviving cluster-conditional reallocation
-  claims.
+- Cite the bioRxiv preprint (doi:10.64898/2026.08.08.743679) in the README,
+  docs, and `CITATION.cff`.
+- Recut the published docs and tutorials against the current API: drop leftover
+  allocation / product wording, match current `uns` keys, and shorten the
+  notebooks to a scanpy-style analysis path. Re-executed both tutorials on
+  0.9.0 (stored outputs had been 0.5.0 / 0.7.0).
+
+## [0.9.0] - 2026-08-12
+
+### Fixed
+
+- **seurat_v3 loess guard** now also checks `n_obs` (1-cell matrices SIGSEGV).
+  Structure auto no longer calls `seurat_v3` on unsafe shapes.
+- **`label_key` type count** drops missing / empty / `"nan"` labels, matching
+  `diagnose_from_labels` (missing values no longer flip fine mode or true-SHORT).
+- **`restore_raw_counts`** aligns `adata.raw` by gene name after HVG subset;
+  `full_genes=True` uses `.raw` as the full universe when no snapshot exists.
+- Failed HVG no longer leaves a newly created `layers["counts"]`.
+- Missing `marker_genes` emit `UserWarning`. `inplace=False, subset=True`
+  warns that subset is ignored.
+
+### Removed
+
+- Dead leftover from cluster-aware HVG: Leiden resolution bisection
+  (`resolution_from_density_field`, `resolution_for_n_clusters`), PC-elbow
+  diagnosis, no-op `_discard_raw_snapshot`, and `scfair_hvg_clusters` writes.
+- Deprecated top-level HVG option kwargs. Secondary knobs only via
+  `options=HVGOptions(...)`. Removed names still raise `TypeError`.
+
+### Documentation
+
+- Tighten published docs and source comments: American English, drop leftover
+  hybrid/fairness wording, and remove claims that do not match the code
+  (`uns` timings; default `raw_snapshot` discard).
+- Quickstart and FAQ rewritten around copy-paste recipes (`HVGOptions`,
+  restore from `.raw`, `inplace=False` + `subset=True`).
 
 ## [0.8.0] - 2026-08-08
 
 ### Changed
 
-- **Default remains `n_top_genes="auto"`.** Docs state clearly: auto exists to
-  **avoid a wrong `n` when no length is known a priori**; the multi-seed cost
-  is intentional and worth it. Structure fall-through no longer hard-codes
-  2000: when no SHORT/LONG/MID rule fires, base k scales as
+- **Default remains `n_top_genes="auto"`.** Structure fall-through no longer
+  hard-codes 2000: when no SHORT/LONG/MID rule fires, base k scales as
   `round(n_density_pops × 150)` (`nd_budget`). Classical 2000 only when `nd`
-  is missing; low-confidence floors still apply. Pass a fixed int only for
-  locked protocols.
-- **Honest product framing.** `append` = same-ranking list buffer
-  (`top-(k+m)`), not population-aware reallocation. Density population count
-  (`estimate_n_populations`) is documented as a first-class feature (scope
+  is missing; low-confidence floors still apply. Pass a fixed int for locked
+  protocols.
+- **`append` documented as same-rank list buffer** (`top-(k+m)`), not
+  population-aware reallocation. Density population count
+  (`estimate_n_populations`) documented as a first-class feature (scope
   ~≤20 well-separated populations).
 - **Public `restore_raw_counts`** for `store_raw=True` snapshots.
 - **`pp.__all__`** is the documented surface only.
@@ -124,9 +186,9 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
-- User guide, README, quickstart, and FAQ emphasize structure-aware auto-`n`
+- User guide, README, quickstart, and FAQ describe structure-aware auto-`n`
   and an optional same-ranking list buffer (not population-aware
-  reallocation). Auto is a safe default, not a claim of global optimality.
+  reallocation).
 - Quickstart and README show a full downstream scanpy path without subsetting
   the gene matrix.
 

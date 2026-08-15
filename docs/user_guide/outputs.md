@@ -1,55 +1,47 @@
 # Outputs
 
-## Columns on `adata.var`
+## `adata.var`
 
 | Column | Meaning |
 |--------|---------|
-| `highly_variable` | Boolean mask of the final gene set |
-| `highly_variable_rank` | Rank among selected genes; **NaN** if not selected (scanpy seurat_v3 style) |
-| `scfair_score` | Score used for ranking; see the note in `uns` for the exact definition |
+| `highly_variable` | Final gene mask |
+| `highly_variable_rank` | Rank among selected genes; **NaN** if not selected |
+| `scfair_score` | Score used for ranking. `uns["scfair"]["hvg"]["scfair_score_note"]` names the statistic (`variances_norm` for `seurat_v3`). It is not a probability. |
 
-Global flavor-specific columns from scanpy (for example `variances_norm`) may
-also be present after the global pass.
+Scanpy flavor columns (for example `variances_norm`) may also be present.
 
-## Record in `adata.uns["scfair"]["hvg"]`
+## `adata.uns["scfair"]["hvg"]`
 
-Every successful call writes a structured record, including:
-
-- options actually used (including resolved `n_top_genes` and `append_budget`)
-- method / balance path
-- timings
-- diagnosis tips when `diagnose=True`
+Written on every successful call:
 
 ```python
 h = adata.uns["scfair"]["hvg"]
-h["n_top_genes_used"]
+h["n_top_genes_used"]          # base k
+h["n_highly_variable_final"]   # |selected|, including the append tail
+h.get("auto_message")
+h.get("auto_n")
 h.get("diagnosis")
-h.get("auto_n")  # present for the default auto path (and any auto call)
 ```
 
-If a call fails after partial writes, scFair rolls back HVG columns when it can
-and records `adata.uns["scfair"]["hvg_failed"]` so a caught exception does not
-leave a false mask behind.
+If the call fails after partial writes, HVG columns are rolled back when
+possible and `uns["scfair"]["hvg_failed"]` records the error.
 
 ## Counts layer
 
-For count-based flavors, scFair ensures a usable raw counts matrix (typically
-`layers["counts"]`). It does **not** overwrite a user counts layer when that
-layer disagrees with integer `.X`; staging uses an internal layer that is
-removed after the call. Prefer an explicit `layer=` when you already know where
-raw counts live.
+For count-based flavors, scFair prepares a usable raw counts matrix
+(typically `layers["counts"]`). It does not overwrite a user counts
+layer that disagrees with integer `.X`; staging uses an internal layer
+that is removed after the call. Pass `layer=` when you already know
+where the counts live.
 
-## No raw-count matrix left in `uns` (default)
+No second full matrix is stored under `uns["scfair"]["raw_snapshot"]`
+unless you pass `options=HVGOptions(store_raw=True)` (or `"ondisk"`).
+Use that when `subset=True` and you later need the pre-subset gene
+universe.
 
-By default the call does **not** keep a second full counts table under
-`adata.uns["scfair"]["raw_snapshot"]`. That sidecar is opt-in via
-`options=HVGOptions(store_raw=True)` (or `"ondisk"`) for the rare case where you
-need the pre-subset gene universe after `subset=True` or for external tooling.
-Most analyses only need `layers["counts"]` plus the HVG mask.
+## Helpers
 
-## Planning helpers
-
-| Function | Writes |
+| Function | Effect |
 |----------|--------|
-| {func}`scfair.pp.diagnose_from_labels` | A short imbalance report (does not modify the HVG mask) |
-| {func}`scfair.pp.estimate_n_populations` | An advisory estimate in `uns` / return object |
+| {func}`scfair.pp.diagnose_from_labels` | Returns an imbalance report. Does not write to `adata`. |
+| {func}`scfair.pp.estimate_n_populations` | Returns a `GranularityEstimate` and stores it under `uns["scfair"]["granularity"]` (override with `key_added=`). |

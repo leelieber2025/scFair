@@ -1,7 +1,8 @@
 cff-version: 1.2.0
 title: "scFair: structure-aware highly variable gene selection for single-cell RNA-seq"
 message: >-
-  If you use this software, please cite it using the metadata below.
+  If you use this software, please cite the bioRxiv preprint
+  (preferred-citation) and the software record below.
 type: software
 authors:
   # Display form used elsewhere: Zhao Li (李钊)
@@ -10,11 +11,18 @@ authors:
     email: "leelieber@gmail.com"
 repository-code: "https://github.com/leelieber2025/scFair"
 url: "https://scfair.readthedocs.io"
+doi: 10.5281/zenodo.21761251
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21761251
+    description: >-
+      Concept DOI representing all versions; always resolves to the latest release.
+  - type: doi
+    value: 10.64898/2026.08.08.743679
+    description: bioRxiv preprint.
 license: Apache-2.0
-version: 0.8.0
-date-released: "2026-08-08"
-# Add when a Zenodo archive exists, e.g.:
-# doi: 10.5281/zenodo.XXXXXXX
+version: 0.10.0
+date-released: "2026-08-15"
 keywords:
   - single-cell
   - RNA-seq
@@ -22,3 +30,20 @@ keywords:
   - highly variable genes
   - structure
   - bioinformatics
+preferred-citation:
+  type: article
+  title: "scFair: Geometry-Aware Gene Budgets and Same-Rank Extension for Highly Variable Gene Selection"
+  authors:
+    - family-names: "Li"
+      given-names: "Zhao"
+      orcid: "https://orcid.org/0000-0002-9276-9129"
+    - family-names: "James"
+      given-names: "Aaron"
+      orcid: "https://orcid.org/0000-0002-2002-622X"
+    - family-names: "Li"
+      given-names: "Shengxuan"
+  year: 2026
+  month: 8
+  journal: bioRxiv
+  doi: 10.64898/2026.08.08.743679
+  url: "https://www.biorxiv.org/content/10.64898/2026.08.08.743679v1"

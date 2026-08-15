@@ -6,37 +6,10 @@ live here and are passed as ``options=HVGOptions(...)``.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 import pandas as pd
-
-# Keys that used to be top-level kwargs on highly_variable_genes.
-# Still accepted with DeprecationWarning; prefer HVGOptions.
-# Removed research fields raise a clear TypeError via unknown-key handling.
-HVG_OPTION_FIELD_NAMES: frozenset[str] = frozenset(
-    {
-        "n_top_min",
-        "n_top_max",
-        "structure_n_seeds",
-        "marker_extra",
-        "global_score",
-        "span",
-        "n_bins",
-        "min_mean",
-        "max_mean",
-        "min_disp",
-        "max_disp",
-        "batch_key",
-        "filter_mito",
-        "filter_ribo",
-        "gene_nomenclature",
-        "append_budget",
-        "label_key",
-        "store_raw",
-        "snapshot_path",
-    }
-)
 
 # Names removed with the cluster-aware balance methods / dead auto strategies.
 _REMOVED_OPTION_NAMES: frozenset[str] = frozenset(
@@ -78,8 +51,8 @@ class HVGOptions:
     # auto bounds / structure seeds
     n_top_min: int = 500
     n_top_max: int = 5000
-    # Structure auto multi-seed count. None → product default (3). Use 1 for
-    # a faster exploratory pass (less stable k).
+    # Structure auto multi-seed count. None → default 3. Use 1 for a faster
+    # exploratory pass (less stable k).
     structure_n_seeds: int | None = None
 
     # Optional obs key for auto mode / fine detection (n_types).
@@ -89,10 +62,10 @@ class HVGOptions:
     marker_extra: bool = True
 
     # Extra genes beyond base ``n_top_genes`` / auto-``k`` from the **same**
-    # global ranking (ranks ``k+1 … k+m``). Softens unfair hard cutoffs
-    # (near-miss genes kept); set equals ``top-(k+m)``, not cluster quotas.
-    # None → product default floor 200; on ``n_top_genes="auto"`` may rise with
-    # structure density cores. Explicit ``0``/``N`` is never overridden.
+    # global ranking (ranks ``k+1 … k+m``). Near-miss genes kept; set equals
+    # ``top-(k+m)``, not cluster quotas. None → floor 200; on
+    # ``n_top_genes="auto"`` may rise with structure density cores. Explicit
+    # ``0``/``N`` is never overridden.
     append_budget: int | None = None
 
     # Opt-in: keep a full raw-count sidecar in ``uns['scfair']['raw_snapshot']``
@@ -134,63 +107,19 @@ class HVGOptions:
         return HVGOptions(**data)
 
 
-def resolve_hvg_options(
-    options: HVGOptions | None,
-    legacy_kwargs: Mapping[str, Any] | None = None,
-) -> HVGOptions:
-    """Merge explicit ``options`` with deprecated top-level kwargs.
-
-    ``options`` must be ``None`` or an :class:`HVGOptions` instance (not a bare
-    dict). ``options=`` and legacy top-level kwargs must not be mixed: if both
-    are present, raise ``ValueError`` (dataclass fields have no "was set"
-    sentinel, so per-field conflict detection is not possible).
-    """
+def resolve_hvg_options(options: HVGOptions | None) -> HVGOptions:
+    """Return ``options`` or a default :class:`HVGOptions` instance."""
     if options is None:
-        base = HVGOptions()
-        options_provided = False
-    elif isinstance(options, HVGOptions):
-        base = options
-        options_provided = True
-    elif isinstance(options, Mapping):
+        return HVGOptions()
+    if isinstance(options, HVGOptions):
+        return options
+    if isinstance(options, Mapping):
         raise TypeError(
             "options must be an HVGOptions instance, not a dict/mapping. "
             "Use options=HVGOptions(append_budget=200) or "
             "options=HVGOptions(**your_dict)."
         )
-    else:
-        raise TypeError(
-            f"options must be HVGOptions or None, got {type(options).__name__}. "
-            "Use options=HVGOptions(...)."
-        )
-
-    if not legacy_kwargs:
-        return base
-
-    overrides = dict(legacy_kwargs)
-    removed_hit = sorted(k for k in overrides if k in _REMOVED_OPTION_NAMES)
-    if removed_hit:
-        raise TypeError(
-            f"removed option(s): {removed_hit}. Cluster-aware balance methods "
-            "(hybrid/score/reweight), auto_n_method, and related knobs were "
-            "deleted. Product auto is structure-only; use balance_method="
-            "'append' (same-rank cutoff tail) or 'none' (top-k only)."
-        )
-
-    field_names = {f.name for f in fields(HVGOptions)}
-    unknown = set(overrides) - field_names
-    if unknown:
-        raise TypeError(
-            f"unknown highly_variable_genes option(s): {sorted(unknown)}. "
-            f"Use HVGOptions fields or the short public signature."
-        )
-
-    if options_provided:
-        conflict = sorted(k for k in overrides if k in field_names)
-        if conflict:
-            raise ValueError(
-                "Do not mix options=HVGOptions(...) with deprecated top-level "
-                f"kwargs. Put every secondary knob on the HVGOptions instance, "
-                f"or pass only legacy kwargs (not both). Got legacy: {conflict}."
-            )
-
-    return base.merged(**overrides)
+    raise TypeError(
+        f"options must be HVGOptions or None, got {type(options).__name__}. "
+        "Use options=HVGOptions(...)."
+    )

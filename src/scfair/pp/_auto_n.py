@@ -117,7 +117,9 @@ SHORT_FLOOR_K = 2000
 FALSE_SHORT_ND_MAX = 8
 # True SHORT (optional labels): many density cores + enough types
 # → skip soft buffer and keep short_hard at k=500.
-TRUE_SHORT_ND_MIN = 10
+# Must sit strictly above SHORT_BLOCK_ND_MAX so nd=10 cannot be both
+# "few cores" and "true SHORT" on large n.
+TRUE_SHORT_ND_MIN = SHORT_BLOCK_ND_MAX + 1
 TRUE_SHORT_N_TYPES_MIN = 5
 
 # Soft one-rung buffer on classical discrete picks (500→1000, …).
@@ -307,12 +309,8 @@ def explain_structure_rule(
             branch_out = base_branch
             if buf_raw is not None and k_clip != buf_raw:
                 branch_out = f"{base_branch}+k_buffer:{buf_raw}→{k_clip}"
-        # Fine product mode: do not ship SHORT soft lists. Floor to classical 2000.
-        if (
-            fine_mode
-            and k_clip < 2000
-            and (base_branch.startswith("short_") or k_rule <= 500 or k_clip <= 1000)
-        ):
+        # Fine mode: do not ship a list below the classical 2000 floor.
+        if fine_mode and k_clip < 2000:
             k_pre = int(k_clip)
             k_clip = _clip_k(2000, k_min, k_max, n_genes)
             branch_out = f"{branch_out}+fine_mode_floor:{k_pre}→{k_clip}"
@@ -603,13 +601,21 @@ def _prepare_structure_embedding(
     ad0.var_names = np.asarray(adata.var_names).astype(str)
     ad0.layers[layer_use] = ad0.X
 
-    sc.pp.highly_variable_genes(
-        ad0,
-        n_top_genes=min(int(n_hvg), ad0.n_vars),
-        flavor="seurat_v3",
-        layer=layer_use,
-        subset=False,
-    )
+    from scfair.pp._highly_variable_genes import _loess_unsafe
+
+    n_hvg_use = min(int(n_hvg), ad0.n_vars)
+    if _loess_unsafe(ad0.n_obs, ad0.n_vars) is None:
+        try:
+            sc.pp.highly_variable_genes(
+                ad0,
+                n_top_genes=n_hvg_use,
+                flavor="seurat_v3",
+                layer=layer_use,
+                subset=False,
+            )
+        except (ValueError, TypeError, RuntimeError, ArithmeticError, MemoryError):
+            # Leave all genes; structure only needs a compact embedding.
+            pass
     if "highly_variable" not in ad0.var.columns:
         mask = np.ones(ad0.n_vars, dtype=bool)
     else:
@@ -627,7 +633,7 @@ def _prepare_structure_embedding(
         return None, {
             "n_obs": int(adata.n_obs),
             "n_leiden": 1,
-            "n_density_pops": 1,
+            "n_density_pops": None,
             "valley_median": float("nan"),
             "frac_shallow": float("nan"),
             "mean_stability": float("nan"),
@@ -837,7 +843,7 @@ def _structure_features_from_embedding(
         return {
             "n_obs": int(n_obs),
             "n_leiden": int(labels.nunique()),
-            "n_density_pops": 0,
+            "n_density_pops": None,
             "valley_median": float("nan"),
             "valley_mean": float("nan"),
             "frac_shallow": float("nan"),
@@ -889,7 +895,7 @@ def _structure_features_from_embedding(
     est = population_count_from_embedding(X3, depth=DEFAULT_DEPTH, bandwidth=bw)
     return {
         "n_obs": int(n_obs),
-        "n_leiden": int(labels.nunique()),
+        "n_leiden": int(len(active)),
         "n_density_pops": int(est.n_populations or 0),
         "valley_median": float(np.nanmedian(arr)),
         "valley_mean": float(np.nanmean(arr)),
@@ -957,12 +963,32 @@ def _aggregate_structure_features(feats: Sequence[dict[str, Any]]) -> dict[str, 
         return dict(feats[0])
 
     def _nanmed(key: str) -> float:
-        vals = [float(f[key]) for f in feats if key in f and np.isfinite(float(f.get(key, np.nan)))]
+        vals: list[float] = []
+        for f in feats:
+            v = f.get(key)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(fv):
+                vals.append(fv)
         return float(np.median(vals)) if vals else float("nan")
 
-    def _nanmed_int(key: str) -> int:
-        vals = [float(f[key]) for f in feats if key in f and np.isfinite(float(f.get(key, np.nan)))]
-        return int(round(float(np.median(vals)))) if vals else 0
+    def _nanmed_int(key: str) -> int | None:
+        vals: list[float] = []
+        for f in feats:
+            v = f.get(key)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(fv):
+                vals.append(fv)
+        return int(round(float(np.median(vals)))) if vals else None
 
     # Worst confidence across seeds (low < moderate < high < none/missing).
     conf_rank = {"low": 0, "moderate": 1, "high": 2, "none": 3}
@@ -975,17 +1001,24 @@ def _aggregate_structure_features(feats: Sequence[dict[str, Any]]) -> dict[str, 
     ]
     worst_sens = int(max(sens_vals)) if sens_vals else None
 
+    fail_reasons = [
+        str(f.get("reason")) for f in feats if f.get("reason") not in (None, "ok", "ok_aggregated")
+    ]
+    ok_any = any(f.get("reason") in (None, "ok", "ok_aggregated") for f in feats)
+    nd = _nanmed_int("n_density_pops")
     out: dict[str, Any] = {
         "n_obs": int(feats[0].get("n_obs") or 0),
-        "n_leiden": _nanmed_int("n_leiden"),
-        "n_density_pops": _nanmed_int("n_density_pops"),
+        "n_leiden": _nanmed_int("n_leiden") or 0,
+        "n_density_pops": nd if nd is not None else 0,
         "valley_median": _nanmed("valley_median"),
         "valley_mean": _nanmed("valley_mean"),
         "frac_shallow": _nanmed("frac_shallow"),
         "mean_stability": _nanmed("mean_stability"),
         "min_stability": _nanmed("min_stability"),
         "bandwidth": feats[0].get("bandwidth"),
-        "reason": "ok_aggregated",
+        "reason": "ok_aggregated"
+        if ok_any
+        else (fail_reasons[0] if fail_reasons else "ok_aggregated"),
         "n_seeds_aggregated": len(feats),
         "density_confidence": worst_conf,
         "density_depth_sensitivity": worst_sens,
@@ -1041,8 +1074,9 @@ def _combine_structure_k(
     preds = [int(p) for p in per_seed_k]
     n_cells = int(n_obs) if n_obs is not None else 0
 
-    # Large-n short vote must not override mid/long aggregate.
-    if n_cells >= 10_000 and k_v <= 500 and k_agg >= 1500:
+    # Large-n short / buffered-short vote must not override mid/long aggregate.
+    # Seeds already apply the 500→1000 soft buffer, so k_v=1000 is still SHORT.
+    if n_cells >= 10_000 and k_v <= 1000 and k_agg >= 1500:
         return k_agg, "anti_short_veto_large_n"
 
     if preds and len(set(preds)) == 1:
@@ -1143,7 +1177,7 @@ def estimate_n_top_structure(
     passes ``n_seeds=``:data:`PRODUCT_STRUCTURE_N_SEEDS` (3) so pred_k is
     multi-seed stable. This function's own default remains ``n_seeds=1``
     for fast one-shot / probe calls only — do not rely on the default for
-    shipped auto behaviour. ``k_max`` defaults to 5000 to match
+    shipped auto behavior. ``k_max`` defaults to 5000 to match
     ``n_top_max`` / HVGOptions (was 4000, which silently capped the documented
     5000 bound).
 
@@ -1182,12 +1216,10 @@ def estimate_n_top_structure(
     if label_key is None and "label_key" in feature_kwargs:
         label_key = feature_kwargs.pop("label_key")
     if n_types is None and label_key and adata is not None:
-        try:
-            if label_key in getattr(adata, "obs", {}):
-                labs = np.asarray(adata.obs[label_key].astype(str))
-                n_types = int(len(np.unique(labs)))
-        except Exception:
-            n_types = None
+        if label_key in getattr(adata, "obs", {}):
+            from scfair.pp._diagnosis import count_label_types
+
+            n_types = count_label_types(adata.obs[label_key])
     if feature_kwargs:
         logger.debug("estimate_n_top_structure ignoring kwargs %s", feature_kwargs)
 

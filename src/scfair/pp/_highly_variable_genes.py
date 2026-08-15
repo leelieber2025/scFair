@@ -2,20 +2,14 @@
 
 Public entry point: :func:`highly_variable_genes`.
 
-Product path:
-
 1. **How many genes (``n``)?** Default ``n_top_genes="auto"`` estimates a base
-   size ``k`` from density structure (safer than guessing; not proven optimal).
-2. **Unfair allocation at the cutoff.** Global HVG ranking is dominated by large
+   size ``k`` from multi-seed density structure. Pass a fixed int when the
+   protocol already locks ``n``.
+2. **Hard top-``k`` cutoff.** Global HVG ranking is dominated by large
    populations; genes useful for smaller types often sit just below top-``k``.
-   Default ``balance_method="append"`` freezes the global backbone and adds a
-   short **same-rank** tail (``append_budget``). The set is
-   ``top-(k+m)`` — a conservative response to cutoff unfairness, **not**
-   cluster-conditional reallocation. Pass ``balance_method="none"`` (or
-   ``append_budget=0``) for pure top-``k``.
-
-Cluster-aware reallocation methods (``hybrid`` / ``score`` / ``reweight``)
-were removed.
+   Default ``balance_method="append"`` keeps the global top-``k`` and adds a
+   short same-rank tail (``append_budget``). The set is ``top-(k+m)``.
+   Pass ``balance_method="none"`` (or ``append_budget=0``) for pure top-``k``.
 """
 
 from __future__ import annotations
@@ -34,10 +28,9 @@ import scipy.sparse as sparse
 from .._utils import UNS_KEY, _is_integer_counts_like
 from ._auto_n import plain_auto_n_message
 from ._diagnosis import check_config, diagnose_hvg_run, resolve_hvg_mode
-from ._options import HVG_OPTION_FIELD_NAMES, HVGOptions, resolve_hvg_options
+from ._options import HVGOptions, resolve_hvg_options
 from ._raw_counts import (
     INTERNAL_COUNTS_LAYER,
-    _discard_raw_snapshot,
     _prepare_counts_layer,
 )
 
@@ -103,6 +96,23 @@ _FLAVOR_SCORE_COLS: dict[str, tuple[str, ...]] = {
     "cell_ranger": ("dispersions_norm", "dispersions"),
 }
 
+# seurat_v3 loess (skmisc) can SIGSEGV in C on tiny matrices. Not catchable.
+_LOESS_MIN_OBS = 2
+
+
+def _loess_unsafe(n_obs: int, n_vars: int, span: float = 0.3) -> str | None:
+    """Return a reason if seurat_v3 loess is unsafe, else None."""
+    span_f = float(span) if span and float(span) > 0 else 0.3
+    min_genes = max(10, int(np.ceil(2.0 / span_f)))
+    n_obs_i = int(n_obs)
+    n_vars_i = int(n_vars)
+    if n_obs_i < _LOESS_MIN_OBS:
+        return f"n_obs={n_obs_i}<{_LOESS_MIN_OBS}"
+    if n_vars_i < min_genes:
+        return f"n_vars={n_vars_i}<{min_genes}"
+    return None
+
+
 _SCANPY_HVG_VAR_COLS = (
     "highly_variable",
     "highly_variable_rank",
@@ -136,7 +146,7 @@ def highly_variable_genes(
     options: HVGOptions | None = None,
     **legacy_kwargs: Any,
 ) -> pd.DataFrame | None:
-    """Select highly variable genes (product: structure auto-``n`` + cutoff append).
+    """Select highly variable genes (structure auto-``n`` + cutoff append).
 
     Parameters
     ----------
@@ -145,22 +155,18 @@ def highly_variable_genes(
         ``layer=``).
     n_top_genes
         ``"auto"`` / ``"structure"`` (**default**): structure-aware base size
-        from multi-seed density features. **Default is auto on purpose:** no
-        fixed ``n`` is known to be safe a priori; paying for structure
-        estimation is meant to reduce silent wrong list lengths. Pass a fixed
-        int (e.g. ``2000``) only when the protocol is locked. Booleans are
-        rejected.
+        from multi-seed density features. Pass a fixed int (e.g. ``2000``)
+        when the protocol is locked. Booleans are rejected. Auto is multi-seed
+        and slower than a fixed ``k``.
     flavor
         Scanpy HVG method for the global ranking:
         counts: ``seurat_v3``, ``seurat_v3_paper``, ``pearson_residuals``;
         log: ``seurat``, ``cell_ranger``.
     balance_method
-        ``"append"`` (default): freeze global top-``k``, then add the next
-        ``append_budget`` genes from the **same** ranking so near-miss genes
-        (often relevant to less dominant structure) are not discarded by a
-        hard cut. The set equals ``top-(k+m)`` — a conservative response to
-        **cutoff unfairness**, not cluster-conditional reallocation.
-        ``"none"``: top-``k`` only (scanpy-like fixed list size).
+        ``"append"`` (default): keep global top-``k``, then add the next
+        ``append_budget`` genes from the **same** ranking (near-miss genes
+        kept). The set equals ``top-(k+m)``. ``"none"``: top-``k`` only
+        (scanpy-like fixed list size).
     mode
         ``"auto"`` / ``"compact"`` / ``"balanced"`` / ``"fine"`` — steers
         auto-``k`` floors and default append budget when not set explicitly.
@@ -177,9 +183,8 @@ def highly_variable_genes(
         auto-``n`` once ``n_obs >= 1000`` (so mid-size auto runs are not silent).
     options
         :class:`~scfair.pp.HVGOptions` for secondary knobs (bounds, filters,
-        append_budget, store_raw, batch_key, …). Do not mix with legacy
-        top-level kwargs for the same call. With ``store_raw=True``, restore
-        via :func:`~scfair.pp.restore_raw_counts`.
+        append_budget, store_raw, batch_key, …). With ``store_raw=True``,
+        restore via :func:`~scfair.pp.restore_raw_counts`.
     """
     if getattr(adata, "isbacked", False):
         raise NotImplementedError(
@@ -193,27 +198,12 @@ def highly_variable_genes(
 
         removed = sorted(k for k in legacy_kwargs if k in _REMOVED_OPTION_NAMES)
         if removed:
-            raise TypeError(
-                f"removed option(s): {removed}. Cluster-aware balance methods "
-                "(hybrid/score/reweight) and their knobs were deleted. "
-                "Use balance_method='append' or 'none'."
-            )
-        unknown = set(legacy_kwargs) - HVG_OPTION_FIELD_NAMES
-        if unknown:
-            raise TypeError(
-                f"highly_variable_genes() got unexpected keyword argument(s) "
-                f"{sorted(unknown)}. Product knobs are the short signature; "
-                f"secondary knobs use options=HVGOptions(...)."
-            )
-    opt = resolve_hvg_options(options, legacy_kwargs)
-    if legacy_kwargs and options is None:
-        warnings.warn(
-            "Passing secondary knobs as top-level keyword arguments is "
-            f"deprecated ({sorted(legacy_kwargs)}); use options=HVGOptions(...). "
-            "See scfair.pp.HVGOptions.",
-            DeprecationWarning,
-            stacklevel=2,
+            raise TypeError(f"removed option(s): {removed}. Use balance_method='append' or 'none'.")
+        raise TypeError(
+            f"highly_variable_genes() got unexpected keyword argument(s) "
+            f"{sorted(legacy_kwargs)}. Secondary knobs use options=HVGOptions(...)."
         )
+    opt = resolve_hvg_options(options)
 
     n_top_min = int(opt.n_top_min)
     n_top_max = int(opt.n_top_max)
@@ -249,6 +239,14 @@ def highly_variable_genes(
     label_key = opt.label_key
     store_raw = opt.store_raw
     snapshot_path = opt.snapshot_path
+    if store_raw and not inplace:
+        warnings.warn(
+            "store_raw is ignored when inplace=False (the snapshot would be "
+            "written on a discarded copy). Call with inplace=True.",
+            UserWarning,
+            stacklevel=2,
+        )
+        store_raw = False
     structure_n_seeds_opt = opt.structure_n_seeds
     if structure_n_seeds_opt is not None:
         structure_n_seeds_opt = int(structure_n_seeds_opt)
@@ -284,8 +282,7 @@ def highly_variable_genes(
     if balance_method not in _BALANCE_ALIASES:
         raise ValueError(
             f"Unknown balance_method={balance_method!r}. "
-            "Use 'append' (default same-rank cutoff tail) or 'none' (top-k only). "
-            "Cluster-aware methods (hybrid/score/reweight) were removed."
+            "Use 'append' (default same-rank cutoff tail) or 'none' (top-k only)."
         )
     method = _BALANCE_ALIASES[balance_method]
 
@@ -319,6 +316,15 @@ def highly_variable_genes(
     if n_top_min > n_top_max:
         raise ValueError(
             f"n_top_min={n_top_min} > n_top_max={n_top_max}. Pass a consistent interval."
+        )
+
+    if subset and not inplace:
+        warnings.warn(
+            "subset=True is ignored when inplace=False (the return value is a "
+            "DataFrame, not AnnData). Use inplace=True to subset the object, "
+            "or apply the returned highly_variable mask yourself.",
+            UserWarning,
+            stacklevel=2,
         )
 
     if not inplace:
@@ -481,10 +487,9 @@ def highly_variable_genes(
 
             n_types_struct: int | None = None
             if label_key and label_key in getattr(adata, "obs", {}):
-                try:
-                    n_types_struct = int(pd.Series(adata.obs[label_key]).astype(str).nunique())
-                except Exception:
-                    n_types_struct = None
+                from ._diagnosis import count_label_types
+
+                n_types_struct = count_label_types(adata.obs[label_key])
             n_seeds_struct = (
                 int(structure_n_seeds_opt)
                 if structure_n_seeds_opt is not None
@@ -686,7 +691,7 @@ def highly_variable_genes(
             ),
             "n_top_min": int(n_top_min),
             "n_top_max": int(n_top_max),
-            "auto_n_method": "structure" if n_top_is_auto else None,  # product: structure only
+            "auto_n_method": "structure" if n_top_is_auto else None,  # auto is structure-only
             "auto_n": auto_meta,
             "auto_message": (
                 (auto_meta or {}).get("message") if isinstance(auto_meta, dict) else None
@@ -785,11 +790,6 @@ def highly_variable_genes(
                 n_top_is_auto=n_top_is_auto,
                 auto_n_strategy=str(auto_strat) if auto_strat else None,
                 structure_meta=structure_meta,
-                resolution=None,
-                neighbor_contrast=0.0,
-                min_cluster_size=None,
-                clustering=None,
-                n_clusters_used=None,
                 config_check=config_check,
                 log=True,
             )
@@ -834,16 +834,14 @@ def highly_variable_genes(
             selected=selected,
             aggregated_score=aggregated,
             global_scores=global_scores,
-            cluster_labels=None,
             meta=meta,
             prior_scanpy_hvg=_prior_scanpy_hvg,
         )
 
         adata.layers.pop("_scfair_log", None)
         adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
-        _discard_raw_snapshot(adata, store_raw=effective_store_raw)
 
-        if subset:
+        if subset and inplace:
             # Same private API scanpy uses; anndata has no public inplace subset.
             adata._inplace_subset_var(adata.var["highly_variable"].to_numpy())
 
@@ -883,14 +881,9 @@ def _snapshot_adata_for_rollback(adata: Any) -> dict[str, Any]:
     return {
         "var_had": var_had,
         "var_cols": set(adata.var.columns),
-        "had_clusters": "scfair_hvg_clusters" in adata.obs.columns,
-        "clusters": (
-            adata.obs["scfair_hvg_clusters"].copy()
-            if "scfair_hvg_clusters" in adata.obs.columns
-            else None
-        ),
         "had_scfair_log": "_scfair_log" in getattr(adata, "layers", {}),
         "had_scfair_counts": INTERNAL_COUNTS_LAYER in getattr(adata, "layers", {}),
+        "had_counts_layer": "counts" in getattr(adata, "layers", {}),
         "uns_scfair": (
             {k: v for k, v in adata.uns["scfair"].items()}
             if isinstance(adata.uns.get("scfair"), dict)
@@ -909,11 +902,6 @@ def _rollback_adata_after_failure(adata: Any, snap: dict[str, Any], exc: BaseExc
             adata.var[c] = snap["var_had"][c]
         elif c in adata.var.columns and c not in snap["var_cols"]:
             del adata.var[c]
-    # intermediate cluster labels
-    if not snap["had_clusters"] and "scfair_hvg_clusters" in adata.obs.columns:
-        del adata.obs["scfair_hvg_clusters"]
-    elif snap["clusters"] is not None:
-        adata.obs["scfair_hvg_clusters"] = snap["clusters"]
     # internal log / counts layers
     if not snap["had_scfair_log"]:
         try:
@@ -923,6 +911,11 @@ def _rollback_adata_after_failure(adata: Any, snap: dict[str, Any], exc: BaseExc
     if not snap.get("had_scfair_counts"):
         try:
             adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
+        except Exception:
+            pass
+    if not snap.get("had_counts_layer"):
+        try:
+            adata.layers.pop("counts", None)
         except Exception:
             pass
     # scfair uns: restore prior dict keys for hvg; always record failure
@@ -949,9 +942,7 @@ def _rollback_adata_after_failure(adata: Any, snap: dict[str, Any], exc: BaseExc
     if snap["uns_hvg"] is not None:
         adata.uns["hvg"] = dict(snap["uns_hvg"])
     elif not snap["had_uns_hvg"] and "hvg" in adata.uns:
-        # only drop if we created a stub; if scanpy wrote mid-run, leave
-        # a note rather than guessing — prefer restore-from-snap path above
-        pass
+        adata.uns.pop("hvg", None)
 
 
 def _validate_counts_matrix(
@@ -1021,7 +1012,7 @@ def _validate_counts_matrix(
         if arr.size == 0:
             raise ValueError(f"counts matrix {where} is empty.")
         if arr.ndim != 2:
-            return info
+            raise ValueError(f"counts matrix {where} must be 2-dimensional, got ndim={arr.ndim}.")
         if not np.isfinite(arr).all():
             n_bad = int(arr.size - np.isfinite(arr).sum())
             raise ValueError(
@@ -1054,7 +1045,7 @@ def _validate_counts_matrix(
     if n_empty_cells > 0 and n_empty_cells >= max(1, int(0.5 * X.shape[0])):
         warnings.warn(
             f"{n_empty_cells}/{X.shape[0]} cells have zero total counts in {where}; "
-            "PCA/neighbours may be unstable. Filter empty barcodes before HVG.",
+            "PCA/neighbors may be unstable. Filter empty barcodes before HVG.",
             UserWarning,
             stacklevel=3,
         )
@@ -1085,24 +1076,18 @@ def _validate_counts_matrix(
         warnings.warn(msg, UserWarning, stacklevel=3)
         logger.warning(msg)
 
-    # seurat_v3 loess (skmisc) segfaults in C when n_vars is too small for
-    # span — not a catchable Python exception. Record here; _run_hvg falls
-    # back to seurat when strict=False, or raises when strict=True.
+    # seurat_v3 loess (skmisc) can SIGSEGV in C on tiny n_obs / n_vars.
     if flavor in ("seurat_v3", "seurat_v3_paper"):
-        span_f = float(span) if span and float(span) > 0 else 0.3
-        min_genes = max(10, int(np.ceil(2.0 / span_f)))
-        n_vars = int(X.shape[1])
-        if n_vars < min_genes:
+        why = _loess_unsafe(int(X.shape[0]), int(X.shape[1]), span=span)
+        if why:
             msg = (
-                f"flavor={flavor!r} (loess span={span_f}) needs at least "
-                f"{min_genes} genes to fit safely; got n_vars={n_vars}. "
-                "Use more genes, or flavor='seurat' / a non-loess method."
+                f"flavor={flavor!r} loess is unsafe on this matrix ({why}). "
+                "Use more cells/genes, or flavor='seurat' / a non-loess method."
             )
-            warn_codes.append("n_vars_too_small_for_loess")
-            info["loess_min_genes"] = min_genes
+            warn_codes.append("loess_unsafe")
+            info["loess_unsafe"] = why
             if strict:
                 raise ValueError(msg + " (strict=True)")
-            # Non-strict: _run_hvg will fall back to seurat before calling loess.
             warnings.warn(
                 msg + " Will fall back to flavor='seurat' if HVG proceeds.",
                 UserWarning,
@@ -1142,38 +1127,35 @@ def _run_hvg(
     }
     # Drop leftover score columns before any flavor run (G3).
     _clear_scanpy_hvg_var_columns(adata)
-    # Pre-empt loess C segfault: n_vars too small for span is not catchable.
     if flavor in ("seurat_v3", "seurat_v3_paper"):
-        span_f = float(span) if span and float(span) > 0 else 0.3
-        min_genes = max(10, int(np.ceil(2.0 / span_f)))
-        if int(adata.n_vars) < min_genes:
-            reason = (
-                f"flavor={flavor!r} (loess span={span_f}) needs ≥{min_genes} genes; "
-                f"got n_vars={adata.n_vars}; falling back to flavor='seurat'."
-            )
+        why = _loess_unsafe(int(adata.n_obs), int(adata.n_vars), span=span)
+        if why:
+            reason = f"flavor={flavor!r} loess is unsafe ({why}); falling back to flavor='seurat'."
             if strict:
-                raise ValueError(
-                    f"flavor={flavor!r} (loess span={span_f}) needs ≥{min_genes} genes; "
-                    f"got n_vars={adata.n_vars}. (strict=True)"
-                )
+                raise ValueError(f"flavor={flavor!r} loess is unsafe ({why}). (strict=True)")
             warnings.warn(reason, UserWarning, stacklevel=3)
             logger.warning(reason)
             _clear_scanpy_hvg_var_columns(adata)
-            _run_hvg_once(
-                adata,
-                n_top_genes=n_top_genes,
-                flavor="seurat",
-                counts_layer=counts_layer,
-                span=span,
-                n_bins=n_bins,
-                min_mean=min_mean,
-                max_mean=max_mean,
-                min_disp=min_disp,
-                max_disp=max_disp,
-                batch_key=batch_key,
-            )
+            try:
+                _run_hvg_once(
+                    adata,
+                    n_top_genes=n_top_genes,
+                    flavor="seurat",
+                    counts_layer=counts_layer,
+                    span=span,
+                    n_bins=n_bins,
+                    min_mean=min_mean,
+                    max_mean=max_mean,
+                    min_disp=min_disp,
+                    max_disp=max_disp,
+                    batch_key=batch_key,
+                )
+            except _RECOVERABLE_ERRORS + (IndexError,) as exc:
+                raise ValueError(
+                    f"{reason} seurat fallback also failed ({type(exc).__name__}: {exc})."
+                ) from exc
             meta["flavor_used"] = "seurat"
-            meta["fallback_reason"] = f"n_vars_too_small_for_loess:{adata.n_vars}<{min_genes}"
+            meta["fallback_reason"] = f"loess_unsafe:{why}"
             return meta
     try:
         _run_hvg_once(
@@ -1257,15 +1239,17 @@ def _run_hvg_once(
             raise ImportError(
                 "flavor='pearson_residuals' requires scanpy.experimental.pp."
             ) from exc
-        hvg_exp(
-            adata,
-            flavor="pearson_residuals",
-            n_top_genes=n_top_genes,
-            layer=work_layer,
-            inplace=True,
-            subset=False,
-            check_values=True,
-        )
+        pr_kwargs: dict[str, Any] = {
+            "flavor": "pearson_residuals",
+            "n_top_genes": n_top_genes,
+            "layer": work_layer,
+            "inplace": True,
+            "subset": False,
+            "check_values": True,
+        }
+        if batch_key is not None:
+            pr_kwargs["batch_key"] = batch_key
+        hvg_exp(adata, **pr_kwargs)
         return
 
     kwargs: dict[str, Any] = {
@@ -1300,22 +1284,24 @@ def _materialize_flavor_matrix(adata: Any, *, flavor: str, counts_layer: str) ->
     import anndata as ad
 
     log_layer = "_scfair_log"
-    if counts_layer in adata.layers:
-        # Minimal object: full adata.copy() would double peak memory (all layers/obsm).
-        X = adata.layers[counts_layer]
+
+    def _log_from(X: Any) -> str:
         ad_tmp = ad.AnnData(X=X.copy() if hasattr(X, "copy") else X)
         sc.pp.normalize_total(ad_tmp, target_sum=1e4)
         sc.pp.log1p(ad_tmp)
         adata.layers[log_layer] = ad_tmp.X
         return log_layer
 
+    if counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        # Already-logged / non-integer staged matrices must not be logged again.
+        # Scanpy seurat/cell_ranger expect log1p input and expm1 internally.
+        if _is_integer_counts_like(X):
+            return _log_from(X)
+        return counts_layer
+
     if _is_integer_counts_like(adata.X):
-        X = adata.X
-        ad_tmp = ad.AnnData(X=X.copy() if hasattr(X, "copy") else X)
-        sc.pp.normalize_total(ad_tmp, target_sum=1e4)
-        sc.pp.log1p(ad_tmp)
-        adata.layers[log_layer] = ad_tmp.X
-        return log_layer
+        return _log_from(adata.X)
 
     logger.debug("Using existing .X for log-based flavor=%s.", flavor)
     return None
@@ -1356,15 +1342,19 @@ def _batch_merge_scores(
         # seurat_v3 (and any other rank-writing batch path): rank ASC primary.
         return -rank_f + nbatches * 1.0e-6
 
-    # seurat / cell_ranger batch merge: nbatches then mean dispersions_norm.
+    # seurat / cell_ranger batch merge: nbatches DESC, then mean score DESC.
+    # Encode so any nbatches=k+1 beats any nbatches=k even when the secondary
+    # score has mixed sign (max(|sec|)+1 is not a safe radix).
     for col in ("dispersions_norm", "variances_norm", "residual_variances"):
         if col in var.columns:
             sec = pd.to_numeric(var[col], errors="coerce")
             sec = sec.reindex(adata.var_names)
             sec_f = sec.fillna(float(np.nanmin(sec.to_numpy())) - 1.0 if sec.notna().any() else 0.0)
-            # nbatches in the high digits; secondary score unbroken in the low digits.
-            scale = float(np.nanmax(np.abs(sec_f.to_numpy()))) + 1.0
-            return nbatches * (scale + 1.0) + sec_f
+            sec_arr = sec_f.to_numpy()
+            sec_min = float(np.nanmin(sec_arr)) if sec_f.notna().any() else 0.0
+            sec_max = float(np.nanmax(sec_arr)) if sec_f.notna().any() else 0.0
+            span = (sec_max - sec_min) + 1.0
+            return nbatches * span + (sec_f - sec_min)
     return nbatches
 
 
@@ -1431,11 +1421,11 @@ def _variability_raw_scores(
 
 
 def _top_genes_from_rank(rank: pd.Series, n_top: int) -> list[str]:
-    return list(rank.sort_values(ascending=True, kind="stable").index[:n_top])
+    return [str(g) for g in rank.sort_values(ascending=True, kind="stable").index[:n_top]]
 
 
 def _top_genes_from_scores(scores: pd.Series, n_top: int) -> list[str]:
-    return list(scores.sort_values(ascending=False, kind="stable").index[:n_top])
+    return [str(g) for g in scores.sort_values(ascending=False, kind="stable").index[:n_top]]
 
 
 def _hvg_base_plus_append(
@@ -1635,10 +1625,13 @@ def _merge_markers(
     markers = [str(g) for g in marker_genes if str(g) in var_set]
     missing = [str(g) for g in marker_genes if str(g) not in var_set]
     if missing:
-        logger.warning(
-            "marker_genes not in adata.var_names (ignored): %s",
-            missing[:10] + (["..."] if len(missing) > 10 else []),
+        shown = missing[:10] + (["..."] if len(missing) > 10 else [])
+        warnings.warn(
+            f"marker_genes not in adata.var_names (ignored): {shown}",
+            UserWarning,
+            stacklevel=3,
         )
+        logger.warning("marker_genes not in adata.var_names (ignored): %s", shown)
     if not markers:
         return selected[:n_top_genes]
 
@@ -1676,11 +1669,10 @@ def _apply_selection(
     selected: list[str],
     aggregated_score: pd.Series | None,
     global_scores: pd.Series,
-    cluster_labels: pd.Series | None,
     meta: dict[str, Any],
     prior_scanpy_hvg: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    hv = adata.var_names.astype(str).isin(selected)
+    hv = adata.var_names.astype(str).isin([str(g) for g in selected])
     adata.var["highly_variable"] = hv
 
     # Match scanpy: finite rank only for selected genes (0-based in selection
@@ -1703,9 +1695,6 @@ def _apply_selection(
     else:
         gs = global_scores.reindex(adata.var_names).to_numpy(dtype=float)
         adata.var["scfair_score"] = gs
-
-    if cluster_labels is not None:
-        adata.obs["scfair_hvg_clusters"] = cluster_labels.astype("category")
 
     # scFair owns ``uns["scfair"]``. Do not replace scanpy's ``uns["hvg"]`` with
     # a one-key stub. Prefer the caller's pre-call dict (scanpy's internal HVG
@@ -1752,8 +1741,7 @@ def _apply_selection(
 
 # ---------------------------------------------------------------------------
 # Helpers used by structure auto_n (pair stability on intermediate Leiden).
-# Kept here so estimate_n_top_structure can import them without reintroducing
-# hybrid selection.
+# Kept here so estimate_n_top_structure can import them.
 # ---------------------------------------------------------------------------
 
 _MERGE_N_BOOT = 15
@@ -1799,7 +1787,7 @@ def _pair_bootstrap_stability(
     idx = np.where(mask_a | mask_b)[0]
     n = idx.size
     if n < 20:
-        return 1.0
+        raise ValueError("pair bootstrap needs at least 20 cells in the union.")
     rng = np.random.default_rng(random_state)
     scores = []
     for _ in range(n_boot):

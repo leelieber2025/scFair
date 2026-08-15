@@ -340,6 +340,68 @@ def test_matrix_fingerprint_ignores_storage_format():
     assert INTERNAL_COUNTS_LAYER not in adata.layers
 
 
+def test_matrix_fingerprint_ignores_sparse_explicit_zeros():
+    import scipy.sparse as sp
+
+    from scfair.pp._raw_counts import _matrix_fingerprint
+
+    dense = np.array([[1.0, 0.0], [0.0, 2.0]])
+    # Same values, but store an explicit structural zero.
+    spx = sp.csr_matrix(([1.0, 0.0, 2.0], ([0, 0, 1], [0, 1, 1])), shape=(2, 2))
+    assert _matrix_fingerprint(dense) == _matrix_fingerprint(spx)
+
+
+def test_noninteger_counts_layer_with_integer_x_uses_internal():
+    import anndata as ad
+
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER, _prepare_counts_layer
+
+    X = np.ones((10, 8))
+    a = ad.AnnData(X.copy())
+    a.obs_names = [f"c{i}" for i in range(10)]
+    a.var_names = [f"g{i}" for i in range(8)]
+    a.layers["counts"] = np.log1p(np.ones((10, 8)))
+    used = _prepare_counts_layer(a)
+    assert used == INTERNAL_COUNTS_LAYER
+    assert np.allclose(a.layers["counts"], np.log1p(np.ones((10, 8))))
+    assert np.allclose(a.layers[INTERNAL_COUNTS_LAYER], X)
+
+
+def test_ondisk_snapshot_rewrites_stale_file(adata_counts, tmp_path):
+    from scfair.pp._raw_counts import _store_raw_snapshot, restore_raw_counts
+
+    path = tmp_path / "raw_snapshot.h5ad"
+    a = adata_counts.copy()
+    _store_raw_snapshot(a, a.X, overwrite=True, ondisk=True, snapshot_path=str(path))
+    b = adata_counts.copy()
+    b.X = np.full_like(np.asarray(b.X, dtype=float), 9.0)
+    _store_raw_snapshot(b, b.X, overwrite=False, ondisk=True, snapshot_path=str(path))
+    restored = restore_raw_counts(b)
+    assert np.allclose(np.asarray(restored.X, dtype=float), 9.0)
+
+
+def test_inline_snapshot_refreshes_when_counts_change(adata_counts):
+    from scfair.pp._raw_counts import _store_raw_snapshot, restore_raw_counts
+
+    a = adata_counts.copy()
+    _store_raw_snapshot(a, a.X, overwrite=False)
+    a.X = np.full_like(np.asarray(a.X, dtype=float), 7.0)
+    _store_raw_snapshot(a, a.X, overwrite=False)
+    restored = restore_raw_counts(a)
+    assert np.allclose(np.asarray(restored.X, dtype=float), 7.0)
+
+
+def test_full_genes_smaller_snapshot_does_not_hide_raw(adata_counts):
+    from scfair.pp._raw_counts import _store_raw_snapshot, restore_raw_counts
+
+    full = adata_counts.copy()
+    sub = full[:, :5].copy()
+    sub.raw = full
+    _store_raw_snapshot(sub, sub.X, overwrite=True)
+    out = restore_raw_counts(sub, full_genes=True)
+    assert out.n_vars == full.n_vars
+
+
 def test_explicit_layer_does_not_materialize_into_counts():
     """layer='alt' must not permanently hijack later default (layer=None) calls."""
     import anndata as ad
@@ -460,3 +522,35 @@ def test_log_X_without_counts_uses_internal_layer():
     assert used == INTERNAL_COUNTS_LAYER
     assert "counts" not in adata.layers
     assert INTERNAL_COUNTS_LAYER in adata.layers
+
+
+def test_restore_aligns_raw_after_gene_subset(adata_counts):
+    """Public restore must use adata.raw when layers['counts'] is absent."""
+    import scfair as scf
+
+    ad = adata_counts.copy()
+    X_full = np.asarray(ad.X, dtype=float).copy()
+    ad.raw = ad.copy()
+    sub = ad[:, :5].copy()
+    sub.layers.pop("counts", None)
+    if UNS_KEY in sub.uns:
+        sub.uns[UNS_KEY].pop("raw_snapshot", None)
+        sub.uns[UNS_KEY].pop("raw_gene_list", None)
+    restored = scf.pp.restore_raw_counts(sub, inplace=False)
+    assert restored.n_vars == 5
+    assert np.allclose(np.asarray(restored.X, dtype=float), X_full[:, :5])
+
+
+def test_full_genes_from_raw_without_snapshot(adata_counts):
+    import scfair as scf
+
+    ad = adata_counts.copy()
+    n_full = ad.n_vars
+    ad.raw = ad.copy()
+    sub = ad[:, :5].copy()
+    sub.layers.pop("counts", None)
+    if UNS_KEY in sub.uns:
+        sub.uns[UNS_KEY].pop("raw_snapshot", None)
+    full = scf.pp.restore_raw_counts(sub, full_genes=True)
+    assert full.n_vars == n_full
+    assert full.n_obs == sub.n_obs

@@ -1,30 +1,31 @@
 # Parameters
 
-This page summarizes the main arguments of
-{func}`scfair.pp.highly_variable_genes`. Full signatures live in the
+Main arguments of {func}`scfair.pp.highly_variable_genes`. Signatures:
 {doc}`../api/index`.
 
 ## Core arguments
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `n_top_genes` | `"auto"` | Structure-aware base size (default); pass an int (e.g. `2000`) for a fixed list |
-| `flavor` | `"seurat_v3"` | Global ranking method; same family as scanpy |
-| `layer` | `None` | Counts layer; default prepares / uses `layers["counts"]` |
-| `balance_method` | `"append"` | `"append"` (base + tail) or `"none"` (scanpy-like exact size) |
-| `mode` | `"auto"` | Product size preset for auto / default budgets |
+| `n_top_genes` | `"auto"` | Structure-aware base size. Pass an int to lock it. |
+| `flavor` | `"seurat_v3"` | Global ranking; same family as scanpy |
+| `layer` | `None` | Counts layer. Default prepares / uses `layers["counts"]` |
+| `balance_method` | `"append"` | `"append"` (base + tail) or `"none"` (exact size) |
+| `mode` | `"auto"` | Size preset for auto / default budgets |
 | `marker_genes` / `marker_mode` | `None` | Optional forced markers |
-| `diagnose` | `True` | Advisory tips in `uns`; never changes the gene list |
-| `strict` | `False` | Raise instead of falling back when a dependency is missing |
-| `random_state` | `0` | Reproducibility for structure auto |
-| `inplace` | `True` | Write results into `adata` |
-| `subset` | `False` | If `True`, subset genes after selection |
+| `diagnose` | `True` | Tips in `uns`; does not change the gene list |
+| `strict` | `False` | Raise instead of falling back |
+| `progress` | `None` | Stage messages on stderr. `None` turns them on for auto once `n_obs >= 1000`, and for any call that is large (`n_obs >= 10_000` or `n_obs * n_vars >= 5e7`) |
+| `random_state` | `0` | Structure auto |
+| `inplace` | `True` | Write into `adata` |
+| `subset` | `False` | Subset genes after selection |
 | `options` | `None` | An {class}`scfair.pp.HVGOptions` instance |
 
-## Secondary knobs (`HVGOptions`)
+## `HVGOptions`
 
-Less common controls live on {class}`scfair.pp.HVGOptions` so the everyday call
-stays short:
+Secondary knobs live here so the top-level signature stays short.
+Pass an instance, not a dict. Top-level kwargs such as `append_budget=200`
+are rejected.
 
 ```python
 from scfair.pp import HVGOptions
@@ -36,33 +37,23 @@ scf.pp.highly_variable_genes(
 )
 ```
 
-Pass an `HVGOptions` instance, not a bare dict. Fields that used to be
-top-level kwargs still work with a deprecation warning; prefer `options=`.
-
-Useful fields:
-
 | Field | Role |
 |-------|------|
-| `append_budget` | Genes appended after the frozen base. `None` → **floor 200**; with `n_top_genes="auto"`, may rise as `max(200, min(300, 200 + max(0, n_density_pops − 12) × 12))`. Explicit `0`/`N` never overridden. |
+| `append_budget` | Tail length after the frozen base. `None` → floor 200; on auto, may rise as `max(200, min(300, 200 + max(0, n_density_pops − 12) × 12))`. An explicit `0` or `N` is never overridden. |
 | `n_top_min` / `n_top_max` | Bounds for automatic `n_top_genes` |
-| `structure_n_seeds` | Multi-seed count for structure auto (`None` → product default 3; use `1` for a faster pass) |
-| `store_raw` | Opt-in: keep a full raw-count sidecar in `uns['scfair']['raw_snapshot']` after HVG (default `False`). `True` = inline; `"ondisk"` needs `snapshot_path` |
-| `label_key` | Optional obs key for type-count detection in auto mode |
-| `batch_key` | Optional `obs` column for scanpy-style per-batch HVG merge on the **global** ranking (default `None`). See below. |
-| `filter_mito` / `filter_ribo` | **Default `False`**: keep MT / ribo in the global ranking. Set `True` to drop them and refill (markers kept). |
-| `gene_nomenclature` | `None` (default) = **auto** detect `human` / `mouse` / `mixed` / `unknown` from gene names; optional force for mito rules. |
+| `structure_n_seeds` | Multi-seed count (`None` → 3; `1` is faster and less stable) |
+| `store_raw` | Keep a full raw-count sidecar in `uns["scfair"]["raw_snapshot"]`. Default `False`. `True` = inline; `"ondisk"` needs `snapshot_path` |
+| `label_key` | Optional `obs` key for type-count detection in auto |
+| `batch_key` | `obs` column for scanpy's per-batch HVG merge on the global ranking |
+| `filter_mito` / `filter_ribo` | Default `False`. Set `True` to drop MT / ribosomal structural proteins and refill (markers are kept) |
+| `gene_nomenclature` | `None` → infer `human` / `mouse` / `mixed` / `unknown` from gene names |
 
-### Multi-batch: `batch_key`
+### `batch_key`
 
-When cells come from several technical batches (or samples you treat as
-batches), pass the `obs` column name via `HVGOptions`. scFair forwards it to
-scanpy on the global HVG pass — the same lightweight merge as
-`scanpy.pp.highly_variable_genes(..., batch_key=...)`:
+Forwarded to `scanpy.pp.highly_variable_genes`. scFair reuses that merge
+order for `"append"` and `"none"`. This is not Harmony / scVI / BBKNN.
 
 ```python
-from scfair.pp import HVGOptions
-import scfair as scf
-
 scf.pp.highly_variable_genes(
     adata,
     n_top_genes=2000,
@@ -70,74 +61,32 @@ scf.pp.highly_variable_genes(
 )
 ```
 
-Effects and limits:
+Resolved value: `adata.uns["scfair"]["hvg"]["batch_key"]`.
 
-- **Applies to** the global ranking used by `"append"` and `"none"`.
-- **Does not** run batch-corrected PCA / integration. For full integration,
-  correct embeddings after HVG selection.
-- Resolved value is recorded in `adata.uns["scfair"]["hvg"]["batch_key"]`.
+### `marker_genes`
 
-If you do not have a batch column, leave the default (`None`).
-
-### Add your own genes: `marker_genes`
-
-To guarantee a specific gene set survives selection regardless of its rank
-(a known lineage marker, a fixed panel), pass `marker_genes`. With
-`marker_genes` set, `marker_mode` defaults to `"force"`:
+With markers given, `marker_mode` defaults to `"force"`:
 
 ```python
-import scfair as scf
-
 scf.pp.highly_variable_genes(adata, marker_genes=["CD3D", "CD8A"])
-adata.var.loc[["CD3D", "CD8A"], "highly_variable"]  # both True
 ```
 
-Forced markers are added **on top of** `n_top_genes` by default
-(`HVGOptions.marker_extra=True`) — nothing algorithm-selected is displaced.
-To check candidates without forcing anything, pass `marker_mode="none"` and
-read `adata.uns["scfair"]["hvg"]["n_marker_genes_already_selected"]`. See
-{doc}`../faq` for the full `marker_extra` / `marker_mode` semantics.
+Forced markers are added on top of `n_top_genes` (`marker_extra=True`).
+`marker_mode="none"` leaves the list alone and records how many
+candidates were already selected. See {doc}`../faq`.
 
-## Typical recipes
-
-**Everyday preprocessing** (auto size + append)
+## Recipes
 
 ```python
 scf.pp.highly_variable_genes(adata)
-```
 
-**Faster fixed size** (skip auto)
-
-```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000)
-```
 
-**Paper protocol that must match scanpy size exactly**
-
-```python
 scf.pp.highly_variable_genes(adata, n_top_genes=2000, balance_method="none")
-```
 
-**Larger extension without re-ranking**
+scf.pp.highly_variable_genes(adata, options=HVGOptions(append_budget=500))
 
-```python
-scf.pp.highly_variable_genes(
-    adata,
-    options=HVGOptions(append_budget=500),
-)
-```
+scf.pp.highly_variable_genes(adata, options=HVGOptions(batch_key="batch"))
 
-**Multi-batch data (per-batch HVG merge on the global ranking)**
-
-```python
-scf.pp.highly_variable_genes(
-    adata,
-    options=HVGOptions(batch_key="batch"),
-)
-```
-
-**Guarantee known genes are in the output**
-
-```python
 scf.pp.highly_variable_genes(adata, marker_genes=["CD3D", "CD8A"])
 ```
