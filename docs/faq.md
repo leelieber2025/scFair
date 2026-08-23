@@ -14,10 +14,12 @@ First call: {doc}`quickstart`. Method: {doc}`user_guide/method`.
 
 ## Is `append` different from a larger `k`?
 
-For the gene set, no. `append` with base `k` and budget `m` selects the
-same genes as `balance_method="none"` with `n_top_genes=k+m`. Auto
-chooses `k`, then the tail is a fixed-length extension. Metadata records
-base vs tail.
+Under the default filtering and marker settings, no. When enough genes are
+available, `append` with base `k` and budget `m` selects the same genes as
+`balance_method="none"` with `n_top_genes=k+m`. Auto chooses `k`, then the
+tail is a fixed-length extension. Gene filters, forced markers, or a small
+gene matrix can change the final set. Metadata records the base and tail
+separately.
 
 ## Why is my list larger than `n_top_genes`?
 
@@ -34,7 +36,10 @@ selected genes; that is a marker option, not append.
 
 ## Do I need to cluster first?
 
-No. Gene selection does not run Leiden.
+No. The default auto-size estimator runs an internal Leiden clustering on a
+temporary representation, but you do not need to supply cluster labels or run
+clustering beforehand. A fixed `n_top_genes` skips this structure-estimation
+step.
 
 ## What counts matrix do I need?
 
@@ -174,8 +179,8 @@ mixHVG mixes *method* rankings. scFair keeps one ranking.
 
 ## Is auto always better than 2000?
 
-No. On many datasets it lands near 2000. On some gold panels a
-hand-tuned `k` still wins on ARI. For a manuscript, pass
+No. On many datasets it lands near 2,000. On some benchmark datasets a
+hand-tuned `k` still performs better by ARI. For a manuscript, pass
 `n_top_genes=` and report that number.
 
 ## Version and citation

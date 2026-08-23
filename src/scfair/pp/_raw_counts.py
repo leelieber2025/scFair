@@ -363,7 +363,7 @@ def restore_raw_counts(
 
     Pair with ``options=HVGOptions(store_raw=True)`` (or ``"ondisk"``) when you
     need a full-gene universe after ``subset=True``, or to put integer counts
-    back into ``.X`` after log-normalisation.
+    back into ``.X`` after log normalization.
 
     Parameters
     ----------

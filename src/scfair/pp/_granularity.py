@@ -356,7 +356,7 @@ def estimate_n_populations(
     **This is the label-free alternative to sweeping Leiden resolution** for
     the question *how many populations are there?* — not which cell belongs
     where. On well-separated synthetic blobs it recovers the true count with
-    high confidence up to roughly **~20 populations**; with many tiny groups
+    high confidence up to roughly **20 populations**; with many tiny groups
     (e.g. 30 types × ~80 cells) it can under-count. Always run
     ``sc.pp.neighbors`` first (or pass ``embedding=``).
 

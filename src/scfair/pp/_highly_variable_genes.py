@@ -151,8 +151,9 @@ def highly_variable_genes(
     Parameters
     ----------
     adata
-        AnnData with raw counts in ``.X`` or ``layers['counts']`` (or pass
-        ``layer=``).
+        AnnData containing the input expected by ``flavor``. The count-based
+        flavors require raw integer counts in ``.X`` or a counts layer (or pass
+        ``layer=``); ``seurat`` and ``cell_ranger`` expect log-transformed data.
     n_top_genes
         ``"auto"`` / ``"structure"`` (**default**): structure-aware base size
         from multi-seed density features. Pass a fixed int (e.g. ``2000``)

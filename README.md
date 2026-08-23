@@ -29,7 +29,8 @@ Docs: [Read the Docs](https://scfair.readthedocs.io/en/latest/).
 ## What you need
 
 - Python 3.10+ (tested 3.10–3.12)
-- An AnnData object with raw integer counts in `.X` or `layers["counts"]`
+- For the default `seurat_v3` flavor, an AnnData object with raw integer counts
+  in `.X` or `layers["counts"]`
 
 ## Install
 
@@ -46,7 +47,8 @@ Details: [installation guide](https://scfair.readthedocs.io/en/latest/installati
 import scanpy as sc
 import scfair as scf
 
-# raw integer counts in .X or layers["counts"]
+# the default seurat_v3 flavor expects raw integer counts
+# in .X or layers["counts"]
 scf.pp.highly_variable_genes(adata)
 # annotates adata.var["highly_variable"]; keep the full gene matrix
 # (scanpy PCA uses that mask by default — no manual subset step)
@@ -83,7 +85,7 @@ print(est.n_populations, est.confidence)
 
 ## Status
 
-**0.10.0 (Beta).** Import as `import scfair as scf` and use names in
+**0.10.1 (Beta).** Import as `import scfair as scf` and use names in
 `scfair.__all__` and `scf.pp`. See the
 [API reference](https://scfair.readthedocs.io/en/latest/api/index.html).
 
@@ -114,7 +116,7 @@ If you use scFair in published work, please cite the preprint:
 ```
 
 For the software record, cite the [Zenodo DOI](https://doi.org/10.5281/zenodo.21761251).
-Pin the package version used in the analysis, for example `scfair==0.10.0`.
+Pin the package version used in the analysis, for example `scfair==0.10.1`.
 See `CITATION.cff`.
 
 ## License

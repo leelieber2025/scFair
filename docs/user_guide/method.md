@@ -8,15 +8,15 @@ secondary. The 18-dataset panel is in the
 
 ## List size
 
-There is no a priori correct `n`. Copying 2000 is easy and often close;
-it is still a guess.
+There is no universally correct `n`. A fixed value of 2,000 is common and
+often reasonable, but it is not data-adaptive.
 
 `n_top_genes="auto"` (the default) estimates a base size `k` from a
 short multi-seed view of cell density after PCA / neighbors. It is not
 a second variance formula. Low density confidence floors a short list
 to 2000. Multi-core short geometry can keep a short base. Bounds are
-`n_top_min` / `n_top_max` (500–5000). The call is several graph builds,
-so a large object is slower than `n_top_genes=2000`.
+`n_top_min` / `n_top_max` (500–5000). The estimator builds several graphs,
+so it is slower on large datasets than a fixed `n_top_genes=2000` call.
 
 | Value | Behavior |
 |-------|----------|
@@ -44,8 +44,9 @@ below a fixed cut.
 
 `balance_method="append"` keeps the global top-`k` and adds ranks
 `k+1 … k+m` from the **same** list. Nothing is pushed out of the base.
-The selected set equals `top-(k+m)`, the same genes as
-`balance_method="none"` with `n_top_genes=k+m`.
+With no gene filters or forced markers, and with enough genes available, the
+selected set equals `top-(k+m)`: the same genes as `balance_method="none"`
+with `n_top_genes=k+m`.
 
 Default `m` is 200. On `n_top_genes="auto"`, `m` may rise with the
 density-core count `n_density_pops`:
@@ -57,9 +58,12 @@ m = max(200, min(300, 200 + max(0, n_density_pops − 12) × 12))
 An explicit `HVGOptions(append_budget=N)` is never overridden.
 `balance_method="none"` (or `append_budget=0`) is pure top-`k`.
 
-Gene selection does not cluster. GiniClust and CellSIUS score
-rare-subtype genes. Append only lengthens the global HVG list. Force
-known markers with `marker_genes` if a type is still missing.
+The append step does not perform cluster-specific gene scoring. The default
+auto-size estimator does run an internal Leiden clustering on a temporary
+representation, but it does not require or alter the user's cluster labels.
+GiniClust and CellSIUS score rare-subtype genes; append only lengthens the
+global HVG list. Force known markers with `marker_genes` if a type is still
+missing.
 
 ## Default path
 

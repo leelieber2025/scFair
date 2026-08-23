@@ -21,8 +21,8 @@ identifiers:
     value: 10.64898/2026.08.08.743679
     description: bioRxiv preprint.
 license: Apache-2.0
-version: 0.10.0
-date-released: "2026-08-15"
+version: 0.10.1
+date-released: "2026-08-23"
 keywords:
   - single-cell
   - RNA-seq

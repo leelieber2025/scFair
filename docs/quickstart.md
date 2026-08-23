@@ -17,8 +17,10 @@ sc.pp.neighbors(adata)
 sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False)
 ```
 
-`adata` must hold **raw integer counts** in `.X` or `layers["counts"]`.
-Pass `layer=` if they live somewhere else. Do not subset to HVGs;
+The default `flavor="seurat_v3"` requires **raw integer counts** in `.X` or
+`layers["counts"]`. Pass `layer=` if they live somewhere else. The
+`flavor="seurat"` and `flavor="cell_ranger"` methods instead expect
+log-transformed data, as they do in Scanpy. Do not subset to HVGs;
 `sc.tl.pca` uses `var["highly_variable"]`.
 
 ```python
@@ -27,8 +29,10 @@ print(adata.uns["scfair"]["hvg"].get("auto_message"))
 ```
 
 Default path: `flavor="seurat_v3"` ranking, `n_top_genes="auto"` for the
-base size `k`, then about 200 genes from the same ranking. Final size is
-`k + append_budget`. Auto is slower than a fixed `k`.
+base size `k`, then about 200 genes from the same ranking. When enough eligible
+genes are available, the final size is `k + append_budget`; filters, forced
+markers, and the number of genes in the matrix can change it. Auto is slower
+than a fixed `k`.
 
 ```python
 # protocol already fixes the length (still appends)

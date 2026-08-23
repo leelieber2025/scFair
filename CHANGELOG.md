@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-23
+
+### Fixed
+
+- Auto-n no longer emits NumPy empty-slice runtime warnings when a seed has no
+  finite valley or gap measurements.
+
+### Documentation
+
+- Corrected the description of the internal Leiden step used by auto-n.
+- Clarified the expected input scale for each Scanpy HVG flavor and qualified
+  final gene-count guarantees when filters or marker constraints apply.
+- Standardized public documentation on professional American English.
+
+### Packaging
+
+- Updated license metadata to the current SPDX form.
+
 ## [0.10.0] - 2026-08-15
 
 ### Fixed

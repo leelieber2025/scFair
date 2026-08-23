@@ -891,16 +891,19 @@ def _structure_features_from_embedding(
                 parent[lo] = hi
             ri = find(i)
 
-    arr = np.asarray(valleys, dtype=float) if valleys else np.array([np.nan])
+    arr = np.asarray(valleys, dtype=float)
+    finite_valleys = arr[np.isfinite(arr)]
+    valley_median = float(np.median(finite_valleys)) if finite_valleys.size else float("nan")
+    valley_mean = float(np.mean(finite_valleys)) if finite_valleys.size else float("nan")
     est = population_count_from_embedding(X3, depth=DEFAULT_DEPTH, bandwidth=bw)
     return {
         "n_obs": int(n_obs),
         "n_leiden": int(len(active)),
         "n_density_pops": int(est.n_populations or 0),
-        "valley_median": float(np.nanmedian(arr)),
-        "valley_mean": float(np.nanmean(arr)),
+        "valley_median": valley_median,
+        "valley_mean": valley_mean,
         "frac_shallow": (
-            float(np.mean(arr < DEFAULT_DEPTH)) if np.isfinite(arr).any() else float("nan")
+            float(np.mean(finite_valleys < DEFAULT_DEPTH)) if finite_valleys.size else float("nan")
         ),
         "mean_stability": mean_stab,
         "min_stability": min_stab,
