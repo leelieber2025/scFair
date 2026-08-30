@@ -190,7 +190,7 @@ import scfair as scf
 print(scf.__version__)
 ```
 
-Pin it, for example `scfair==0.10.0`. Cite the
+Pin it, for example `scfair==0.10.2`. Cite the
 [preprint](https://www.biorxiv.org/content/10.64898/2026.08.08.743679v1)
 (doi:[10.64898/2026.08.08.743679](https://doi.org/10.64898/2026.08.08.743679))
 and the software record

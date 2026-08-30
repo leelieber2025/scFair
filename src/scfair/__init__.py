@@ -32,6 +32,7 @@ Usage::
 from . import pp
 from ._version import __version__
 from .pp import (
+    HVGOptions,
     diagnose_from_labels,
     estimate_n_populations,
     highly_variable_genes,
@@ -42,6 +43,7 @@ __all__ = [
     "__version__",
     "pp",
     "highly_variable_genes",
+    "HVGOptions",
     "diagnose_from_labels",
     "estimate_n_populations",
     "restore_raw_counts",

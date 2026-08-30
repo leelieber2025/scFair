@@ -20,6 +20,10 @@ count:
 | **How many genes (`n`)?** | Fixed `2000` | **`n_top_genes="auto"`** (default) estimates a base size from multi-seed density structure. Pass an int when a protocol already fixes `n`. Auto is slower than a fixed `k`. |
 | **Hard top-`k` cutoff** | Rank globally and keep top-`k` | Default **`append`** keeps the global top-`k` and adds the next `append_budget` genes from the same ranking (`top-(k+m)`). Use `balance_method="none"` for exact top-`k`. |
 
+`append` is a longer same-rank list (`top-(k+m)`), not a rare-subpopulation
+marker method (unlike GiniClust / CellSIUS). Pass `marker_genes` if a type is
+still unresolved.
+
 Optional: **`estimate_n_populations`** counts populations from a 3D density
 field after `sc.pp.neighbors`. It works best on well-separated data with up to
 about 20 populations.
@@ -85,7 +89,7 @@ print(est.n_populations, est.confidence)
 
 ## Status
 
-**0.10.1 (Beta).** Import as `import scfair as scf` and use names in
+**0.10.2 (Beta).** Import as `import scfair as scf` and use names in
 `scfair.__all__` and `scf.pp`. See the
 [API reference](https://scfair.readthedocs.io/en/latest/api/index.html).
 
@@ -116,7 +120,7 @@ If you use scFair in published work, please cite the preprint:
 ```
 
 For the software record, cite the [Zenodo DOI](https://doi.org/10.5281/zenodo.21761251).
-Pin the package version used in the analysis, for example `scfair==0.10.1`.
+Pin the package version used in the analysis, for example `scfair==0.10.2`.
 See `CITATION.cff`.
 
 ## License

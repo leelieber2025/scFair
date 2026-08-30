@@ -39,6 +39,21 @@ def _clip_k(k: int, k_min: int, k_max: int, n_genes: int) -> int:
     return int(max(k_min_eff, min(int(k), k_max_eff)))
 
 
+def _as_density_count(value: Any) -> float:
+    """Coerce a density-core count; missing/failed estimates stay NaN, not 0.
+
+    ``int(n_populations or 0)`` turned ``too_few_cells`` (None) into a finite
+    nd=0, which the LONG rule treats as a real few-core count.
+    """
+    if value is None:
+        return float("nan")
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return fv if np.isfinite(fv) else float("nan")
+
+
 def _annotate_k_bound_clamp(
     k: int,
     k_source: str,
@@ -147,7 +162,7 @@ def explain_structure_rule(
     *,
     valley_median: float,
     frac_shallow: float,
-    n_density_pops: int,
+    n_density_pops: int | float | None,
     mean_stability: float | None = None,
     min_stability: float | None = None,
     n_obs: int | None = None,
@@ -202,7 +217,7 @@ def explain_structure_rule(
 
     vm = float(valley_median)
     fs = float(frac_shallow)
-    nd = float(n_density_pops)
+    nd = _as_density_count(n_density_pops)
     ms = float(mean_stability) if mean_stability is not None else float("nan")
     mu = float(min_stability) if min_stability is not None else float("nan")
     n_cells = int(n_obs) if n_obs is not None else None
@@ -467,7 +482,7 @@ def select_n_top_from_structure(
     *,
     valley_median: float,
     frac_shallow: float,
-    n_density_pops: int,
+    n_density_pops: int | float | None,
     mean_stability: float | None = None,
     min_stability: float | None = None,
     n_obs: int | None = None,
@@ -899,7 +914,7 @@ def _structure_features_from_embedding(
     return {
         "n_obs": int(n_obs),
         "n_leiden": int(len(active)),
-        "n_density_pops": int(est.n_populations or 0),
+        "n_density_pops": (int(est.n_populations) if est.n_populations is not None else None),
         "valley_median": valley_median,
         "valley_mean": valley_mean,
         "frac_shallow": (
@@ -1012,7 +1027,7 @@ def _aggregate_structure_features(feats: Sequence[dict[str, Any]]) -> dict[str, 
     out: dict[str, Any] = {
         "n_obs": int(feats[0].get("n_obs") or 0),
         "n_leiden": _nanmed_int("n_leiden") or 0,
-        "n_density_pops": nd if nd is not None else 0,
+        "n_density_pops": nd,
         "valley_median": _nanmed("valley_median"),
         "valley_mean": _nanmed("valley_mean"),
         "frac_shallow": _nanmed("frac_shallow"),
@@ -1093,7 +1108,7 @@ def _apply_short_floor_if_needed(
     k: int,
     k_source: str,
     n_obs: int | None,
-    n_density_pops: int,
+    n_density_pops: int | float | None,
     density_confidence: str | None,
     density_depth_sensitivity: int | None,
     k_min: int,
@@ -1112,7 +1127,7 @@ def _apply_short_floor_if_needed(
     k_cur = int(k)
     conf = str(density_confidence).lower() if density_confidence else None
     n_cells = int(n_obs) if n_obs is not None else None
-    nd = float(n_density_pops)
+    nd = _as_density_count(n_density_pops)
     floor_k = int(short_floor_k)
     high_nd = bool(np.isfinite(nd) and nd >= float(TRUE_SHORT_ND_MIN))
 
@@ -1259,7 +1274,7 @@ def estimate_n_top_structure(
         k_i = select_n_top_from_structure(
             valley_median=feat_i.get("valley_median", float("nan")),
             frac_shallow=feat_i.get("frac_shallow", float("nan")),
-            n_density_pops=int(feat_i.get("n_density_pops") or 0),
+            n_density_pops=_as_density_count(feat_i.get("n_density_pops")),
             mean_stability=feat_i.get("mean_stability"),
             min_stability=feat_i.get("min_stability"),
             n_obs=feat_i.get("n_obs"),
@@ -1292,7 +1307,7 @@ def estimate_n_top_structure(
     rule_kw = dict(
         valley_median=feat.get("valley_median", float("nan")),
         frac_shallow=feat.get("frac_shallow", float("nan")),
-        n_density_pops=int(feat.get("n_density_pops") or 0),
+        n_density_pops=_as_density_count(feat.get("n_density_pops")),
         mean_stability=feat.get("mean_stability"),
         min_stability=feat.get("min_stability"),
         n_obs=feat.get("n_obs"),
@@ -1319,7 +1334,7 @@ def estimate_n_top_structure(
         k=int(k),
         k_source=k_source,
         n_obs=feat.get("n_obs"),
-        n_density_pops=int(feat.get("n_density_pops") or 0),
+        n_density_pops=_as_density_count(feat.get("n_density_pops")),
         density_confidence=feat.get("density_confidence"),
         density_depth_sensitivity=feat.get("density_depth_sensitivity"),
         k_min=k_min,

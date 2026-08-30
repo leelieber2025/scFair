@@ -16,5 +16,5 @@ Preprint: [https://www.biorxiv.org/content/10.64898/2026.08.08.743679v1](https:/
 ```
 
 Software record: [10.5281/zenodo.21761251](https://doi.org/10.5281/zenodo.21761251).
-Pin the package version used in the analysis, for example `scfair==0.10.0`.
+Pin the package version used in the analysis, for example `scfair==0.10.2`.
 See `CITATION.cff` in the repository.

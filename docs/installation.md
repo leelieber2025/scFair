@@ -21,7 +21,7 @@ import scfair as scf
 print(scf.__version__)
 ```
 
-The version string is `src/scfair/_version.py` (currently **0.10.0**).
+The version string is `src/scfair/_version.py` (currently **0.10.2**).
 
 ```bash
 git clone https://github.com/leelieber2025/scFair.git

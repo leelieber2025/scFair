@@ -1,7 +1,7 @@
-"""Private raw-count snapshot helpers used by ``highly_variable_genes``.
+"""Raw-count snapshot helpers used by ``highly_variable_genes``.
 
-Not part of the public API. Users should only call
-:func:`scfair.pp.highly_variable_genes`.
+:func:`restore_raw_counts` is public (also re-exported as
+``scfair.restore_raw_counts``). The rest of this module is package-private.
 
 Design (package-private):
 
@@ -518,9 +518,10 @@ def _prepare_counts_layer(
     counts_layer
         Default name when creating a new counts layer.
     store_raw
-        ``False`` (default): only ensure ``layers[counts_layer]`` — no second
-        full matrix in ``uns`` (avoids ~3× h5ad bloat). ``True``: inline
-        snapshot; ``"ondisk"``: write h5ad sidecar at ``snapshot_path``.
+        ``False`` (default): stage counts on an internal layer when needed;
+        do not invent a public ``layers['counts']``. ``True``: also write
+        the public counts layer plus an inline uns snapshot; ``"ondisk"``:
+        write an h5ad sidecar at ``snapshot_path``.
     snapshot_path
         Required when ``store_raw="ondisk"``.
     """
@@ -662,21 +663,28 @@ def _prepare_counts_layer(
         and np.array_equal(raw_attr.var_names, adata.var_names)
     )
     if x_int or raw_ok:
-        _store_raw_counts(
-            adata,
-            layer=counts_layer,
-            mode="auto",
-            overwrite=False,
-            sidecar=sidecar,
-            snapshot_path=snapshot_path,
-        )
-        if counts_layer not in adata.layers:
-            raise ValueError(
-                "Could not prepare a counts layer for highly_variable_genes. "
-                "Provide raw integer counts in adata.X or adata.layers['counts'], "
-                "or pass layer= explicitly."
+        if sidecar:
+            _store_raw_counts(
+                adata,
+                layer=counts_layer,
+                mode="auto",
+                overwrite=False,
+                sidecar=sidecar,
+                snapshot_path=snapshot_path,
             )
-        return counts_layer
+            if counts_layer not in adata.layers:
+                raise ValueError(
+                    "Could not prepare a counts layer for highly_variable_genes. "
+                    "Provide raw integer counts in adata.X or adata.layers['counts'], "
+                    "or pass layer= explicitly."
+                )
+            return counts_layer
+        # Default path: do not invent a public layers['counts'] (downstream
+        # tools treat that name as raw UMI counts). Stage internally; the
+        # HVG caller pops INTERNAL_COUNTS_LAYER after the run.
+        src = adata.X if x_int else raw_attr.X
+        adata.layers[INTERNAL_COUNTS_LAYER] = src.copy() if hasattr(src, "copy") else src
+        return INTERNAL_COUNTS_LAYER
 
     # Non-integer .X, no raw recovery: stage on the internal key only (same
     # policy as fingerprint-mismatch). Caller pops INTERNAL_COUNTS_LAYER.

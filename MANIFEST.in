@@ -14,6 +14,8 @@ include .readthedocs.yaml
 graft tests
 graft docs
 prune docs/_build
+# Executed tutorial notebooks are large; keep markdown docs in the sdist.
+recursive-exclude docs *.ipynb
 prune bak
 global-exclude *.docx
 

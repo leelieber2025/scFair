@@ -665,8 +665,12 @@ def highly_variable_genes(
                 extra=marker_extra,
             )
 
+        # Stringify both sides, matching _merge_markers. Raw `g in var_names`
+        # misses string markers against a RangeIndex (n_marker_genes=0 while
+        # markers are still selected).
+        var_set = set(map(str, adata.var_names))
         n_markers_present = (
-            0 if marker_genes is None else int(sum(g in adata.var_names for g in marker_genes))
+            0 if marker_genes is None else int(sum(str(g) in var_set for g in marker_genes))
         )
         from dataclasses import asdict as _asdict
 
@@ -843,8 +847,20 @@ def highly_variable_genes(
         adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
 
         if subset and inplace:
-            # Same private API scanpy uses; anndata has no public inplace subset.
-            adata._inplace_subset_var(adata.var["highly_variable"].to_numpy())
+            mask = adata.var["highly_variable"].to_numpy()
+            # AnnData has no public in-place var subset. Scanpy mutates the
+            # same object via this private method; keep that as the primary
+            # path so object identity and views stay correct. Fall back if
+            # the private API is missing.
+            try:
+                adata._inplace_subset_var(mask)
+            except (AttributeError, TypeError):
+                subsetted = adata[:, mask].copy()
+                init = getattr(adata, "_init_as_actual", None)
+                if callable(init):
+                    init(subsetted)
+                else:  # pragma: no cover
+                    raise
 
         if not inplace:
             return result

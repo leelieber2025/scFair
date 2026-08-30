@@ -6,6 +6,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-08-29
+
+### Fixed
+
+- Failed density-core estimates (`n_populations is None`, e.g. too few cells)
+  are no longer stored as `n_density_pops=0`. A finite zero looked like a real
+  few-core count and could take the `long_shallow_few_cores` branch instead of
+  falling through to the existing `default_2000` rule. Product default remains
+  `n_top_genes="auto"`.
+- Marker presence metadata (`n_marker_genes`) now stringifies names the same
+  way `_merge_markers` does, so RangeIndex `var_names` with string
+  `marker_genes` no longer reports 0 present markers while still selecting them.
+
+### Changed
+
+- Default HVG no longer writes a public `layers["counts"]` unless
+  `store_raw=True`. Counts needed for the call are staged on the internal
+  `_scfair_counts` layer (already popped after the run).
+- `HVGOptions` is re-exported from the top-level `scfair` package.
+- Source distribution no longer ships executed tutorial notebooks.
+
+### Documentation
+
+- README: `append` is a longer same-rank `top-(k+m)` list, not GiniClust-style
+  rare-marker recovery (matches the FAQ).
+- Version pins in the docs and `CITATION.cff` updated to 0.10.2. Tutorials
+  were last re-executed on 0.9.0.
+
 ## [0.10.1] - 2026-08-23
 
 ### Fixed

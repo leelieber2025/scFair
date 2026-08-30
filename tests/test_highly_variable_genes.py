@@ -48,7 +48,10 @@ def test_hvg_global_only(adata_for_hvg):
     ad = adata_for_hvg.copy()
     scf.pp.highly_variable_genes(ad, n_top_genes=30, balance_method="none", flavor="seurat_v3")
     assert int(ad.var["highly_variable"].sum()) == 30
-    assert "counts" in ad.layers
+    assert "counts" not in ad.layers
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER
+
+    assert INTERNAL_COUNTS_LAYER not in ad.layers
     sc = ad.uns.get(UNS_KEY, {})
     assert "raw_snapshot" not in sc
     assert ad.uns[UNS_KEY]["hvg"]["balance_method"] == "none"
@@ -279,6 +282,7 @@ def test_hvg_store_raw_true_writes_snapshot(adata_for_hvg):
     assert "raw_snapshot" in ad.uns[UNS_KEY]
     assert ad.uns[UNS_KEY]["raw_snapshot"]["backend"] == "inline"
     assert ad.uns[UNS_KEY]["hvg"]["store_raw"] is True
+    assert "counts" in ad.layers
 
 
 def test_hvg_preserves_preexisting_snapshot_when_store_raw_false(adata_for_hvg):
@@ -518,6 +522,8 @@ def test_selected_genes_golden_stable():
 def test_public_api_surface():
     assert "highly_variable_genes" in scf.pp.__all__
     assert "HVGOptions" in scf.pp.__all__
+    assert "HVGOptions" in scf.__all__
+    assert scf.HVGOptions is scf.pp.HVGOptions
     assert "restore_raw_counts" in scf.pp.__all__
     assert "recommend_cluster_resolution" not in scf.pp.__all__
     assert "estimate_n_top_structure" not in scf.pp.__all__
@@ -810,3 +816,29 @@ def test_store_raw_ignored_when_inplace_false(adata_for_hvg):
             options=HVGOptions(store_raw=True),
         )
     assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
+
+
+def test_marker_presence_counts_rangeindex_var_names():
+    """String markers vs RangeIndex var_names must count as present."""
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    X = rng.poisson(2, size=(80, 40)).astype(np.float64)
+    X[:20, 0] = 30
+    adata = ad.AnnData(X)
+    adata.var_names = pd.RangeIndex(adata.n_vars)
+    scf.pp.highly_variable_genes(
+        adata,
+        n_top_genes=10,
+        flavor="seurat",
+        balance_method="none",
+        marker_genes=["0", "1", "2"],
+        diagnose=False,
+        progress=False,
+    )
+    meta = adata.uns[UNS_KEY]["hvg"]
+    assert meta["n_marker_genes"] == 3
+    selected = {str(g) for g in adata.var_names[adata.var["highly_variable"].to_numpy()]}
+    assert {"0", "1", "2"} <= selected
+    assert meta["n_marker_genes_already_selected"] is not None
+    assert meta["n_marker_genes_already_selected"] >= 0

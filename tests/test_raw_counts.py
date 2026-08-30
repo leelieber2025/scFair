@@ -9,6 +9,7 @@ import scipy.sparse as sp
 
 from scfair._utils import UNS_KEY, _is_integer_counts_like, resolve_aligned_raw_counts
 from scfair.pp._raw_counts import (
+    INTERNAL_COUNTS_LAYER,
     _prepare_counts_layer,
     _restore_raw_counts,
     _store_raw_counts,
@@ -192,10 +193,11 @@ def test_ondisk_sidecar(adata_counts, tmp_path):
 
 def test_prepare_counts_layer(adata_counts):
     ad = adata_counts.copy()
-    # Default: counts layer only, no uns raw_snapshot (avoids 3× h5ad bloat).
+    # Default: internal layer only, no public layers['counts'], no uns snapshot.
     name = _prepare_counts_layer(ad)
-    assert name == "counts"
-    assert "counts" in ad.layers
+    assert name == INTERNAL_COUNTS_LAYER
+    assert "counts" not in ad.layers
+    assert INTERNAL_COUNTS_LAYER in ad.layers
     assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
 
 
@@ -247,6 +249,8 @@ def test_public_api_exports_restore_not_store():
     assert "restore_raw_counts" in pp.__all__
     assert "highly_variable_genes" in scf.__all__
     assert "highly_variable_genes" in pp.__all__
+    assert "HVGOptions" in scf.__all__
+    assert scf.HVGOptions is pp.HVGOptions
     # Implementation details not exported
     assert "recommend_cluster_resolution" not in pp.__all__
     assert "estimate_n_top_structure" not in pp.__all__
@@ -407,7 +411,7 @@ def test_explicit_layer_does_not_materialize_into_counts():
     import anndata as ad
     import numpy as np
 
-    from scfair.pp._raw_counts import _prepare_counts_layer
+    from scfair.pp._raw_counts import INTERNAL_COUNTS_LAYER, _prepare_counts_layer
 
     rng = np.random.default_rng(2)
     X = rng.poisson(1.0, size=(40, 15)).astype(np.float32)
@@ -421,9 +425,10 @@ def test_explicit_layer_does_not_materialize_into_counts():
     assert "counts" not in adata.layers
 
     used = _prepare_counts_layer(adata)  # default
-    assert used == "counts"
-    # Default path materialises from .X, not from the prior layer='alt' call.
-    assert np.array_equal(np.asarray(adata.layers["counts"]), np.asarray(X))
+    assert used == INTERNAL_COUNTS_LAYER
+    assert "counts" not in adata.layers
+    # Default path stages .X internally, not the prior layer='alt' matrix.
+    assert np.array_equal(np.asarray(adata.layers[INTERNAL_COUNTS_LAYER]), np.asarray(X))
 
 
 def test_stale_counts_uses_internal_layer_preserves_user_counts():
@@ -442,7 +447,9 @@ def test_stale_counts_uses_internal_layer_preserves_user_counts():
     adata.obs_names = [f"c{i}" for i in range(40)]
     adata.var_names = [f"g{i}" for i in range(15)]
 
-    assert _prepare_counts_layer(adata) == "counts"
+    used0 = _prepare_counts_layer(adata)
+    assert used0 == INTERNAL_COUNTS_LAYER
+    assert "counts" not in adata.layers
     # User replaces .X and also keeps a distinct intentional counts matrix.
     adata.X = X2
     adata.layers["counts"] = counts_b.copy()

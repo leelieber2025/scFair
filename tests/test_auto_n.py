@@ -342,7 +342,7 @@ def test_aggregate_skips_failed_seed_sentinels():
     assert out["n_density_pops"] == 15
     assert out["reason"] == "ok_aggregated"
     all_fail = _aggregate_structure_features([failed, dict(failed)])
-    assert all_fail["n_density_pops"] == 0
+    assert all_fail["n_density_pops"] is None
     assert all_fail["reason"] == "too_few_pcs"
 
 
@@ -553,6 +553,17 @@ def test_structure_missing_nd_falls_back_to_2000():
     )
     assert d["n_top"] == 2000
     assert d["rule_branch"].startswith("default_2000")
+
+    d_none = explain_structure_rule(
+        valley_median=0.03,
+        frac_shallow=1.0,
+        n_density_pops=None,
+        mean_stability=0.85,
+        density_confidence="high",
+    )
+    assert d_none["n_top"] == 2000
+    assert d_none["rule_branch"].startswith("default_2000")
+    assert "long_shallow" not in d_none["rule_branch"]
 
 
 def test_structure_v5_large_atlas_floor():
@@ -942,3 +953,61 @@ def test_explain_structure_rule_matches_selector():
         assert explain_structure_rule(**kw, version=ver)["n_top"] == select_n_top_from_structure(
             **kw, version=ver
         )
+
+
+def test_failed_density_count_stays_none_through_extraction(monkeypatch):
+    """Failed density (n_populations is None) must not become nd=0.
+
+    Finite nd=0 plus shallow valleys can take long_shallow_few_cores instead of
+    the existing default_2000 fall-through. Exercise the real extraction path
+    (``_structure_features_from_embedding``), not only a NaN feature dict.
+    """
+    import anndata as ad
+    import scanpy as sc
+
+    from scfair.pp._auto_n import (
+        _aggregate_structure_features,
+        _structure_features_from_embedding,
+        explain_structure_rule,
+    )
+    from scfair.pp._granularity import GranularityEstimate
+
+    rng = np.random.default_rng(0)
+    n_obs, n_vars = 40, 30
+    X = rng.normal(size=(n_obs, n_vars)).astype(np.float64)
+    e = ad.AnnData(X)
+    e.obs_names = [f"c{i}" for i in range(n_obs)]
+    e.var_names = [f"g{i}" for i in range(n_vars)]
+    n_pcs = min(10, n_obs - 1, n_vars - 1)
+    sc.tl.pca(e, n_comps=n_pcs, svd_solver="arpack", random_state=0)
+    sc.pp.neighbors(e, n_neighbors=min(10, n_obs - 1), n_pcs=n_pcs, random_state=0)
+
+    def _fail_density(embedding, **kwargs):
+        return GranularityEstimate(None, "too_few_cells", depth=0.5, bandwidth=30)
+
+    monkeypatch.setattr(
+        "scfair.pp._granularity.population_count_from_embedding",
+        _fail_density,
+    )
+
+    feat = _structure_features_from_embedding(e, n_obs=n_obs, random_state=0, min_cluster_size=5)
+    assert feat["n_density_pops"] is None
+
+    agg = _aggregate_structure_features([feat, dict(feat)])
+    assert agg["n_density_pops"] is None
+
+    d = explain_structure_rule(
+        valley_median=0.03,
+        frac_shallow=1.0,
+        n_density_pops=feat["n_density_pops"],
+        mean_stability=0.85,
+        min_stability=feat.get("min_stability"),
+        n_obs=n_obs,
+        n_leiden=feat.get("n_leiden"),
+        density_confidence=feat.get("density_confidence"),
+        n_genes=n_vars,
+        k_min=10,
+        k_max=40,
+    )
+    assert d["rule_branch"].startswith("default_2000")
+    assert "long_shallow" not in d["rule_branch"]
