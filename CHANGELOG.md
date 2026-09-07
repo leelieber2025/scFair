@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-09-07
+
+### Fixed
+
+- Count sources and snapshots are compared by actual matrix values rather than
+  column-sum fingerprints, detecting changes that preserve gene totals.
+- NumPy arrays and pandas indexes are accepted as marker sequences; repeated
+  marker names are counted once. Bare strings are rejected.
+- Structure auto-n normalizes by full input library totals before subsetting
+  HVGs, matching the downstream full-library workflow. This can change
+  inferred geometry and selected gene budgets.
+- Internal structure HVG fitting errors propagate to the caller instead of
+  silently constructing an embedding with all genes.
+
+### Changed
+
+- Gene budgets must be positive integers or `"auto"` / `"structure"`.
+  Floats, numeric strings, and NumPy booleans are rejected before modifying
+  the input, closing a validation bypass for zero and negative budgets.
+
+### Packaging
+
+- Require setuptools >=77.0.0 for the SPDX license expression and
+  `project.license-files` metadata used by the build.
+
 ## [0.10.2] - 2026-08-29
 
 ### Fixed

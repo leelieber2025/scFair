@@ -304,33 +304,33 @@ def test_explicit_layer_wins_over_an_existing_counts_layer():
     assert np.array_equal(adata.layers["counts"], np.zeros_like(X))
 
 
-def test_matrix_fingerprint_uses_column_sums():
+def test_count_matrices_equal_rejects_different_column_values():
     """Same global sum but different column distribution must not collide."""
-    from scfair.pp._raw_counts import _matrix_fingerprint
+    from scfair.pp._raw_counts import _count_matrices_equal
 
     a = np.array([[1, 0, 0], [1, 0, 0], [0, 0, 0]], dtype=float)
     b = np.array([[0, 0, 1], [0, 0, 1], [0, 0, 0]], dtype=float)
     assert a.sum() == b.sum()
     assert a.shape == b.shape
     assert int(np.count_nonzero(a)) == int(np.count_nonzero(b))
-    assert _matrix_fingerprint(a) != _matrix_fingerprint(b)
-    assert _matrix_fingerprint(a) == _matrix_fingerprint(a.copy())
+    assert not _count_matrices_equal(a, b)
+    assert _count_matrices_equal(a, a.copy())
 
 
-def test_matrix_fingerprint_ignores_storage_format():
-    """Dense vs CSR of the same counts must fingerprint equal (no false mismatch)."""
+def test_count_matrices_equal_ignores_storage_format():
+    """Dense vs CSR of the same counts must compare equal (no false mismatch)."""
     import scipy.sparse as sp
 
     from scfair.pp._raw_counts import (
         INTERNAL_COUNTS_LAYER,
-        _matrix_fingerprint,
+        _count_matrices_equal,
         _prepare_counts_layer,
     )
 
     rng = np.random.default_rng(7)
     dense = rng.poisson(2.0, size=(50, 30)).astype(np.float32)
     sparse = sp.csr_matrix(dense)
-    assert _matrix_fingerprint(dense) == _matrix_fingerprint(sparse)
+    assert _count_matrices_equal(dense, sparse)
 
     # End-to-end: mixed format with identical content must keep layers['counts'].
     import anndata as ad
@@ -344,15 +344,15 @@ def test_matrix_fingerprint_ignores_storage_format():
     assert INTERNAL_COUNTS_LAYER not in adata.layers
 
 
-def test_matrix_fingerprint_ignores_sparse_explicit_zeros():
+def test_count_matrices_equal_ignores_sparse_explicit_zeros():
     import scipy.sparse as sp
 
-    from scfair.pp._raw_counts import _matrix_fingerprint
+    from scfair.pp._raw_counts import _count_matrices_equal
 
     dense = np.array([[1.0, 0.0], [0.0, 2.0]])
     # Same values, but store an explicit structural zero.
     spx = sp.csr_matrix(([1.0, 0.0, 2.0], ([0, 0, 1], [0, 1, 1])), shape=(2, 2))
-    assert _matrix_fingerprint(dense) == _matrix_fingerprint(spx)
+    assert _count_matrices_equal(dense, spx)
 
 
 def test_noninteger_counts_layer_with_integer_x_uses_internal():
@@ -432,7 +432,7 @@ def test_explicit_layer_does_not_materialize_into_counts():
 
 
 def test_stale_counts_uses_internal_layer_preserves_user_counts():
-    """Fingerprint mismatch: use .X via _scfair_counts; never clobber user layer."""
+    """Count mismatch: use .X via _scfair_counts; never clobber user layer."""
     import anndata as ad
     import numpy as np
     import pytest
@@ -561,3 +561,50 @@ def test_full_genes_from_raw_without_snapshot(adata_counts):
     full = scf.pp.restore_raw_counts(sub, full_genes=True)
     assert full.n_vars == n_full
     assert full.n_obs == sub.n_obs
+
+
+@pytest.mark.parametrize("sparse_input", [False, True])
+def test_stale_counts_with_identical_marginals(sparse_input):
+    import anndata as ad
+
+    original = np.array([[1., 4.], [4., 1.]])
+    changed = np.array([[4., 1.], [1., 4.]])
+    convert = sp.csr_matrix if sparse_input else np.asarray
+    a = ad.AnnData(convert(changed))
+    a.layers["counts"] = convert(original.copy())
+    with pytest.warns(UserWarning, match="differs"):
+        used = _prepare_counts_layer(a)
+    assert used == INTERNAL_COUNTS_LAYER
+    actual = a.layers[used]
+    np.testing.assert_array_equal(actual.toarray() if sparse_input else actual, changed)
+    preserved = a.layers["counts"]
+    np.testing.assert_array_equal(preserved.toarray() if sparse_input else preserved, original)
+
+
+def test_count_comparison_handles_sparse_duplicate_entries():
+    from scfair.pp._raw_counts import _count_matrices_equal
+
+    dense = np.array([[3., 0.], [0., 4.]])
+    duplicated = sp.csr_matrix(
+        (np.array([1., 2., 4.]), np.array([0, 0, 1]), np.array([0, 2, 3])),
+        shape=(2, 2),
+    )
+    before = duplicated.data.copy()
+    assert _count_matrices_equal(duplicated, dense)
+    np.testing.assert_array_equal(duplicated.data, before)
+
+
+@pytest.mark.parametrize("ondisk", [False, True])
+def test_snapshot_matching_checks_cells_not_just_gene_totals(tmp_path, ondisk):
+    import anndata as ad
+
+    from scfair.pp._raw_counts import _snapshot_matches_matrix, _store_raw_snapshot
+
+    a = ad.AnnData(np.array([[1., 4.], [4., 1.]]))
+    _store_raw_snapshot(
+        a, a.X, overwrite=True, ondisk=ondisk,
+        snapshot_path=str(tmp_path / "counts.h5ad") if ondisk else None,
+    )
+    snap = a.uns[UNS_KEY]["raw_snapshot"]
+    assert _snapshot_matches_matrix(snap, a, a.X)
+    assert not _snapshot_matches_matrix(snap, a, a.X[::-1].copy())

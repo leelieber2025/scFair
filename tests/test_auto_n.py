@@ -1011,3 +1011,54 @@ def test_failed_density_count_stays_none_through_extraction(monkeypatch):
     )
     assert d["rule_branch"].startswith("default_2000")
     assert "long_shallow" not in d["rule_branch"]
+
+
+def test_structure_embedding_uses_full_library_counts():
+    import anndata as ad
+    from scipy import sparse
+
+    from scfair.pp._auto_n import _prepare_structure_embedding
+
+    rng = np.random.default_rng(42)
+    counts = rng.poisson(rng.uniform(0.2, 12, size=(80, 120))).astype(np.float64)
+    counts[:40, 60:] *= 8
+    for sparse_input in (False, True):
+        for counts_layer in ("counts", "raw_umi"):
+            matrix = sparse.csr_matrix(counts) if sparse_input else counts.copy()
+            a = ad.AnnData(X=matrix * 0.25)
+            a.layers[counts_layer] = matrix.copy()
+            e, failure = _prepare_structure_embedding(a, counts_layer=counts_layer, n_hvg=40)
+            assert failure == {}
+            assert e.n_vars == 40
+            indices = a.var_names.get_indexer(e.var_names)
+            expected = np.log1p(counts[:, indices] * (1e4 / counts.sum(axis=1))[:, None])
+            observed = e.X.toarray() if sparse_input else e.X
+            np.testing.assert_allclose(observed, expected, rtol=1e-6)
+            assert sparse.issparse(e.X) == sparse_input
+            assert not e.layers
+            assert "connectivities" in e.obsp
+            actual_counts = a.layers[counts_layer]
+            np.testing.assert_array_equal(
+                actual_counts.toarray() if sparse_input else actual_counts, counts
+            )
+            np.testing.assert_array_equal(
+                a.X.toarray() if sparse_input else a.X, counts * 0.25
+            )
+            assert "highly_variable" not in a.var
+
+
+def test_structure_embedding_propagates_hvg_fit_failure(monkeypatch):
+    import anndata as ad
+    import pytest
+    import scanpy as sc
+
+    from scfair.pp._auto_n import _prepare_structure_embedding
+
+    a = ad.AnnData(np.ones((80, 120)))
+
+    def fail_fit(*args, **kwargs):
+        raise ValueError("HVG fit failed")
+
+    monkeypatch.setattr(sc.pp, "highly_variable_genes", fail_fit)
+    with pytest.raises(ValueError, match="HVG fit failed"):
+        _prepare_structure_embedding(a)

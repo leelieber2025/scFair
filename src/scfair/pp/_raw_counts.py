@@ -66,7 +66,7 @@ def _snapshot_matches_matrix(snap: dict[str, Any], adata: Any, mat: Any) -> bool
             )
         if "X" not in snap:
             return False
-        return _matrix_fingerprint(snap["X"]) == _matrix_fingerprint(mat)
+        return _count_matrices_equal(snap["X"], mat)
     except Exception:
         return False
 
@@ -88,7 +88,7 @@ def _ondisk_file_matches(
         return False
     if not np.array_equal(np.asarray(snap_ad.var_names).astype(str), np.asarray(var_names)):
         return False
-    return _matrix_fingerprint(snap_ad.X) == _matrix_fingerprint(mat)
+    return _count_matrices_equal(snap_ad.X, mat)
 
 
 def _record_raw_counts_metadata(adata: Any) -> None:
@@ -455,47 +455,15 @@ def _restore_raw_counts(
     return None if inplace else target
 
 
-def _matrix_fingerprint(X: Any) -> tuple[Any, ...]:
-    """Cheap content identity: shape + nnz + total + column-sum hash.
-
-    Used to detect a stale ``layers['counts']`` after the user replaced ``.X``
-    with a new integer count matrix without updating the layer. Column-sum hash
-    (adler32 of float64 col sums) catches permutations / redistributions that
-    keep the global sum unchanged.
-
-    Storage format (dense vs sparse) is **not** part of the fingerprint: the
-    same counts in CSR vs ndarray must compare equal so a format-only change
-    does not bypass the user's counts layer.
-    """
-    import zlib
-
+def _count_matrices_equal(left: Any, right: Any) -> bool:
+    """Compare count values exactly, independently of dense/sparse storage."""
     import scipy.sparse as sparse
 
-    if X is None:
-        return ("none",)
-    if sparse.issparse(X):
-        # count_nonzero, not .nnz: explicit zeros / COO duplicates must not
-        # make the same counts look different from a dense copy.
-        nnz = int(np.count_nonzero(X.data)) if X.data.size else 0
-        total = float(X.sum())
-        col_sums = np.asarray(X.sum(axis=0), dtype=np.float64).ravel()
-        shape = tuple(X.shape)
-    else:
-        arr = np.asarray(X)
-        shape = tuple(arr.shape)
-        if arr.size == 0:
-            return (shape, 0, 0.0, 0)
-        flat = arr.ravel()
-        nnz = int(np.count_nonzero(flat))
-        total = float(flat.sum())
-        col_sums = (
-            np.asarray(arr.sum(axis=0), dtype=np.float64).ravel()
-            if arr.ndim == 2
-            else np.asarray([total], dtype=np.float64)
-        )
-    # Stable across processes (unlike Python's salted hash()).
-    col_hash = int(zlib.adler32(np.ascontiguousarray(col_sums).tobytes())) & 0xFFFFFFFF
-    return (shape, nnz, total, col_hash)
+    if left.shape != right.shape:
+        return False
+    if sparse.issparse(left) or sparse.issparse(right):
+        return (sparse.csr_matrix(left) != sparse.csr_matrix(right)).nnz == 0
+    return bool(np.array_equal(left, right))
 
 
 def _prepare_counts_layer(
@@ -575,14 +543,12 @@ def _prepare_counts_layer(
     # counts layer raw) keeps the layer: .X is not integer-like.
     if counts_layer in adata.layers and _is_integer_counts_like(adata.layers[counts_layer]):
         x_int = _is_integer_counts_like(adata.X)
-        if x_int and _matrix_fingerprint(adata.layers[counts_layer]) != _matrix_fingerprint(
-            adata.X
-        ):
+        if x_int and not _count_matrices_equal(adata.layers[counts_layer], adata.X):
             # Do NOT overwrite the user layer (spliced/unspliced, dual assay,
             # ambient-corrected vs raw). Stage .X on an internal key instead.
             warnings.warn(
                 f"layers[{counts_layer!r}] differs from the current integer-like "
-                f".X (shape/nnz/column-sum fingerprint mismatch). Using .X for "
+                f".X (count values differ). Using .X for "
                 f"this call via internal layer {INTERNAL_COUNTS_LAYER!r}; "
                 f"layers[{counts_layer!r}] is left unchanged. "
                 f"To use the layer instead, pass layer={counts_layer!r}. "
@@ -687,7 +653,7 @@ def _prepare_counts_layer(
         return INTERNAL_COUNTS_LAYER
 
     # Non-integer .X, no raw recovery: stage on the internal key only (same
-    # policy as fingerprint-mismatch). Caller pops INTERNAL_COUNTS_LAYER.
+    # policy as a count mismatch). Caller pops INTERNAL_COUNTS_LAYER.
     warnings.warn(
         f"No integer counts layer found and .X does not look like raw counts. "
         f"Using .X for this call via internal layer {INTERNAL_COUNTS_LAYER!r}; "

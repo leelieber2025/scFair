@@ -89,7 +89,7 @@ print(est.n_populations, est.confidence)
 
 ## Status
 
-**0.10.2 (Beta).** Import as `import scfair as scf` and use names in
+**0.10.3 (Beta).** Import as `import scfair as scf` and use names in
 `scfair.__all__` and `scf.pp`. See the
 [API reference](https://scfair.readthedocs.io/en/latest/api/index.html).
 
@@ -120,7 +120,7 @@ If you use scFair in published work, please cite the preprint:
 ```
 
 For the software record, cite the [Zenodo DOI](https://doi.org/10.5281/zenodo.21761251).
-Pin the package version used in the analysis, for example `scfair==0.10.2`.
+Pin the package version used in the analysis, for example `scfair==0.10.3`.
 See `CITATION.cff`.
 
 ## License

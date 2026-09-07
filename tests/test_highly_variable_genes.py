@@ -842,3 +842,31 @@ def test_marker_presence_counts_rangeindex_var_names():
     assert {"0", "1", "2"} <= selected
     assert meta["n_marker_genes_already_selected"] is not None
     assert meta["n_marker_genes_already_selected"] >= 0
+
+
+@pytest.mark.parametrize("budget", [0.0, -1.0, 20.0, "0", "-1", "20", np.bool_(True)])
+def test_noninteger_budget_rejected_before_mutation(adata_for_hvg, budget):
+    a = adata_for_hvg
+    before = a.copy()
+    with pytest.raises((TypeError, ValueError), match="n_top_genes"):
+        scf.pp.highly_variable_genes(a, n_top_genes=budget, diagnose=False, progress=False)
+    pd.testing.assert_frame_equal(a.var, before.var)
+    assert dict(a.uns) == dict(before.uns)
+    assert list(a.layers) == list(before.layers)
+
+
+def test_marker_array_is_supported_and_deduplicated(adata_for_hvg):
+    a = adata_for_hvg
+    scf.pp.highly_variable_genes(
+        a, n_top_genes=10, balance_method="none",
+        marker_genes=np.array(["g78", "g79", "g78"]), diagnose=False, progress=False,
+    )
+    assert a.var.loc[["g78", "g79"], "highly_variable"].all()
+    assert a.uns[UNS_KEY]["hvg"]["n_marker_genes"] == 2
+
+
+def test_single_marker_string_rejected(adata_for_hvg):
+    with pytest.raises(TypeError, match="marker_genes"):
+        scf.pp.highly_variable_genes(
+            adata_for_hvg, n_top_genes=10, marker_genes="g78", diagnose=False,
+        )

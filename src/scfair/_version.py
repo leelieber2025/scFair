@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __all__ = ["__version__", "version", "version_tuple"]
 
-__version__ = "0.10.2"
+__version__ = "0.10.3"
 version = __version__
 
 _parts: list[int | str] = []

@@ -594,7 +594,7 @@ def _prepare_structure_embedding(
     random_state: int = 0,
     n_hvg: int = 2000,
 ) -> tuple[Any | None, dict[str, Any]]:
-    """HVG@``n_hvg`` + log1p + PCA + neighbors once (shared multi-seed base).
+    """HVG@``n_hvg`` + full-library normalization + log1p + PCA + neighbors.
 
     Returns ``(embedding_adata, fail_feat_or_empty)``. On failure,
     ``embedding_adata`` is None and the second value is a feature dict with
@@ -620,28 +620,24 @@ def _prepare_structure_embedding(
 
     n_hvg_use = min(int(n_hvg), ad0.n_vars)
     if _loess_unsafe(ad0.n_obs, ad0.n_vars) is None:
-        try:
-            sc.pp.highly_variable_genes(
-                ad0,
-                n_top_genes=n_hvg_use,
-                flavor="seurat_v3",
-                layer=layer_use,
-                subset=False,
-            )
-        except (ValueError, TypeError, RuntimeError, ArithmeticError, MemoryError):
-            # Leave all genes; structure only needs a compact embedding.
-            pass
+        sc.pp.highly_variable_genes(
+            ad0,
+            n_top_genes=n_hvg_use,
+            flavor="seurat_v3",
+            layer=layer_use,
+            subset=False,
+        )
     if "highly_variable" not in ad0.var.columns:
         mask = np.ones(ad0.n_vars, dtype=bool)
     else:
         mask = ad0.var["highly_variable"].to_numpy()
         if not mask.any():
             mask = np.ones(ad0.n_vars, dtype=bool)
+    # Use full-library size factors independent of the selected HVG budget.
+    # Drop the private counts layer before copying the normalized subset.
+    del ad0.layers[layer_use]
+    sc.pp.normalize_total(ad0, target_sum=1e4)
     e = ad0[:, mask].copy()
-    if layer_use in e.layers:
-        e.X = e.layers[layer_use].copy()
-    e.uns.pop("log1p", None)
-    sc.pp.normalize_total(e, target_sum=1e4)
     sc.pp.log1p(e)
     n_pcs = min(30, e.n_vars - 1, e.n_obs - 1)
     if n_pcs < 2:

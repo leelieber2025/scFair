@@ -272,10 +272,18 @@ def highly_variable_genes(
 
     if not isinstance(strict, bool):
         raise TypeError(f"strict must be bool, got {type(strict).__name__}={strict!r}.")
-    if isinstance(n_top_genes, bool):
+    if isinstance(n_top_genes, (bool, np.bool_)):
         raise TypeError(
             f"n_top_genes must be an int or 'auto'/'structure', not bool ({n_top_genes!r})."
         )
+    if isinstance(n_top_genes, str):
+        n_top_genes = n_top_genes.lower().strip()
+        if n_top_genes not in _AUTO_STRATEGIES:
+            raise ValueError(
+                f"Unknown n_top_genes={n_top_genes!r}. Pass an int, 'auto', or 'structure'."
+            )
+    elif not isinstance(n_top_genes, (int, np.integer)):
+        raise TypeError("n_top_genes must be an int or 'auto'/'structure'.")
     if isinstance(n_top_genes, (int, np.integer)) and int(n_top_genes) < 1:
         raise ValueError("n_top_genes must be >= 1.")
     if flavor not in _ALL_FLAVORS:
@@ -286,6 +294,11 @@ def highly_variable_genes(
             "Use 'append' (default same-rank cutoff tail) or 'none' (top-k only)."
         )
     method = _BALANCE_ALIASES[balance_method]
+
+    if marker_genes is not None:
+        if isinstance(marker_genes, str):
+            raise TypeError("marker_genes must be a sequence of gene names, not a string.")
+        marker_genes = list(dict.fromkeys(map(str, marker_genes)))
 
     if marker_mode is None:
         marker_mode = "force" if marker_genes else "none"
@@ -354,14 +367,6 @@ def highly_variable_genes(
         )
 
         auto_meta: dict[str, Any] | None = None
-        if not isinstance(n_top_genes, (int, np.integer)):
-            try:
-                as_float = float(n_top_genes)
-            except (TypeError, ValueError):
-                pass
-            else:
-                if np.isfinite(as_float) and float(as_float).is_integer():
-                    n_top_genes = int(as_float)
         n_top_is_auto = not isinstance(n_top_genes, (int, np.integer))
         _mode_arg = str(mode or "auto").lower().strip()
         if (
@@ -375,10 +380,6 @@ def highly_variable_genes(
                 "Pass n_top_genes='auto' to let mode influence k.",
                 UserWarning,
                 stacklevel=2,
-            )
-        if n_top_is_auto and str(n_top_genes).lower() not in _AUTO_STRATEGIES:
-            raise ValueError(
-                f"Unknown n_top_genes={n_top_genes!r}. Pass an int, 'auto', or 'structure'."
             )
         if n_top_is_auto:
             n_top_request = min(int(n_top_max), adata.n_vars)
