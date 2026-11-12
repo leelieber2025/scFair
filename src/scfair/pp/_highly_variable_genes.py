@@ -344,6 +344,11 @@ def highly_variable_genes(
     if not inplace:
         adata = adata.copy()
 
+    # Reject a bad batch column before Scanpy runs. Otherwise seurat_v3
+    # failures (NaN, empty categories) are swallowed as a flavor fallback,
+    # or the seurat path crashes inside pd.cut.
+    _validate_batch_key(adata, batch_key)
+
     _hvg_snap = _snapshot_adata_for_rollback(adata)
     effective_store_raw: bool | str = store_raw
     try:
@@ -361,6 +366,9 @@ def highly_variable_genes(
             span=span,
             strict=strict,
         )
+        # Snapshot is written inside prepare, before this check. A failed
+        # check must not keep that snapshot (see rollback).
+        _hvg_snap["counts_validated"] = True
 
         _prior_scanpy_hvg = (
             dict(adata.uns["hvg"]) if isinstance(adata.uns.get("hvg"), dict) else None
@@ -844,8 +852,7 @@ def highly_variable_genes(
             prior_scanpy_hvg=_prior_scanpy_hvg,
         )
 
-        adata.layers.pop("_scfair_log", None)
-        adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
+        _restore_or_drop_internal_layers(adata, _hvg_snap)
 
         if subset and inplace:
             mask = adata.var["highly_variable"].to_numpy()
@@ -893,15 +900,68 @@ def _progress_default(adata: Any, *, n_top_is_auto: bool = False) -> bool:
     return bool(n_obs >= 10_000 or n_obs * n_vars >= 5e7)
 
 
+def _validate_batch_key(adata: Any, batch_key: str | None) -> None:
+    """Reject missing, empty, or all-NA batch columns before Scanpy sees them.
+
+    Unused categorical levels are dropped in place so a batch with zero cells
+    is not passed to Scanpy's per-batch ``pd.cut`` path. Observed labels are
+    unchanged. The column is not written unless unused levels were present.
+    """
+    if batch_key is None:
+        return
+    if batch_key not in adata.obs.columns:
+        raise ValueError(f"batch_key={batch_key!r} not in adata.obs")
+    s = adata.obs[batch_key]
+    n_missing = int(pd.isna(s).sum())
+    if n_missing:
+        raise ValueError(
+            f"batch_key={batch_key!r} has {n_missing} missing value(s). "
+            "Drop or fill them before calling highly_variable_genes."
+        )
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        s_use = s.cat.remove_unused_categories()
+    else:
+        s_use = s
+    n_batches = int(pd.Series(s_use).nunique(dropna=True))
+    if n_batches < 2:
+        raise ValueError(
+            f"batch_key={batch_key!r} has {n_batches} non-empty batch(es); need at least 2."
+        )
+    if isinstance(s.dtype, pd.CategoricalDtype) and not s_use.cat.categories.equals(
+        s.cat.categories
+    ):
+        adata.obs[batch_key] = s_use
+
+
+def _restore_or_drop_internal_layers(adata: Any, snap: dict[str, Any]) -> None:
+    """Put caller-owned internal layers back; drop ones this call created."""
+    if snap.get("had_scfair_log"):
+        adata.layers["_scfair_log"] = snap["scfair_log"]
+    else:
+        adata.layers.pop("_scfair_log", None)
+    if snap.get("had_scfair_counts"):
+        adata.layers[INTERNAL_COUNTS_LAYER] = snap["scfair_counts"]
+    else:
+        adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
+
+
 def _snapshot_adata_for_rollback(adata: Any) -> dict[str, Any]:
     """Capture caller-visible state that a failed HVG call may leave dirty."""
     var_had = {c: adata.var[c].copy() for c in _HVG_PARTIAL_VAR_COLS if c in adata.var.columns}
+    layers = getattr(adata, "layers", {})
+    had_log = "_scfair_log" in layers
+    had_counts = INTERNAL_COUNTS_LAYER in layers
     return {
         "var_had": var_had,
         "var_cols": set(adata.var.columns),
-        "had_scfair_log": "_scfair_log" in getattr(adata, "layers", {}),
-        "had_scfair_counts": INTERNAL_COUNTS_LAYER in getattr(adata, "layers", {}),
-        "had_counts_layer": "counts" in getattr(adata, "layers", {}),
+        "had_scfair_log": had_log,
+        "had_scfair_counts": had_counts,
+        # References, not copies: later code replaces these slots. Restoring
+        # the reference puts the caller's matrix back.
+        "scfair_log": layers["_scfair_log"] if had_log else None,
+        "scfair_counts": layers[INTERNAL_COUNTS_LAYER] if had_counts else None,
+        "counts_validated": False,
+        "had_counts_layer": "counts" in layers,
         "uns_scfair": (
             {k: v for k, v in adata.uns["scfair"].items()}
             if isinstance(adata.uns.get("scfair"), dict)
@@ -920,17 +980,10 @@ def _rollback_adata_after_failure(adata: Any, snap: dict[str, Any], exc: BaseExc
             adata.var[c] = snap["var_had"][c]
         elif c in adata.var.columns and c not in snap["var_cols"]:
             del adata.var[c]
-    # internal log / counts layers
-    if not snap["had_scfair_log"]:
-        try:
-            adata.layers.pop("_scfair_log", None)
-        except Exception:
-            pass
-    if not snap.get("had_scfair_counts"):
-        try:
-            adata.layers.pop(INTERNAL_COUNTS_LAYER, None)
-        except Exception:
-            pass
+    try:
+        _restore_or_drop_internal_layers(adata, snap)
+    except Exception:
+        pass
     if not snap.get("had_counts_layer"):
         try:
             adata.layers.pop("counts", None)
@@ -940,9 +993,16 @@ def _rollback_adata_after_failure(adata: Any, snap: dict[str, Any], exc: BaseExc
     prev = snap["uns_scfair"]
     if prev is None:
         if "scfair" in adata.uns and isinstance(adata.uns["scfair"], dict):
-            # keep raw_snapshot if prepare wrote it; drop incomplete hvg
             store = adata.uns["scfair"]
             store.pop("hvg", None)
+            # prepare writes raw_snapshot before counts are validated.
+            # Keep a snapshot only after validation succeeded; a later
+            # failure can still leave that checked snapshot in place.
+            if not snap.get("counts_validated"):
+                store.pop("raw_snapshot", None)
+                store.pop("raw_gene_list", None)
+                store.pop("raw_gene_list_full", None)
+                store.pop("store_raw_counts_n_genes", None)
         else:
             adata.uns.setdefault("scfair", {})
     else:
@@ -1231,7 +1291,8 @@ def _clear_scanpy_hvg_var_columns(adata: Any) -> None:
     """
     drop = [c for c in _SCANPY_HVG_VAR_COLS if c in adata.var.columns]
     if drop:
-        adata.var.drop(columns=drop, inplace=True, errors="ignore")
+        # inplace=True is deprecated in pandas 3.1 and removed in pandas 4.
+        adata.var = adata.var.drop(columns=drop, errors="ignore")
 
 
 def _run_hvg_once(
@@ -1515,6 +1576,25 @@ def _infer_gene_nomenclature(var_names: Sequence[str]) -> str:
     return "human" if h >= m else "mouse"
 
 
+def _has_symbol_level_mito_ribo(var_names: Sequence[str]) -> bool:
+    """True when any name matches a symbol rule the MT/ribo filters can apply.
+
+    Ensembl ids (``ENSG`` / ``ENSMUSG``) score as human or mouse in
+    :func:`_infer_gene_nomenclature` but never match those symbol rules.
+    """
+    for raw in var_names:
+        n = str(raw)
+        if _MITO_HUMAN_RE.match(n) or _MITO_MOUSE_RE.match(n):
+            return True
+        if _RIBO_RE.match(n):
+            return True
+        if _RIBO_HUMAN_SIGNAL_RE.match(n) and n[:3] == n[:3].upper():
+            return True
+        if _RIBO_MOUSE_SIGNAL_RE.match(n):
+            return True
+    return False
+
+
 def _is_mito_name(name: str, nomenclature: str = "unknown") -> bool:
     """Mito symbol under inferred (or forced) nomenclature."""
     n = str(name)
@@ -1565,11 +1645,18 @@ def _apply_gene_filters(
     if not filter_mito and not filter_ribo:
         return selected[:n_top_genes], info
 
-    # Tip when naming is not recognized (other species / Ensembl-only ids).
-    if nom == "unknown" and (filter_mito or filter_ribo):
+    # Tip when names are not symbols these filters can match: unknown
+    # conventions, or species inferred only from Ensembl id prefixes.
+    ensembl_only = (
+        info["gene_nomenclature_source"] == "auto"
+        and nom != "unknown"
+        and not _has_symbol_level_mito_ribo(var_names)
+    )
+    if (nom == "unknown" or ensembl_only) and (filter_mito or filter_ribo):
         info["tips"].append(
             "MT/ribo filters are on, but gene names do not look human (MT-/RPL) "
             "or mouse (mt-/Rpl). No symbols matched — filters skipped matching. "
+            "Ensembl ids are not translated to symbols. "
             "Pass options=HVGOptions(gene_nomenclature='human'|'mouse') if names "
             "use another convention, or filter_mito=False / filter_ribo=False."
         )

@@ -705,8 +705,8 @@ def _imbalance_tips(metrics: Mapping[str, Any], *, source: str) -> list[str]:
         return tips
     if imb == "degenerate":
         tips.append(
-            "Too few intermediate groups for cluster-based rebalancing. "
-            "Try a higher resolution, or use balance_method='none'/'append'."
+            "Only one label group, so an imbalance check does not apply. "
+            "Pass a fixed n_top_genes, or balance_method='none'."
         )
         return tips
 

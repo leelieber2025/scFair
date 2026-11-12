@@ -346,6 +346,48 @@ def test_aggregate_skips_failed_seed_sentinels():
     assert all_fail["reason"] == "too_few_pcs"
 
 
+def test_missing_n_leiden_is_not_zero_and_does_not_take_v7():
+    """Missing Leiden counts must not become 0 and satisfy the v7 ratio cap."""
+    from scfair.pp._auto_n import _aggregate_structure_features, explain_structure_rule
+
+    missing = {
+        "n_obs": 20_000,
+        "n_leiden": None,
+        "n_density_pops": 15,
+        "valley_median": 0.85,
+        "frac_shallow": 0.1,
+        "mean_stability": 0.7,
+        "min_stability": 0.4,
+        "reason": "ok",
+        "density_confidence": "high",
+    }
+    agg = _aggregate_structure_features([missing, dict(missing)])
+    assert agg["n_leiden"] is None
+
+    hit = explain_structure_rule(
+        valley_median=0.85,
+        frac_shallow=0.1,
+        n_density_pops=15,
+        n_obs=20_000,
+        n_leiden=0,
+        density_confidence="high",
+    )
+    assert hit["rule_branch"] != "v7_fine_atlas_band"
+    assert hit["v7_band_eligible"] is False
+    assert "ratio_ok" in (hit["v7_band_miss"] or [])
+
+    kept = explain_structure_rule(
+        valley_median=0.85,
+        frac_shallow=0.1,
+        n_density_pops=15,
+        n_obs=20_000,
+        n_leiden=None,
+        density_confidence="high",
+    )
+    assert kept["v7_band_eligible"] is False
+    assert kept["rule_branch"] == hit["rule_branch"]
+
+
 def test_structure_anti_short_residual_and_false_short_post_combine():
     """Post-combine floors: false_short and low_conf; high-nd 500 exempt."""
     from scfair.pp._auto_n import _apply_short_floor_if_needed

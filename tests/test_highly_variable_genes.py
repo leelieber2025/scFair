@@ -818,6 +818,130 @@ def test_store_raw_ignored_when_inplace_false(adata_for_hvg):
     assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
 
 
+def test_batch_key_missing_or_empty_raises(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    with pytest.raises(ValueError, match="not in adata.obs"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            options=HVGOptions(batch_key="missing"),
+            diagnose=False,
+        )
+    assert "highly_variable" not in ad.var.columns
+
+    ad.obs["batch"] = ["A"] * ad.n_obs
+    with pytest.raises(ValueError, match="non-empty batch"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            options=HVGOptions(batch_key="batch"),
+            diagnose=False,
+        )
+
+    batch = ["A"] * (ad.n_obs - 1) + [np.nan]
+    ad.obs["batch"] = batch
+    with pytest.raises(ValueError, match="missing value"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            options=HVGOptions(batch_key="batch"),
+            diagnose=False,
+        )
+    hvg = ad.uns.get(UNS_KEY, {}).get("hvg", {})
+    assert hvg.get("flavor_used") != "seurat"
+
+
+def test_batch_key_drops_unused_categories(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    labels = ["A"] * (ad.n_obs // 2) + ["B"] * (ad.n_obs - ad.n_obs // 2)
+    ad.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=10,
+        balance_method="none",
+        options=HVGOptions(batch_key="batch"),
+        diagnose=False,
+    )
+    assert list(ad.obs["batch"].cat.categories) == ["A", "B"]
+    assert ad.uns[UNS_KEY]["hvg"]["flavor_used"] == "seurat_v3"
+
+
+def test_preexisting_internal_layers_are_restored(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    counts = np.full(ad.shape, 7.0, dtype=np.float32)
+    log = np.full(ad.shape, 0.5, dtype=np.float32)
+    ad.layers["_scfair_counts"] = counts.copy()
+    ad.layers["_scfair_log"] = log.copy()
+    scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="none", diagnose=False)
+    assert np.array_equal(np.asarray(ad.layers["_scfair_counts"]), counts)
+    assert np.array_equal(np.asarray(ad.layers["_scfair_log"]), log)
+
+
+def test_preexisting_internal_layer_restored_when_counts_invalid(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    counts = np.full(ad.shape, 7.0, dtype=np.float32)
+    ad.layers["_scfair_counts"] = counts.copy()
+    x = np.array(ad.X, dtype=np.float32, copy=True)
+    x[0, 0] = np.nan
+    ad.X = x
+    with pytest.raises(ValueError, match="non-finite"):
+        scf.pp.highly_variable_genes(ad, n_top_genes=10, balance_method="none", diagnose=False)
+    assert np.array_equal(np.asarray(ad.layers["_scfair_counts"]), counts)
+
+
+def test_ensembl_ids_warn_that_mito_ribo_filters_match_nothing(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    ad.var_names = [f"ENSG{i:011d}" for i in range(ad.n_vars)]
+    scf.pp.highly_variable_genes(
+        ad,
+        n_top_genes=10,
+        balance_method="none",
+        diagnose=False,
+        options=HVGOptions(filter_mito=True, filter_ribo=True),
+    )
+    h = ad.uns[UNS_KEY]["hvg"]
+    assert h["gene_nomenclature"] == "human"
+    assert h["n_mito_ribo_dropped"] == 0
+    tips = list(h.get("gene_filter_tips") or [])
+    assert any("No symbols matched" in t for t in tips)
+
+
+def test_store_raw_validation_failure_drops_snapshot(adata_for_hvg):
+    ad = adata_for_hvg.copy()
+    x = np.array(ad.X, dtype=np.float32, copy=True)
+    x[0, 0] = np.nan
+    ad.X = x
+    with pytest.raises(ValueError, match="non-finite"):
+        scf.pp.highly_variable_genes(
+            ad,
+            n_top_genes=10,
+            balance_method="none",
+            diagnose=False,
+            options=HVGOptions(store_raw=True),
+        )
+    assert "raw_snapshot" not in ad.uns.get(UNS_KEY, {})
+    assert "highly_variable" not in ad.var.columns
+
+
+def test_clear_scanpy_hvg_columns_does_not_use_inplace_drop(adata_for_hvg):
+    import warnings
+
+    from scfair.pp._highly_variable_genes import _clear_scanpy_hvg_var_columns
+
+    ad = adata_for_hvg.copy()
+    ad.var["highly_variable"] = False
+    ad.var["dispersions_norm"] = 1.0
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _clear_scanpy_hvg_var_columns(ad)
+    assert "highly_variable" not in ad.var.columns
+    assert "dispersions_norm" not in ad.var.columns
+    assert not any("inplace" in str(w.message).lower() for w in caught)
+
+
 def test_marker_presence_counts_rangeindex_var_names():
     """String markers vs RangeIndex var_names must count as present."""
     import anndata as ad

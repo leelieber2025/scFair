@@ -94,6 +94,9 @@ def test_diagnose_from_labels_single_population_is_decidable():
     d = diagnose_from_labels(["only"] * 300)
     assert d["recommendation"] == "use_scanpy_or_none"
     assert d["known_no_gain_regime"] is True
+    assert any("fixed n_top_genes" in t for t in d["tips"])
+    assert all("cluster-based" not in t for t in d["tips"])
+    assert all("resolution" not in t for t in d["tips"])
 
 
 def test_count_label_types_drops_missing():

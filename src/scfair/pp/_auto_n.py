@@ -222,6 +222,10 @@ def explain_structure_rule(
     mu = float(min_stability) if min_stability is not None else float("nan")
     n_cells = int(n_obs) if n_obs is not None else None
     nl = float(n_leiden) if n_leiden is not None else float("nan")
+    # A missing or non-positive Leiden count is not "Leiden << density".
+    # ratio 0 used to pass the v7 upper bound (ratio <= fine_ratio_hi).
+    if not (np.isfinite(nl) and nl > 0):
+        nl = float("nan")
     ratio = (nl / nd) if (np.isfinite(nl) and np.isfinite(nd) and nd > 0) else float("nan")
     conf = str(density_confidence).lower() if density_confidence else None
     sens = int(density_depth_sensitivity) if density_depth_sensitivity is not None else None
@@ -1022,7 +1026,7 @@ def _aggregate_structure_features(feats: Sequence[dict[str, Any]]) -> dict[str, 
     nd = _nanmed_int("n_density_pops")
     out: dict[str, Any] = {
         "n_obs": int(feats[0].get("n_obs") or 0),
-        "n_leiden": _nanmed_int("n_leiden") or 0,
+        "n_leiden": _nanmed_int("n_leiden"),
         "n_density_pops": nd,
         "valley_median": _nanmed("valley_median"),
         "valley_mean": _nanmed("valley_mean"),

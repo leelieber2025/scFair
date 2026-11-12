@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-11-11
+
+### Fixed
+
+- `batch_key` with missing values, a missing column, or fewer than two
+  non-empty batches now raises `ValueError` before Scanpy runs. Unused
+  categorical levels are dropped. These inputs no longer fall back from
+  `seurat_v3` to `seurat`, and no longer crash inside `pd.cut`.
+- A successful call no longer deletes `_scfair_counts` or `_scfair_log`
+  when those layers already existed. Their contents are restored.
+- Multi-seed structure aggregation no longer turns a missing `n_leiden`
+  into `0`. Non-positive Leiden counts are treated as missing in the v7
+  ratio, so they do not take the fine-atlas branch.
+- `diagnose_from_labels` no longer suggests cluster-based rebalancing,
+  which was removed. A single label group tells you to pass a fixed
+  `n_top_genes` or `balance_method='none'`.
+- MT/ribo filters now warn when gene names are Ensembl ids. Those ids
+  were inferred as human or mouse, so the filters matched nothing and
+  stayed silent.
+- `store_raw=True` no longer leaves a `raw_snapshot` when count
+  validation fails (for example on NaN). A snapshot is kept only after
+  the counts check succeeds.
+- Clearing previous Scanpy HVG columns no longer uses
+  `DataFrame.drop(..., inplace=True)`, which pandas 4 will remove.
+
 ## [0.10.3] - 2026-09-07
 
 ### Fixed
