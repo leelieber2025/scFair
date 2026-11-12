@@ -1,9 +1,9 @@
 {
  "package": "scfair",
  "pypi_total": 5263,
- "conda_total": 2556,
- "total": 7819,
- "updated": "2026-11-12T02:39:29+00:00",
+ "conda_total": 2558,
+ "total": 7821,
+ "updated": "2026-11-12T15:24:00+00:00",
  "pypi_daily": {
   "2026-08-02": 538,
   "2026-08-03": 70,
